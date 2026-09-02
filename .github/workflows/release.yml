@@ -1,0 +1,361 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "올릴 버전 자리"
+        required: true
+        type: choice
+        default: patch
+        options:
+          - major
+          - minor
+          - patch
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  PRODUCT_NAME: "Packer"
+  BINARY_NAME: packer
+  RUST_TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  release:
+    name: Windows 단독 실행 파일 릴리스
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: 체크아웃
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # 다음 버전은 releases 페이지의 태그와 저장소 태그를 함께 훑어서 가장 큰
+      # semver 를 기준으로 정한다. 양쪽 모두 semver 태그가 없으면(최초 릴리스)
+      # package.json 의 version 을 기준으로 삼는다.
+      #
+      # 주의: $ErrorActionPreference = 'Stop' 인 pwsh 에서는 네이티브 명령의 stderr 를
+      # 리다이렉트하면(예: `gh ... 2>$null`) PowerShell 이 stderr 한 줄을
+      # NativeCommandError 종료 오류로 바꾼다. 대상이 $null 이면 그 메시지까지 함께
+      # 버려져서 로그에는 "Process completed with exit code 1" 만 남는다.
+      # (릴리스가 아직 없을 때 `gh release view` 가 실패하는 정상 경로에서 이 스텝이
+      #  아무 단서도 없이 죽던 원인이다.)
+      # 그래서 이 스텝에서는 네이티브 명령에 리다이렉트를 걸지 않고 — gh·git 의 오류는
+      # 그대로 로그에 남게 두고 — 종료 코드를 직접 확인한다.
+      - name: 다음 버전 계산
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUMP: ${{ inputs.bump }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          # 실패는 무조건 눈에 보이게 남긴다.
+          trap {
+            Write-Host "::error::버전 계산 중 예상치 못한 오류: $($_.Exception.Message)"
+            exit 1
+          }
+
+          function Fail([string]$Message) {
+            Write-Host "::error::$Message"
+            exit 1
+          }
+
+          # 'v1.2.3' · '1.2.3' 만 버전으로 인정한다(프리릴리스 표기가 붙은 태그는 무시).
+          function Read-SemverTag([string]$Text) {
+            $value = "$Text".Trim()
+            $m = [regex]::Match($value, '^[vV]?(\d+)\.(\d+)\.(\d+)$')
+            if (-not $m.Success) { return $null }
+            [pscustomobject]@{
+              Tag     = $value
+              Version = [version]::new([int]$m.Groups[1].Value, [int]$m.Groups[2].Value, [int]$m.Groups[3].Value)
+            }
+          }
+
+          if ($env:BUMP -notin @('major', 'minor', 'patch')) {
+            Fail "알 수 없는 bump 값입니다: '$env:BUMP' (major·minor·patch 중 하나여야 합니다)"
+          }
+
+          # 1) releases 페이지의 태그 (초안·프리릴리스 릴리스까지 포함해서 본다)
+          $releaseTags = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases" --jq '.[].tag_name')
+          if ($LASTEXITCODE -ne 0) {
+            Fail "releases 목록을 읽지 못했습니다 (gh api 종료 코드: $LASTEXITCODE). 위에 찍힌 gh 오류 메시지를 확인하세요."
+          }
+          $releaseTags = @($releaseTags | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+
+          # 2) 저장소 태그 (릴리스 없이 태그만 남은 경우도 잡는다)
+          $gitTags = @(git tag --list)
+          if ($LASTEXITCODE -ne 0) {
+            Fail "git tag 목록을 읽지 못했습니다 (종료 코드: $LASTEXITCODE)."
+          }
+          $gitTags = @($gitTags | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+
+          Write-Host "릴리스 $($releaseTags.Count) 개, 태그 $($gitTags.Count) 개를 확인했습니다."
+
+          $candidates = @()
+          foreach ($item in $releaseTags) {
+            $parsedTag = Read-SemverTag $item
+            if ($parsedTag) {
+              $candidates += [pscustomobject]@{ Tag = $parsedTag.Tag; Version = $parsedTag.Version; From = 'releases 페이지'; Rank = 0 }
+            }
+          }
+          foreach ($item in $gitTags) {
+            $parsedTag = Read-SemverTag $item
+            if ($parsedTag) {
+              $candidates += [pscustomobject]@{ Tag = $parsedTag.Tag; Version = $parsedTag.Version; From = '저장소 태그'; Rank = 1 }
+            }
+          }
+
+          $previousTag = ''
+          if ($candidates.Count -gt 0) {
+            # 가장 큰 버전을 고르고, releases 와 태그에 같은 버전이 있으면
+            # releases 쪽(Rank 0)을 출처로 표시한다.
+            $baseItem = $candidates |
+              Sort-Object -Property @{ Expression = 'Version'; Descending = $true }, @{ Expression = 'Rank'; Descending = $false } |
+              Select-Object -First 1
+            $baseVersion = $baseItem.Version
+            $previousTag = $baseItem.Tag
+            $source = "$($baseItem.From) ($previousTag)"
+          }
+          else {
+            if (-not (Test-Path -LiteralPath 'package.json')) {
+              Fail "릴리스·태그가 하나도 없고 package.json 도 찾지 못했습니다."
+            }
+            $pkgVersion = ''
+            try {
+              $pkgVersion = "$((Get-Content -Raw -LiteralPath 'package.json' | ConvertFrom-Json).version)"
+            }
+            catch {
+              Fail "package.json 을 읽지 못했습니다: $($_.Exception.Message)"
+            }
+            $parsedPkg = Read-SemverTag $pkgVersion
+            if (-not $parsedPkg) {
+              Fail "릴리스·태그가 하나도 없고 package.json 의 version 도 X.Y.Z 형식이 아닙니다: '$pkgVersion'"
+            }
+            $baseVersion = $parsedPkg.Version
+            $source = "package.json ($pkgVersion)"
+          }
+
+          $current = "$($baseVersion.Major).$($baseVersion.Minor).$($baseVersion.Build)"
+          switch ($env:BUMP) {
+            'major' { $next = "$($baseVersion.Major + 1).0.0" }
+            'minor' { $next = "$($baseVersion.Major).$($baseVersion.Minor + 1).0" }
+            'patch' { $next = "$($baseVersion.Major).$($baseVersion.Minor).$($baseVersion.Build + 1)" }
+          }
+          $tag = "v$next"
+
+          # 새 태그가 이미 잡혀 있으면 멈춘다 (기존 릴리스·태그 덮어쓰기 방지).
+          $taken = @()
+          if ($releaseTags -contains $tag) { $taken += '릴리스가 이미 있습니다' }
+          if ($gitTags -contains $tag) { $taken += '태그가 이미 있습니다' }
+          if ($taken.Count -gt 0) {
+            Fail "$tag : $($taken -join ' / '). 기존 릴리스·태그를 정리하거나 다른 bump 를 선택하세요."
+          }
+
+          Write-Host "기준 버전 $current (출처: $source) -> 새 버전 $next (태그 $tag)"
+
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$next"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "tag=$tag"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "previous_version=$current"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "previous_tag=$previousTag"
+
+          $summary = @(
+            '## 버전',
+            '',
+            '| 항목 | 값 |',
+            '| --- | --- |',
+            "| 기준 버전 | ``$current`` (출처: $source) |",
+            "| 증가 단위 | ``$env:BUMP`` |",
+            "| 새 버전 | ``$next`` |"
+          )
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
+
+      - name: Node 22 준비
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      # package.json 에 packageManager 필드가 없어서 pnpm/action-setup 이 버전을
+      # 스스로 판단할 수 없다. 그래서 여기서 major 버전을 직접 지정한다
+      # (pnpm-lock.yaml 의 lockfileVersion 9.0 과 호환되는 pnpm 10 계열).
+      - name: pnpm 준비
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+          run_install: false
+
+      - name: Rust 툴체인 준비
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust 빌드 캐시
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      # package.json · tauri.conf.json · src-tauri/Cargo.toml 에 새 버전을 기록한다.
+      - name: 버전 반영
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:VERSION
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+
+          function Write-Text([string]$Path, [string]$Text) {
+            [System.IO.File]::WriteAllText((Resolve-Path -LiteralPath $Path).Path, $Text, $utf8)
+          }
+
+          # JSON 파일의 첫 번째 "version" 필드만 바꾼다.
+          function Set-JsonVersion([string]$Path) {
+            $raw = Get-Content -Raw -LiteralPath $Path
+            $re = [regex]'("version"\s*:\s*")[^"]*(")'
+            if (-not $re.IsMatch($raw)) { throw "$Path 에서 version 필드를 찾지 못했습니다." }
+            Write-Text $Path $re.Replace($raw, ('${1}' + $version + '${2}'), 1)
+            Write-Host "$Path -> $version"
+          }
+
+          # Cargo.toml 의 [package] version 을 바꾼다.
+          function Set-CargoVersion([string]$Path) {
+            $raw = Get-Content -Raw -LiteralPath $Path
+            $packageRe = [regex]'(\[package\][^\[]*?\r?\nversion\s*=\s*")[^"]*(")'
+            if (-not $packageRe.IsMatch($raw)) { throw "$Path 에서 [package] version 을 찾지 못했습니다." }
+            $raw = $packageRe.Replace($raw, ('${1}' + $version + '${2}'), 1)
+
+            Write-Text $Path $raw
+            Write-Host "$Path -> $version"
+          }
+
+          Set-JsonVersion 'package.json'
+          Set-JsonVersion 'src-tauri/tauri.conf.json'
+
+          Set-CargoVersion 'src-tauri/Cargo.toml'
+
+          # 바뀐 버전을 Cargo.lock 에 반영한다.
+          cargo update --workspace --manifest-path src-tauri/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw "cargo update 실패" }
+
+      - name: 프론트엔드 의존성 설치
+        run: pnpm install --frozen-lockfile
+
+      - name: Windows 단독 실행 파일 빌드
+        run: pnpm exec tauri build --no-bundle --target ${{ env.RUST_TARGET }}
+
+      # 번들(설치 파일) 없이 만들어진 단독 exe 를 릴리스용 이름으로 복사한다.
+      - name: 실행 파일 수집
+        id: artifact
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path (Get-Location) "src-tauri/target/$env:RUST_TARGET/release/$env:BINARY_NAME.exe"
+          if (-not (Test-Path -LiteralPath $exe)) { throw "빌드된 실행 파일을 찾지 못했습니다: $exe" }
+
+          $outDir = Join-Path $env:RUNNER_TEMP 'release-artifacts'
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+          $name = "$env:BINARY_NAME-v$env:VERSION-windows-x86_64.exe"
+          $dest = Join-Path $outDir $name
+          Copy-Item -LiteralPath $exe -Destination $dest -Force
+
+          $sha = (Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash.ToLower()
+          $sizeMb = [math]::Round((Get-Item -LiteralPath $dest).Length / 1MB, 1)
+
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "path=$dest"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "name=$name"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "sha256=$sha"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "size_mb=$sizeMb"
+
+      # 이전 릴리스 태그부터 지금까지의 커밋을 릴리스 본문에 넣는다.
+      - name: 변경 이력 작성
+        id: notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          PREVIOUS_TAG: ${{ steps.version.outputs.previous_tag }}
+          ASSET_NAME: ${{ steps.artifact.outputs.name }}
+          ASSET_SHA256: ${{ steps.artifact.outputs.sha256 }}
+          ASSET_SIZE_MB: ${{ steps.artifact.outputs.size_mb }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          $previousTag = $env:PREVIOUS_TAG
+          $hasPrevious = $false
+          if ($previousTag) {
+            git rev-parse -q --verify "refs/tags/$previousTag" | Out-Null
+            $hasPrevious = ($LASTEXITCODE -eq 0)
+          }
+
+          if ($hasPrevious) {
+            $heading = "### 변경 이력 ($previousTag -> $env:TAG)"
+            $commits = git log --no-merges --pretty=format:'- %s (%h)' "$previousTag..HEAD"
+          }
+          elseif ($previousTag) {
+            # 릴리스는 있는데 태그를 못 찾은 경우 — 전체 커밋을 대신 싣는다.
+            $heading = "### 변경 이력 (이전 태그 $previousTag 를 찾지 못해 전체 커밋을 표시합니다)"
+            $commits = git log --no-merges --pretty=format:'- %s (%h)' -n 200
+          }
+          else {
+            $heading = "### 변경 이력 (최초 릴리스)"
+            $commits = git log --no-merges --pretty=format:'- %s (%h)' -n 200
+          }
+          if ($LASTEXITCODE -ne 0) { throw "git log 실패" }
+
+          $commits = @($commits) | Where-Object { $_ }
+          if ($commits.Count -eq 0) { $commits = @('- 변경된 커밋이 없습니다.') }
+
+          $lines = @()
+          $lines += $heading
+          $lines += ''
+          $lines += $commits
+          $lines += ''
+          $lines += '### 다운로드'
+          $lines += ''
+          $lines += "- ``$env:ASSET_NAME`` — 설치가 필요 없는 Windows(x64) 단독 실행 파일 · $env:ASSET_SIZE_MB MB"
+          $lines += "  - SHA256: ``$env:ASSET_SHA256``"
+          $lines += '  - 실행에는 WebView2 런타임이 필요합니다 (Windows 11 기본 포함).'
+          $lines += ''
+          $lines += "빌드 커밋: ``$env:GITHUB_SHA``"
+          if ($hasPrevious) {
+            $lines += ''
+            $lines += "**Full Changelog**: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/compare/$previousTag...$env:TAG"
+          }
+
+          $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          Set-Content -LiteralPath $notesPath -Value $lines -Encoding utf8NoBOM
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "path=$notesPath"
+
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ''
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value (Get-Content -Raw -LiteralPath $notesPath)
+
+      - name: 릴리스 생성 및 실행 파일 업로드
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ASSET_PATH: ${{ steps.artifact.outputs.path }}
+          NOTES_PATH: ${{ steps.notes.outputs.path }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          gh release create $env:TAG $env:ASSET_PATH `
+            --title "$env:PRODUCT_NAME $env:TAG" `
+            --notes-file $env:NOTES_PATH `
+            --target $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "릴리스 생성 실패" }
+
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ''
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "릴리스: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/releases/tag/$env:TAG"
