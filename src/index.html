@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Packer</title>
+    <link rel="stylesheet" href="./fonts/fonts.css" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
+          <h1>Packer</h1>
+          <p class="brand-sub">파일을 묶어 암호화하고, 다시 풀어냅니다</p>
+        </div>
+      </div>
+      <nav class="tabs" role="tablist" aria-label="작업 선택">
+        <button type="button" class="tab" data-pk="tab" data-tab="pack" role="tab" aria-selected="true">
+          묶기
+        </button>
+        <button type="button" class="tab" data-pk="tab" data-tab="unpack" role="tab" aria-selected="false">
+          풀기
+        </button>
+      </nav>
+    </header>
+
+    <main>
+      <!-- ------------------------------------------------------------ 묶기 -->
+      <section class="panel" data-pk="panel" data-tab="pack" role="tabpanel" aria-label="묶기">
+        <div class="dropzone" data-pk="pack-dropzone">
+          <p class="dropzone-title">여기로 파일이나 폴더를 끌어다 놓으세요</p>
+          <p class="dropzone-sub">폴더를 놓으면 안에 있는 파일까지 모두 담습니다</p>
+          <div class="dropzone-actions">
+            <button type="button" class="btn btn-ghost" data-pk="pack-add-files">파일 선택</button>
+            <button type="button" class="btn btn-ghost" data-pk="pack-add-folders">폴더 선택</button>
+          </div>
+        </div>
+
+        <div class="list-head">
+          <span class="list-summary tnum" data-pk="pack-summary"></span>
+          <button type="button" class="btn btn-quiet" data-pk="pack-clear">모두 비우기</button>
+        </div>
+        <p class="empty" data-pk="pack-empty">아직 담긴 항목이 없습니다.</p>
+        <div class="list" data-pk="pack-list"></div>
+
+        <div class="field">
+          <label class="field-label" for="pack-key-input">암호화 키</label>
+          <div class="key-row">
+            <input
+              class="input"
+              id="pack-key-input"
+              data-pk="pack-key"
+              type="password"
+              placeholder="풀 때 필요한 키를 입력하세요"
+            />
+            <button type="button" class="btn btn-ghost" data-pk="pack-key-toggle">보기</button>
+          </div>
+          <p class="strength" data-pk="pack-key-strength" hidden></p>
+        </div>
+
+        <button type="button" class="btn btn-primary btn-block" data-pk="pack-submit">
+          묶고 암호화하기
+        </button>
+
+        <div class="progress" data-pk="pack-progress" hidden>
+          <div class="progress-track"><div class="progress-fill" data-pk="pack-progress-fill"></div></div>
+          <p class="progress-label tnum" data-pk="pack-progress-label"></p>
+        </div>
+
+        <p class="status" data-pk="pack-status" hidden></p>
+
+        <div class="output" data-pk="pack-output" hidden>
+          <div class="output-head">
+            <span class="field-label">묶은 결과 (텍스트)</span>
+            <button type="button" class="btn btn-ghost" data-pk="pack-output-copy">
+              전체 복사
+            </button>
+          </div>
+          <textarea
+            class="textarea"
+            data-pk="pack-output-text"
+            readonly
+            spellcheck="false"
+            aria-label="묶은 결과 텍스트"
+          ></textarea>
+          <p class="hint tnum" data-pk="pack-output-note"></p>
+        </div>
+
+        <button type="button" class="btn btn-ghost" data-pk="pack-reveal" hidden>탐색기에서 보기</button>
+      </section>
+
+      <!-- ------------------------------------------------------------ 풀기 -->
+      <section class="panel" data-pk="panel" data-tab="unpack" role="tabpanel" aria-label="풀기" hidden>
+        <div class="dropzone" data-pk="unpack-dropzone">
+          <p class="dropzone-title">묶어 둔 텍스트 파일을 끌어다 놓으세요</p>
+          <p class="dropzone-sub">키 없이도 어떤 방식으로 묶였는지 먼저 확인합니다</p>
+          <div class="dropzone-actions">
+            <button type="button" class="btn btn-ghost" data-pk="unpack-pick">파일 선택</button>
+          </div>
+        </div>
+
+        <div class="or-divider"><span>또는 텍스트를 붙여넣기</span></div>
+
+        <div class="output">
+          <div class="output-head">
+            <span class="field-label">받은 텍스트</span>
+            <button type="button" class="btn btn-quiet" data-pk="unpack-text-clear">비우기</button>
+          </div>
+          <textarea
+            class="textarea"
+            data-pk="unpack-text"
+            spellcheck="false"
+            placeholder="-----BEGIN PACKER CONTAINER----- 로 시작하는 텍스트를 붙여넣으세요"
+            aria-label="풀어낼 텍스트"
+          ></textarea>
+        </div>
+
+        <div class="card" data-pk="unpack-file" hidden>
+          <p class="card-title" data-pk="unpack-file-name"></p>
+          <p class="card-meta tnum" data-pk="unpack-file-meta"></p>
+        </div>
+        <p class="hint" data-pk="unpack-source-note" hidden></p>
+
+        <div class="field">
+          <label class="field-label" for="unpack-key-input">암호화 키</label>
+          <div class="key-row">
+            <input
+              class="input"
+              id="unpack-key-input"
+              data-pk="unpack-key"
+              type="password"
+              placeholder="묶을 때 사용한 키"
+            />
+            <button type="button" class="btn btn-ghost" data-pk="unpack-key-toggle">보기</button>
+          </div>
+          <p class="hint" data-pk="unpack-key-hint" hidden>방금 묶을 때 쓴 키를 그대로 채웠습니다.</p>
+        </div>
+
+        <div class="field">
+          <label class="field-label" for="unpack-dest-input">풀어낼 위치</label>
+          <div class="key-row">
+            <input
+              class="input"
+              id="unpack-dest-input"
+              data-pk="unpack-dest"
+              type="text"
+              placeholder="파일을 모아 둘 폴더"
+            />
+            <button type="button" class="btn btn-ghost" data-pk="unpack-dest-pick">폴더 선택</button>
+          </div>
+        </div>
+
+        <button type="button" class="btn btn-primary btn-block" data-pk="unpack-submit">
+          풀고 복호화하기
+        </button>
+
+        <div class="progress" data-pk="unpack-progress" hidden>
+          <div class="progress-track"><div class="progress-fill" data-pk="unpack-progress-fill"></div></div>
+          <p class="progress-label tnum" data-pk="unpack-progress-label"></p>
+        </div>
+
+        <p class="status" data-pk="unpack-status" hidden></p>
+        <button type="button" class="btn btn-ghost" data-pk="unpack-reveal" hidden>탐색기에서 보기</button>
+      </section>
+    </main>
+
+    <template data-pk="row-template">
+      <div class="row">
+        <span class="row-name" data-field="name"></span>
+        <span class="row-meta tnum" data-field="meta"></span>
+        <button type="button" class="row-remove" data-pk="row-remove" aria-label="목록에서 제거">
+          &times;
+        </button>
+      </div>
+    </template>
+
+    <script src="./main.js"></script>
+  </body>
+</html>

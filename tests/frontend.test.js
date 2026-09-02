@@ -1,0 +1,799 @@
+// main.js 의 배선을 실제 창 없이 검증한다.
+//
+// index.html 을 jsdom 에 올리고 `window.__TAURI__` 를 가짜 브리지로 바꿔치기한 뒤 main.js 를
+// 그대로 실행한다. 덕분에 탭 전환, 목록 렌더링, 버튼 활성화, 에러 표시, 텍스트 복사/붙여넣기,
+// 그리고 무엇보다 **묶기에서 쓴 키가 풀기 탭으로 이어지는지** 를 사람 손 없이 확인할 수 있다.
+//
+//   pnpm test
+
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { afterEach, describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
+
+import { JSDOM } from "jsdom";
+
+const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const html = fs.readFileSync(path.join(root, "src", "index.html"), "utf8");
+const mainJs = fs.readFileSync(path.join(root, "src", "main.js"), "utf8");
+
+const BEGIN = "-----BEGIN PACKER CONTAINER-----";
+const END = "-----END PACKER CONTAINER-----";
+
+/** 실제 결과물과 같은 모양의 가짜 armor 텍스트. */
+const ARMOR_TEXT = [BEGIN, "A".repeat(76), "B".repeat(76), "Cg==", END, ""].join("\r\n");
+
+/**
+ * 줄바꿈을 LF 로 맞춘다.
+ *
+ * `textarea.value` 는 DOM 규격상 CRLF 가 LF 로 정규화된다 (실제 브라우저도 같다). armor 리더가
+ * LF 도 받아 주므로 기능에는 영향이 없고, 파일에서 직접 읽는 '전체 복사' 경로는 CRLF 그대로다.
+ */
+const lf = (text) => text.replace(/\r\n/g, "\n");
+
+/** 다음 마이크로태스크/타이머까지 기다린다. main() 이 await 를 여러 번 하므로 몇 번 돌려준다. */
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+/** 붙여넣기 확인은 250ms 모아서 보내므로 그만큼 기다려 준다. */
+const settleDebounce = () => new Promise((resolve) => setTimeout(resolve, 320));
+
+/**
+ * 가짜 Tauri 브리지를 붙인 jsdom 창을 만들고 main.js 를 실행한다.
+ *
+ * @param {Record<string, Function>} handlers 명령 이름 → 응답 함수
+ */
+async function mount(handlers = {}) {
+  const dom = new JSDOM(html, {
+    runScripts: "outside-only",
+    url: "http://localhost/",
+    pretendToBeVisual: true,
+  });
+  const { window } = dom;
+
+  const calls = [];
+  const listeners = new Map();
+  let dragDropHandler = null;
+
+  window.__TAURI__ = {
+    core: {
+      invoke: async (name, args) => {
+        calls.push({ name, args });
+        const handler = handlers[name];
+        if (!handler) throw { code: "Internal", message: `가짜 핸들러 없음: ${name}` };
+        return handler(args);
+      },
+    },
+    event: {
+      listen: async (name, cb) => {
+        listeners.set(name, cb);
+        return () => listeners.delete(name);
+      },
+    },
+    webview: {
+      getCurrentWebview: () => ({
+        onDragDropEvent: async (cb) => {
+          dragDropHandler = cb;
+          return () => {
+            dragDropHandler = null;
+          };
+        },
+      }),
+    },
+  };
+
+  window.eval(mainJs);
+  window.dispatchEvent(new window.Event("DOMContentLoaded"));
+  await settle();
+  await settle();
+  await settle();
+
+  const hook = (name) => window.document.querySelector(`[data-pk="${name}"]`);
+
+  return {
+    dom,
+    window,
+    calls,
+    hook,
+    /** 훅이 화면에 보이는지 (hidden 속성 기준). */
+    visible: (name) => {
+      const node = hook(name);
+      return Boolean(node) && !node.hidden;
+    },
+    text: (name) => hook(name)?.textContent ?? null,
+    value: (name) => hook(name)?.value ?? null,
+    called: (name) => calls.some((c) => c.name === name),
+    argsOf: (name) => calls.find((c) => c.name === name)?.args ?? null,
+    click: async (name) => {
+      hook(name).dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+      await settle();
+      await settle();
+      await settle();
+    },
+    type: async (name, value) => {
+      const input = hook(name);
+      input.value = value;
+      input.dispatchEvent(new window.Event("input", { bubbles: true }));
+      await settle();
+    },
+    /** 텍스트 영역에 붙여넣고 확인 요청이 나가기까지 기다린다. */
+    paste: async (name, value) => {
+      const input = hook(name);
+      input.value = value;
+      input.dispatchEvent(new window.Event("input", { bubbles: true }));
+      await settleDebounce();
+      await settle();
+      await settle();
+    },
+    drop: async (paths) => {
+      assert.ok(dragDropHandler, "드래그 드롭 핸들러가 등록되지 않았다");
+      dragDropHandler({ payload: { type: "drop", paths } });
+      await settle();
+      await settle();
+      await settle();
+    },
+    dragOver: async () => {
+      dragDropHandler({ payload: { type: "over" } });
+      await settle();
+    },
+    dragLeave: async () => {
+      dragDropHandler({ payload: { type: "leave" } });
+      await settle();
+    },
+    emit: async (event, payload) => {
+      const cb = listeners.get(event);
+      assert.ok(cb, `${event} 리스너가 없다`);
+      cb({ payload });
+      await settle();
+    },
+    rows: () => Array.from(window.document.querySelectorAll('[data-pk="pack-list"] .row')),
+  };
+}
+
+/** 흔한 응답을 미리 채운 핸들러 모음. */
+function handlers(overrides = {}) {
+  return {
+    scan_paths: async ({ paths }) => ({
+      items: paths.map((p) => ({
+        path: p,
+        name: p.split(/[\\/]/).pop(),
+        kind: /\.(txt|bin)$/.test(p) ? "file" : "dir",
+        size: 2048,
+        file_count: /\.(txt|bin)$/.test(p) ? 1 : 4,
+      })),
+      total_bytes: 2048 * paths.length,
+      file_count: paths.length,
+      dir_count: 0,
+    }),
+
+    inspect: async ({ path: p }) => ({
+      source: "file",
+      path: p,
+      name: p.split(/[\\/]/).pop(),
+      byte_size: 5000,
+      armored: true,
+      format_version: 1,
+      kdf: "Argon2id",
+      cipher: "AES-256-GCM",
+      compression: "zstd",
+      chunk_size: 1048576,
+    }),
+
+    inspect_text: async ({ text }) => {
+      if (!text.includes(BEGIN)) {
+        throw { code: "NotContainer", message: "이 파일은 이 프로그램으로 묶은 파일이 아닙니다." };
+      }
+      return {
+        source: "text",
+        path: null,
+        name: "붙여넣은 텍스트",
+        byte_size: text.length,
+        armored: true,
+        format_version: 1,
+        kdf: "Argon2id",
+        cipher: "AES-256-GCM",
+        compression: "zstd",
+        chunk_size: 1048576,
+      };
+    },
+
+    pick_save_path: async () => "C:\\out\\bundle.txt",
+    pick_dest_dir: async () => "C:\\out\\restored",
+    pick_files_to_pack: async () => ["C:\\src\\picked.txt"],
+    pick_folders_to_pack: async () => ["C:\\src\\folder"],
+    pick_container: async () => "C:\\out\\bundle.txt",
+    reveal: async () => null,
+    copy_container_to_clipboard: async () => 4096,
+
+    pack: async () => ({
+      dest: "C:\\out\\bundle.txt",
+      container_bytes: 1024,
+      original_bytes: 4096,
+      file_count: 2,
+      dir_count: 1,
+      changed: [],
+      skipped: [],
+      preview: ARMOR_TEXT,
+      preview_omitted: false,
+    }),
+
+    unpack: async () => ({
+      dest: "C:\\out\\restored",
+      file_count: 2,
+      dir_count: 1,
+      total_bytes: 4096,
+      skipped: [],
+      hash_mismatch: [],
+      renamed: [],
+    }),
+
+    unpack_text: async () => ({
+      dest: "C:\\out\\restored",
+      file_count: 2,
+      dir_count: 1,
+      total_bytes: 4096,
+      skipped: [],
+      hash_mismatch: [],
+      renamed: [],
+    }),
+
+    ...overrides,
+  };
+}
+
+let open = [];
+afterEach(() => {
+  for (const dom of open) dom.window.close();
+  open = [];
+});
+
+async function boot(overrides) {
+  const app = await mount(handlers(overrides));
+  open.push(app.dom);
+  return app;
+}
+
+/** 묶기를 끝까지 한 번 돌린다. */
+async function packOnce(app, key = "열려라 참깨 2026!") {
+  await app.drop(["C:\\src\\a.txt"]);
+  await app.type("pack-key", key);
+  await app.click("pack-submit");
+}
+
+describe("첫 화면", () => {
+  it("묶기 탭만 보이고 풀기 패널은 숨어 있다", async () => {
+    const app = await boot();
+    const panels = Array.from(app.window.document.querySelectorAll('[data-pk="panel"]'));
+    assert.equal(panels.find((p) => p.dataset.tab === "pack").hidden, false);
+    assert.equal(panels.find((p) => p.dataset.tab === "unpack").hidden, true);
+  });
+
+  it("담긴 항목이 없으면 묶기 버튼이 잠겨 있다", async () => {
+    const app = await boot();
+    assert.equal(app.hook("pack-submit").disabled, true);
+    assert.equal(app.hook("pack-clear").disabled, true);
+    assert.equal(app.visible("pack-empty"), true);
+    assert.equal(app.visible("pack-progress"), false);
+    assert.equal(app.visible("pack-status"), false);
+    // 결과 텍스트 영역은 묶기 전에는 나오지 않는다.
+    assert.equal(app.visible("pack-output"), false);
+  });
+
+  it("'기억' 버튼이 어디에도 없다", async () => {
+    const app = await boot();
+    // 요청대로 제거했다. 문구로도, 훅으로도 남아 있지 않아야 한다.
+    assert.equal(app.window.document.body.textContent.includes("기억"), false);
+    assert.equal(app.window.document.querySelector('[data-pk="pack-remember"]'), null);
+  });
+});
+
+describe("탭 전환", () => {
+  it("풀기를 누르면 패널이 맞바뀐다", async () => {
+    const app = await boot();
+    const tabs = Array.from(app.window.document.querySelectorAll('[data-pk="tab"]'));
+    const unpackTab = tabs.find((t) => t.dataset.tab === "unpack");
+    unpackTab.dispatchEvent(new app.window.MouseEvent("click", { bubbles: true }));
+    await settle();
+
+    const panels = Array.from(app.window.document.querySelectorAll('[data-pk="panel"]'));
+    assert.equal(panels.find((p) => p.dataset.tab === "pack").hidden, true);
+    assert.equal(panels.find((p) => p.dataset.tab === "unpack").hidden, false);
+    assert.equal(unpackTab.getAttribute("aria-selected"), "true");
+  });
+});
+
+describe("묶기 목록", () => {
+  it("드롭한 경로를 scan_paths 로 재서 행으로 그린다", async () => {
+    const app = await boot();
+    await app.drop(["C:\\src\\메모.txt", "C:\\src\\폴더"]);
+
+    const rows = app.rows();
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0].querySelector('[data-field="name"]').textContent, "메모.txt");
+    assert.equal(rows[1].querySelector('[data-field="name"]').textContent, "폴더");
+    assert.match(rows[1].querySelector('[data-field="meta"]').textContent, /폴더 · 파일 4개/);
+    assert.equal(app.visible("pack-empty"), false);
+    assert.match(app.text("pack-summary"), /2개 항목/);
+  });
+
+  it("같은 경로를 다시 드롭해도 중복되지 않는다", async () => {
+    const app = await boot();
+    await app.drop(["C:\\src\\a.txt"]);
+    await app.drop(["C:\\src\\a.txt"]);
+    assert.equal(app.rows().length, 1);
+  });
+
+  it("행의 제거 버튼이 그 항목만 뺀다", async () => {
+    const app = await boot();
+    await app.drop(["C:\\src\\a.txt", "C:\\src\\b.bin"]);
+    app
+      .rows()[0]
+      .querySelector('[data-pk="row-remove"]')
+      .dispatchEvent(new app.window.MouseEvent("click", { bubbles: true }));
+    await settle();
+
+    const rows = app.rows();
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].querySelector('[data-field="name"]').textContent, "b.bin");
+  });
+
+  it("모두 비우기가 목록과 결과 텍스트를 함께 치운다", async () => {
+    const app = await boot();
+    await packOnce(app);
+    assert.equal(app.visible("pack-output"), true);
+
+    await app.click("pack-clear");
+    assert.equal(app.rows().length, 0);
+    assert.equal(app.visible("pack-empty"), true);
+    assert.equal(app.visible("pack-output"), false, "지난 결과가 남아 있으면 헷갈린다");
+  });
+
+  it("드래그 중에는 드롭존이 강조된다", async () => {
+    const app = await boot();
+    await app.dragOver();
+    assert.equal(app.hook("pack-dropzone").classList.contains("is-dragover"), true);
+    await app.dragLeave();
+    assert.equal(app.hook("pack-dropzone").classList.contains("is-dragover"), false);
+  });
+});
+
+describe("암호화 키", () => {
+  it("항목과 키가 모두 있어야 묶기 버튼이 열린다", async () => {
+    const app = await boot();
+    await app.drop(["C:\\src\\a.txt"]);
+    assert.equal(app.hook("pack-submit").disabled, true, "키가 없으면 잠겨 있어야 한다");
+    await app.type("pack-key", "열려라 참깨");
+    assert.equal(app.hook("pack-submit").disabled, false);
+  });
+
+  it("보기 버튼이 키를 평문으로 바꾼다", async () => {
+    const app = await boot();
+    assert.equal(app.hook("pack-key").type, "password");
+    await app.click("pack-key-toggle");
+    assert.equal(app.hook("pack-key").type, "text");
+    await app.click("pack-key-toggle");
+    assert.equal(app.hook("pack-key").type, "password");
+  });
+
+  it("짧은 키에 경고를 띄운다", async () => {
+    const app = await boot();
+    await app.type("pack-key", "abc");
+    assert.equal(app.visible("pack-key-strength"), true);
+    assert.match(app.text("pack-key-strength"), /짧습니다/);
+    await app.type("pack-key", "Zaq12wsx!열려라참깨");
+    assert.equal(app.hook("pack-key-strength").dataset.level, "strong");
+  });
+});
+
+describe("묶고 암호화하기", () => {
+  it("경로·키·저장 위치를 그대로 pack 에 넘긴다", async () => {
+    const app = await boot();
+    await app.drop(["C:\\src\\a.txt", "C:\\src\\b.bin"]);
+    await app.type("pack-key", "열려라 참깨");
+    await app.click("pack-submit");
+
+    const args = app.argsOf("pack");
+    assert.ok(args, "pack 이 호출되지 않았다");
+    // jsdom 창의 배열은 프로토타입이 달라 strict 비교를 통과하지 못한다. 값만 본다.
+    assert.deepEqual(Array.from(args.paths), ["C:\\src\\a.txt", "C:\\src\\b.bin"]);
+    assert.equal(args.passphrase, "열려라 참깨");
+    assert.equal(args.dest, "C:\\out\\bundle.txt");
+  });
+
+  it("기본 파일 이름이 .txt 로 제안된다", async () => {
+    const app = await boot();
+    await app.drop(["C:\\src\\a.txt"]);
+    await app.type("pack-key", "pw123456");
+    await app.click("pack-submit");
+
+    const args = app.argsOf("pick_save_path");
+    assert.ok(args.suggestedName.endsWith(".txt"), `제안된 이름: ${args.suggestedName}`);
+  });
+
+  it("성공하면 절약률과 안내를 보여 준다", async () => {
+    const app = await boot();
+    await packOnce(app);
+
+    assert.equal(app.visible("pack-status"), true);
+    assert.equal(app.hook("pack-status").dataset.kind, "ok");
+    assert.match(app.text("pack-status"), /파일 2개를 텍스트로 묶었습니다/);
+    assert.match(app.text("pack-status"), /75% 절약/);
+    assert.equal(app.visible("pack-reveal"), true);
+  });
+
+  it("저장 위치를 취소하면 아무것도 하지 않는다", async () => {
+    const app = await boot({ pick_save_path: async () => null });
+    await packOnce(app);
+
+    assert.equal(app.called("pack"), false);
+    assert.equal(app.visible("pack-status"), false);
+    assert.equal(app.visible("pack-output"), false);
+  });
+
+  it("실패하면 Rust 가 준 한국어 문장을 그대로 띄운다", async () => {
+    const app = await boot({
+      pack: async () => {
+        throw { code: "Io", message: "D:\\x 를 만들 수 없습니다: 액세스가 거부되었습니다" };
+      },
+    });
+    await packOnce(app);
+
+    assert.equal(app.hook("pack-status").dataset.kind, "error");
+    assert.match(app.text("pack-status"), /액세스가 거부되었습니다/);
+    assert.equal(app.visible("pack-output"), false);
+  });
+
+  it("건너뛴 항목이 있으면 경고로 알린다", async () => {
+    const app = await boot({
+      pack: async () => ({
+        dest: "C:\\out\\bundle.txt",
+        container_bytes: 1024,
+        original_bytes: 4096,
+        file_count: 1,
+        dir_count: 0,
+        changed: ["a.txt"],
+        skipped: ["C:\\src\\link — 링크는 담지 않습니다"],
+        preview: ARMOR_TEXT,
+        preview_omitted: false,
+      }),
+    });
+    await packOnce(app, "pw123456");
+
+    assert.equal(app.hook("pack-status").dataset.kind, "warn");
+    assert.match(app.text("pack-status"), /크기가 변한 파일 1개/);
+    assert.match(app.text("pack-status"), /담지 못한 항목 1개/);
+  });
+});
+
+describe("텍스트 결과 — 요청의 핵심", () => {
+  it("묶은 결과를 복사할 수 있는 텍스트로 보여 준다", async () => {
+    const app = await boot();
+    await packOnce(app);
+
+    assert.equal(app.visible("pack-output"), true, "결과 텍스트가 보이지 않는다");
+    const shown = app.value("pack-output-text");
+    // 텍스트 에디터에 그대로 붙일 수 있는 형태여야 한다.
+    assert.ok(shown.startsWith(BEGIN), `시작 표시가 없다: ${shown.slice(0, 40)}`);
+    assert.ok(shown.trimEnd().endsWith(END), "끝 표시가 없다");
+    assert.equal(lf(shown), lf(ARMOR_TEXT));
+  });
+
+  it("결과 텍스트 영역은 읽기 전용이고 선택할 수 있다", async () => {
+    const app = await boot();
+    await packOnce(app);
+    const area = app.hook("pack-output-text");
+    assert.equal(area.readOnly, true, "실수로 고쳐지면 풀 수 없게 된다");
+    assert.equal(area.tagName, "TEXTAREA");
+  });
+
+  it("전체 복사가 파일 경로로 클립보드 명령을 부른다", async () => {
+    const app = await boot();
+    await packOnce(app);
+    await app.click("pack-output-copy");
+
+    // 본문을 IPC 로 한 번 더 넘기지 않고 Rust 가 파일에서 직접 읽어 올린다.
+    const args = app.argsOf("copy_container_to_clipboard");
+    assert.ok(args, "클립보드 명령이 호출되지 않았다");
+    assert.equal(args.path, "C:\\out\\bundle.txt");
+    assert.equal(app.hook("pack-status").dataset.kind, "ok");
+    assert.match(app.text("pack-status"), /클립보드에 복사했습니다/);
+  });
+
+  it("텍스트가 너무 크면 화면에 띄우지 않고 그 이유를 말해 준다", async () => {
+    const app = await boot({
+      pack: async () => ({
+        dest: "C:\\out\\big.txt",
+        container_bytes: 40 * 1024 * 1024,
+        original_bytes: 80 * 1024 * 1024,
+        file_count: 3,
+        dir_count: 0,
+        changed: [],
+        skipped: [],
+        preview: null,
+        preview_omitted: true,
+      }),
+    });
+    await packOnce(app, "pw123456");
+
+    assert.equal(app.visible("pack-output"), true);
+    assert.equal(app.value("pack-output-text"), "");
+    assert.match(app.text("pack-output-note"), /화면에는 띄우지 않았습니다/);
+    // 그래도 클립보드로는 옮길 수 있어야 한다.
+    assert.equal(app.hook("pack-output-copy").disabled, false);
+  });
+
+  it("클립보드 복사가 실패하면 이유를 보여 준다", async () => {
+    const app = await boot({
+      copy_container_to_clipboard: async () => {
+        throw { code: "Io", message: "텍스트가 너무 커서 클립보드로 옮길 수 없습니다 (80 MB)." };
+      },
+    });
+    await packOnce(app);
+    await app.click("pack-output-copy");
+
+    assert.equal(app.hook("pack-status").dataset.kind, "error");
+    assert.match(app.text("pack-status"), /클립보드로 옮길 수 없습니다/);
+  });
+});
+
+describe("키 이어짐 — 요청의 핵심", () => {
+  it("묶기가 성공하면 같은 키가 풀기 탭에 채워진다", async () => {
+    const app = await boot();
+    assert.equal(app.value("unpack-key"), "", "처음에는 비어 있어야 한다");
+
+    await packOnce(app, "열려라 참깨 2026!");
+
+    assert.equal(app.value("unpack-key"), "열려라 참깨 2026!");
+    assert.equal(app.visible("unpack-key-hint"), true);
+  });
+
+  it("묶기가 실패하면 키를 이어 주지 않는다", async () => {
+    const app = await boot({
+      pack: async () => {
+        throw { code: "Io", message: "쓸 수 없습니다" };
+      },
+    });
+    await packOnce(app, "틀린-키");
+    assert.equal(app.value("unpack-key"), "", "실패한 키는 흘려보내지 않는다");
+  });
+
+  it("키를 localStorage 에 저장하지 않는다", async () => {
+    const app = await boot();
+    await packOnce(app, "비밀-키-1234");
+
+    // 경로는 기억해도 되지만 키는 절대 남아선 안 된다. '기억' 버튼을 뺀 이유가 이것이다.
+    const dump = JSON.stringify({ ...app.window.localStorage });
+    assert.equal(dump.includes("비밀-키-1234"), false, `localStorage 에 키가 남았다: ${dump}`);
+  });
+});
+
+describe("풀기 — 파일에서", () => {
+  async function withFile(overrides) {
+    const app = await boot(overrides);
+    await app.click("unpack-pick");
+    return app;
+  }
+
+  it("고른 파일의 정보를 키 없이 보여 준다", async () => {
+    const app = await withFile();
+    assert.equal(app.visible("unpack-file"), true);
+    assert.equal(app.text("unpack-file-name"), "bundle.txt");
+    assert.match(app.text("unpack-file-meta"), /텍스트/);
+    assert.match(app.text("unpack-file-meta"), /AES-256-GCM/);
+    assert.match(app.text("unpack-file-meta"), /포맷 v1/);
+    assert.match(app.text("unpack-source-note"), /파일을 풉니다/);
+  });
+
+  it("대상과 키가 모두 있어야 풀기 버튼이 열린다", async () => {
+    const app = await boot();
+    assert.equal(app.hook("unpack-submit").disabled, true);
+    await app.click("unpack-pick");
+    assert.equal(app.hook("unpack-submit").disabled, true, "키가 없으면 잠겨 있어야 한다");
+    await app.type("unpack-key", "pw123456");
+    assert.equal(app.hook("unpack-submit").disabled, false);
+  });
+
+  it("우리 파일이 아니면 그렇게 말해 준다", async () => {
+    const app = await withFile({
+      inspect: async () => {
+        throw { code: "NotContainer", message: "이 파일은 이 프로그램으로 묶은 파일이 아닙니다." };
+      },
+    });
+    assert.equal(app.visible("unpack-file"), false);
+    assert.equal(app.hook("unpack-status").dataset.kind, "error");
+    assert.match(app.text("unpack-status"), /묶은 파일이 아닙니다/);
+    assert.equal(app.hook("unpack-submit").disabled, true);
+  });
+
+  it("이전 형식(바이너리)도 그렇게 표시하고 풀어 준다", async () => {
+    const app = await withFile({
+      inspect: async ({ path: p }) => ({
+        source: "file",
+        path: p,
+        name: "legacy.fsx",
+        byte_size: 4096,
+        armored: false,
+        format_version: 1,
+        kdf: "Argon2id",
+        cipher: "AES-256-GCM",
+        compression: "zstd",
+        chunk_size: 1048576,
+      }),
+    });
+    assert.match(app.text("unpack-file-meta"), /이전 형식\(바이너리\)/);
+    await app.type("unpack-key", "pw123456");
+    assert.equal(app.hook("unpack-submit").disabled, false);
+  });
+
+  it("고른 폴더를 그대로 unpack 에 넘긴다", async () => {
+    const app = await withFile();
+    await app.type("unpack-key", "pw123456");
+    await app.click("unpack-dest-pick");
+    await app.click("unpack-submit");
+
+    const args = app.argsOf("unpack");
+    assert.ok(args, "unpack 이 호출되지 않았다");
+    assert.equal(args.container, "C:\\out\\bundle.txt");
+    assert.equal(args.passphrase, "pw123456");
+    assert.equal(args.dest, "C:\\out\\restored");
+  });
+
+  it("위치를 비워 둔 채 누르면 폴더 선택을 먼저 띄운다", async () => {
+    const app = await withFile();
+    await app.type("unpack-key", "pw123456");
+    await app.click("unpack-submit");
+
+    assert.ok(app.called("pick_dest_dir"), "폴더 선택을 띄우지 않았다");
+    assert.ok(app.called("unpack"));
+  });
+
+  it("키가 틀리면 그렇게 말해 준다", async () => {
+    const app = await withFile({
+      unpack: async () => {
+        throw { code: "WrongKey", message: "암호화 키가 올바르지 않습니다." };
+      },
+    });
+    await app.type("unpack-key", "틀린키123");
+    await app.click("unpack-dest-pick");
+    await app.click("unpack-submit");
+
+    assert.equal(app.hook("unpack-status").dataset.kind, "error");
+    assert.match(app.text("unpack-status"), /키가 올바르지 않습니다/);
+  });
+
+  it("건너뛴 경로와 이름 충돌을 보고한다", async () => {
+    const app = await withFile({
+      unpack: async () => ({
+        dest: "C:\\out\\restored",
+        file_count: 3,
+        dir_count: 1,
+        total_bytes: 9000,
+        skipped: ["../evil.txt (상대 경로 이동)"],
+        hash_mismatch: [],
+        renamed: ["proj → proj (2)"],
+      }),
+    });
+    await app.type("unpack-key", "pw123456");
+    await app.click("unpack-dest-pick");
+    await app.click("unpack-submit");
+
+    assert.equal(app.hook("unpack-status").dataset.kind, "warn");
+    assert.match(app.text("unpack-status"), /건너뛴 항목 1개/);
+    assert.match(app.text("unpack-status"), /proj \(2\)/);
+  });
+});
+
+describe("풀기 — 붙여넣은 텍스트에서", () => {
+  it("붙여넣으면 키 없이 내용을 확인해 준다", async () => {
+    const app = await boot();
+    await app.paste("unpack-text", ARMOR_TEXT);
+
+    assert.ok(app.called("inspect_text"), "텍스트 확인 요청이 나가지 않았다");
+    assert.equal(app.visible("unpack-file"), true);
+    assert.equal(app.text("unpack-file-name"), "붙여넣은 텍스트");
+    assert.match(app.text("unpack-source-note"), /붙여넣은 텍스트를 풉니다/);
+  });
+
+  it("붙여넣은 텍스트를 unpack_text 로 넘긴다", async () => {
+    const app = await boot();
+    await app.paste("unpack-text", ARMOR_TEXT);
+    await app.type("unpack-key", "pw123456");
+    await app.click("unpack-dest-pick");
+    await app.click("unpack-submit");
+
+    const args = app.argsOf("unpack_text");
+    assert.ok(args, "unpack_text 가 호출되지 않았다");
+    assert.equal(lf(args.text), lf(ARMOR_TEXT));
+    assert.equal(args.passphrase, "pw123456");
+    assert.equal(args.dest, "C:\\out\\restored");
+    // 파일 경로로 부르는 명령은 쓰이지 않아야 한다.
+    assert.equal(app.called("unpack"), false);
+  });
+
+  it("우리 텍스트가 아니면 그렇게 말해 준다", async () => {
+    const app = await boot();
+    await app.paste("unpack-text", "그냥 평범한 메모입니다.");
+
+    assert.equal(app.hook("unpack-status").dataset.kind, "error");
+    assert.match(app.text("unpack-status"), /묶은 파일이 아닙니다/);
+    assert.equal(app.hook("unpack-submit").disabled, true);
+  });
+
+  it("비우면 대상이 사라진다", async () => {
+    const app = await boot();
+    await app.paste("unpack-text", ARMOR_TEXT);
+    assert.equal(app.visible("unpack-file"), true);
+
+    await app.click("unpack-text-clear");
+    assert.equal(app.value("unpack-text"), "");
+    assert.equal(app.visible("unpack-file"), false);
+    assert.equal(app.hook("unpack-submit").disabled, true);
+  });
+
+  it("파일을 고르면 붙여넣은 텍스트를 비운다", async () => {
+    const app = await boot();
+    await app.paste("unpack-text", ARMOR_TEXT);
+    await app.click("unpack-pick");
+
+    // 두 입구 중 무엇을 쓸지 헷갈리지 않게 하나만 살아 있어야 한다.
+    assert.equal(app.value("unpack-text"), "");
+    assert.equal(app.text("unpack-file-name"), "bundle.txt");
+    assert.match(app.text("unpack-source-note"), /파일을 풉니다/);
+  });
+
+  it("텍스트가 잘렸으면 복사가 덜 됐다고 알려 준다", async () => {
+    const app = await boot({
+      inspect_text: async () => {
+        throw {
+          code: "ArmorDamaged",
+          message: "텍스트가 온전하지 않습니다. 시작·끝 표시 줄까지 빠짐없이 복사했는지 확인해 주세요.",
+        };
+      },
+    });
+    await app.paste("unpack-text", ARMOR_TEXT.slice(0, 100));
+
+    assert.equal(app.hook("unpack-status").dataset.kind, "error");
+    assert.match(app.text("unpack-status"), /빠짐없이 복사했는지/);
+  });
+});
+
+describe("진행률", () => {
+  it("총량을 알면 퍼센트로, 모르면 불확정으로 표시한다", async () => {
+    const app = await boot();
+
+    await app.emit("pack-progress", {
+      phase: "packing",
+      done_bytes: 0,
+      total_bytes: 0,
+      current_path: "",
+    });
+    assert.equal(app.visible("pack-progress"), true);
+    assert.equal(app.hook("pack-progress-fill").dataset.indeterminate, "true");
+    assert.match(app.text("pack-progress-label"), /묶는 중…/);
+
+    await app.emit("pack-progress", {
+      phase: "packing",
+      done_bytes: 512,
+      total_bytes: 2048,
+      current_path: "proj/a.txt",
+    });
+    assert.equal(app.hook("pack-progress-fill").dataset.indeterminate, "false");
+    assert.equal(app.hook("pack-progress-fill").style.width, "25%");
+    assert.match(app.text("pack-progress-label"), /25%/);
+    assert.match(app.text("pack-progress-label"), /proj\/a\.txt/);
+    assert.equal(app.hook("pack-progress").getAttribute("aria-valuenow"), "25");
+  });
+
+  it("풀기 진행률은 풀기 쪽 막대만 움직인다", async () => {
+    const app = await boot();
+    await app.emit("unpack-progress", {
+      phase: "unpacking",
+      done_bytes: 1000,
+      total_bytes: 4000,
+      current_path: "x",
+    });
+    assert.equal(app.hook("unpack-progress-fill").style.width, "25%");
+    assert.equal(app.visible("pack-progress"), false);
+    assert.match(app.text("unpack-progress-label"), /푸는 중/);
+  });
+});

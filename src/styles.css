@@ -1,0 +1,617 @@
+/* Packer — 기능 확인용 스타일.
+ *
+ * 디자인(Packer.dc.html)을 이식하면 이 파일의 색/여백/모양은 목업 값으로 대체된다.
+ * 아래 타이포그래피 블록은 그때도 그대로 남는다 — 요청받은 "Google 산세리프 기반 가독성 향상"이
+ * 여기에 들어 있다.
+ */
+
+/* ---------------------------------------------------------------- 타이포그래피 */
+
+:root {
+  /* Noto Sans KR 은 한글과 라틴을 한 벌로 설계했기 때문에 섞인 문장에서도 굵기와 높이가 흔들리지
+   * 않는다. 숫자만 Roboto 로 넘겨 파일 크기 표시가 또렷하게 보이도록 한다. */
+  --font-sans: "Noto Sans KR", "Malgun Gothic", "Segoe UI", system-ui, sans-serif;
+  --font-num: "Roboto", "Noto Sans KR", "Segoe UI", system-ui, sans-serif;
+
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --border: #e3e6ea;
+  --border-strong: #cfd4da;
+  --text: #1b1f24;
+  --text-dim: #5b6470;
+  --text-faint: #8b939e;
+  --accent: #4f7cff;
+  --accent-deep: #7c4dff;
+  --ok: #0f7b4f;
+  --ok-bg: #eaf7f0;
+  --warn: #8a5a00;
+  --warn-bg: #fdf4e3;
+  --error: #b4232b;
+  --error-bg: #fdeeee;
+  --radius: 12px;
+  --radius-sm: 8px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* `hidden` 을 이기지 못하게 못박아 둔다.
+ *
+ * 브라우저 기본 스타일시트의 `[hidden] { display: none }` 은 작성자 스타일보다 약하다. 그래서
+ * `.panel { display: flex }` 같은 규칙 하나만으로도 `hidden` 이 무력화돼 숨겨야 할 패널이 그대로
+ * 보인다. JS 가 여러 훅을 `hidden` 으로 토글하므로 여기서 한 번에 막는다. */
+[hidden] {
+  display: none !important;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  /* 14px 은 한글에서 받침이 뭉친다. 15px + 1.6 배 행간이 훨씬 편하게 읽힌다. */
+  font-size: 15px;
+  line-height: 1.6;
+  /* 한글은 자간을 살짝 좁혀야 단어 덩어리가 또렷해진다. */
+  letter-spacing: -0.01em;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  /* 텍스트를 드래그로 집어 올릴 수 없게 한다 — 여기선 파일 드롭이 주 상호작용이다. */
+  user-select: none;
+}
+
+/* 숫자가 섞인 표시(크기, 개수, 퍼센트)는 자릿수를 고정해 값이 바뀔 때 흔들리지 않게 한다. */
+.tnum {
+  font-family: var(--font-num);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  letter-spacing: 0;
+}
+
+h1 {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+/* ---------------------------------------------------------------- 레이아웃 */
+
+.app-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 20px 28px 0;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.brand-mark {
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-deep));
+  flex: none;
+}
+
+.brand-sub {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  background: #e9ecf1;
+  border-radius: 10px;
+}
+
+.tab {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  padding: 8px 22px;
+  border-radius: 7px;
+  font: inherit;
+  font-weight: 600;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.tab.is-active {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 1px 3px rgb(27 31 36 / 12%);
+}
+
+.tab:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+main {
+  padding: 20px 28px 28px;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* ---------------------------------------------------------------- 드롭존 */
+
+.dropzone {
+  border: 2px dashed var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 28px 20px;
+  text-align: center;
+  transition:
+    border-color 120ms ease,
+    background 120ms ease;
+}
+
+.dropzone.is-dragover {
+  border-color: var(--accent);
+  background: #f0f4ff;
+}
+
+.dropzone-title {
+  margin: 0 0 4px;
+  font-weight: 600;
+}
+
+.dropzone-sub {
+  margin: 0 0 14px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.dropzone-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+}
+
+/* ---------------------------------------------------------------- 목록 */
+
+.list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 24px;
+}
+
+.list-summary {
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.empty {
+  margin: 0;
+  padding: 14px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-faint);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.list:empty {
+  display: none;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.row[data-kind="missing"] {
+  border-color: #f0c9c9;
+  background: var(--error-bg);
+}
+
+.row-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.row-meta {
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.row-remove {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 18px;
+  line-height: 1;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.row-remove:hover:not(:disabled) {
+  background: #eef0f3;
+  color: var(--text);
+}
+
+/* ---------------------------------------------------------------- 입력 */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.key-row {
+  display: flex;
+  gap: 8px;
+}
+
+.input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  user-select: text;
+}
+
+.input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  border-color: var(--accent);
+}
+
+.input:disabled {
+  background: #f1f2f4;
+  color: var(--text-faint);
+}
+
+.strength,
+.hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.strength[data-level="weak"] {
+  color: var(--error);
+}
+
+.strength[data-level="fair"] {
+  color: var(--warn);
+}
+
+.strength[data-level="strong"] {
+  color: var(--ok);
+}
+
+.hint {
+  color: var(--accent);
+}
+
+/* ---------------------------------------------------------------- 버튼 */
+
+.btn {
+  appearance: none;
+  font: inherit;
+  font-weight: 600;
+  padding: 9px 16px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn:hover:not(:disabled) {
+  border-color: var(--text-faint);
+}
+
+.btn:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, var(--accent), var(--accent-deep));
+  border-color: transparent;
+  color: #fff;
+  padding: 12px 18px;
+}
+
+.btn-primary:disabled {
+  background: #c3c8d0;
+  color: #fff;
+  opacity: 1;
+}
+
+.btn-block {
+  width: 100%;
+}
+
+.btn-quiet {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-dim);
+  padding: 6px 10px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.btn-quiet:hover:not(:disabled) {
+  background: #eef0f3;
+  border-color: transparent;
+}
+
+.btn-ghost.is-active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ---------------------------------------------------------------- 카드 / 진행률 / 상태 */
+
+.card {
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.card-title {
+  margin: 0;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.card-meta {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.progress-track {
+  height: 6px;
+  border-radius: 999px;
+  background: #e3e6ea;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-deep));
+  transition: width 120ms linear;
+}
+
+/* 총량을 아직 모르는 구간에서는 막대를 훑어 지나가게 한다. */
+.progress-fill[data-indeterminate="true"] {
+  transition: none;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--accent) 40%,
+    var(--accent-deep) 60%,
+    transparent 100%
+  );
+  background-size: 40% 100%;
+  background-repeat: no-repeat;
+  animation: sweep 1.1s ease-in-out infinite;
+}
+
+@keyframes sweep {
+  from {
+    background-position: -40% 0;
+  }
+  to {
+    background-position: 140% 0;
+  }
+}
+
+.progress-label {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status {
+  margin: 0;
+  padding: 11px 13px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  /* 여러 줄 보고(건너뛴 항목 등)를 줄바꿈 그대로 보여 준다. */
+  white-space: pre-line;
+  user-select: text;
+}
+
+.status[data-kind="ok"] {
+  background: var(--ok-bg);
+  color: var(--ok);
+}
+
+.status[data-kind="warn"] {
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+
+.status[data-kind="error"] {
+  background: var(--error-bg);
+  color: var(--error);
+}
+
+body[data-busy="true"] {
+  cursor: progress;
+}
+
+/* ---------------------------------------------------------------- 어두운 테마 */
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181c;
+    --surface: #1e2126;
+    --border: #2c3037;
+    --border-strong: #3a3f47;
+    --text: #e8eaed;
+    --text-dim: #a2aab5;
+    --text-faint: #757d88;
+    --ok: #6ee7a8;
+    --ok-bg: #12281e;
+    --warn: #f0c674;
+    --warn-bg: #2b2314;
+    --error: #ff9b9b;
+    --error-bg: #2c1719;
+  }
+
+  .tabs {
+    background: #23262c;
+  }
+
+  .tab.is-active {
+    background: #2f333a;
+  }
+
+  .dropzone.is-dragover {
+    background: #1c2333;
+  }
+
+  .empty,
+  .btn-quiet:hover:not(:disabled),
+  .row-remove:hover:not(:disabled) {
+    background: #23262c;
+  }
+
+  .input:disabled {
+    background: #23262c;
+  }
+
+  .progress-track {
+    background: #2c3037;
+  }
+
+  .row[data-kind="missing"] {
+    border-color: #5a2b2b;
+    background: var(--error-bg);
+  }
+}
+
+/* ---------------------------------------------------------------- 텍스트 결과 / 붙여넣기 */
+
+.output {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.output-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.textarea {
+  /* armor 본문은 76자 고정폭이다. 등폭 글꼴이어야 줄이 가지런히 맞아 "온전히 복사됐다" 는
+   * 느낌을 준다. 본문 글꼴로 두면 줄마다 길이가 달라 보여 불안해진다. */
+  font-family: ui-monospace, "Cascadia Mono", Consolas, "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  letter-spacing: 0;
+  min-height: 132px;
+  max-height: 240px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  resize: vertical;
+  /* 76자가 접히지 않게 가로로만 흘린다. */
+  white-space: pre;
+  overflow: auto;
+  user-select: text;
+}
+
+.textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  border-color: var(--accent);
+}
+
+.textarea:disabled {
+  background: #f1f2f4;
+  color: var(--text-faint);
+}
+
+.textarea::placeholder {
+  font-family: var(--font-sans);
+  color: var(--text-faint);
+}
+
+.or-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+.or-divider::before,
+.or-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+@media (prefers-color-scheme: dark) {
+  .textarea:disabled {
+    background: #23262c;
+  }
+}
