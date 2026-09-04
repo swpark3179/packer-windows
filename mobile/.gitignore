@@ -1,0 +1,11 @@
+# 네이티브 프로젝트는 생성물이다. `npm run sync` 가 다시 만들고 patch-native.mjs 가
+# 필수 설정을 다시 넣어 준다. 수천 개 파일을 이력에 남기지 않는다.
+android/
+ios/
+
+node_modules/
+
+# 이 프로젝트는 npm 을 쓴다 (루트는 pnpm). pnpm 의 심볼릭 링크 node_modules 는 Gradle 의
+# `project(':capacitor-android')` 와 CocoaPods 의 `:path =>` 해석을 방해한다. package-lock.json
+# 은 커밋한다 — 네이티브 빌드는 재현 가능해야 한다.
+pnpm-lock.yaml
