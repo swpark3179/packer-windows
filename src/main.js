@@ -11,6 +11,8 @@
 //             pack-key-strength, pack-submit, pack-progress, pack-progress-fill,
 //             pack-progress-label, pack-status, pack-reveal
 //   결과 텍스트 pack-output, pack-output-text, pack-output-copy, pack-output-note
+//   결과 QR    pack-qr (data-state=single|split|toobig), pack-qr-image, pack-qr-note,
+//             pack-qr-nav, pack-qr-prev, pack-qr-next, pack-qr-index
 //   풀기      unpack-dropzone, unpack-pick, unpack-file, unpack-file-name,
 //             unpack-file-meta, unpack-text, unpack-text-clear, unpack-source-note,
 //             unpack-key, unpack-key-toggle, unpack-key-hint, unpack-dest,
@@ -38,6 +40,8 @@ const state = {
   items: [],
   /// 방금 묶어 낸 결과. `{ dest, text }`
   packed: null,
+  /// 결과를 담은 QR 코드 그림들과 지금 보고 있는 장. `{ images, index }` (없으면 null)
+  qr: null,
   /// 풀어낼 대상. `{ kind: "file" | "text", info, text }`
   source: null,
 };
@@ -88,6 +92,16 @@ function formatBytes(bytes) {
   const value = bytes / 1024 ** i;
   const digits = i === 0 ? 0 : value < 10 ? 1 : 0;
   return `${value.toFixed(digits)} ${units[i]}`;
+}
+
+/// QR 한도 근처에서 쓰는 크기 표기.
+///
+/// `formatBytes` 는 2953 도 3000 도 "2.9 KB" 로 적는다. 그러면 안내문이 "2.9 KB라서 2.9 KB 를
+/// 넘습니다" 처럼 스스로 모순된다. QR 로 다룰 수 있는 범위가 전부 64 KB 아래에 들어오므로,
+/// 그 아래는 정확한 바이트로 말해 값과 한도의 자릿수가 겹치지 않게 한다.
+function qrBytes(bytes) {
+  if (bytes >= 64 * 1024) return formatBytes(bytes);
+  return `${String(bytes).replace(/\B(?=(\d{3})+(?!\d))/g, ",")} B`;
 }
 
 /// Rust 쪽 에러는 `{ code, message }` 로 온다. message 는 이미 완성된 한국어 문장이다.
@@ -400,6 +414,14 @@ function refreshButtons() {
   const copy = el("pack-output-copy");
   if (copy) copy.disabled = state.busy || !state.packed;
 
+  // QR 넘기기. 끝 판정과 작업 중 잠금을 한곳에서 계산한다 — 아래 일괄 잠금 목록에 넣으면
+  // `disabled = state.busy` 가 끝 판정을 덮어써서 마지막 장에서도 '다음' 이 열린다.
+  const qr = state.qr;
+  const qrPrev = el("pack-qr-prev");
+  const qrNext = el("pack-qr-next");
+  if (qrPrev) qrPrev.disabled = state.busy || !qr || qr.index === 0;
+  if (qrNext) qrNext.disabled = state.busy || !qr || qr.index >= qr.images.length - 1;
+
   for (const hook of [
     "pack-add-files",
     "pack-add-folders",
@@ -463,7 +485,142 @@ function clearPackOutput() {
   const textarea = el("pack-output-text");
   if (textarea) textarea.value = "";
   show("pack-output", false);
+  // 지난 QR 이 남으면 *이전* 컨테이너를 가리키는 그림을 새 결과인 줄 알고 찍어 보낸다.
+  // 텍스트를 치우는 모든 경로에서 그림도 함께 사라지도록 여기 안에 둔다.
+  clearPackQr();
   refreshButtons();
+}
+
+// ---------------------------------------------------------------- 결과 QR
+
+/// 결과 텍스트를 QR 코드 그림으로도 보여 준다.
+///
+/// 한 장에 담기지 않으면 여러 장으로 나눠 준다. 앱이 다시 이어 붙여 주지는 않는다 — 사용자가
+/// 순서대로 스캔해 이어 붙인다. 그래서 뷰어는 한 번에 한 장만 크게 보여 준다: 작은 타일로
+/// 늘어놓으면 모듈이 1px 까지 줄어들어 휴대폰이 읽지 못하고, 아무 장이나 먼저 찍게 되어 순서가
+/// 어긋난다.
+function renderPackQr(result) {
+  const images = Array.isArray(result.qr) && result.qr.length > 0 ? result.qr : null;
+  state.qr = images ? { images, index: 0 } : null;
+
+  const section = el("pack-qr");
+  if (section) {
+    section.dataset.state = !images ? "toobig" : images.length > 1 ? "split" : "single";
+  }
+
+  show("pack-qr", true);
+  // 안내 문구는 결과마다 한 번만 정한다. 장을 넘길 때는 건드리지 않는다 — 읽는 도중에 문장이
+  // 바뀌면 읽던 자리를 잃는다.
+  setText("pack-qr-note", qrNote(result, state.qr));
+  showPackQrPage();
+}
+
+/// 지금 보고 있는 장을 그림·설명·번호·넘기기에 반영한다.
+function showPackQrPage() {
+  const qr = state.qr;
+  const image = el("pack-qr-image");
+
+  if (!qr) {
+    if (image) {
+      // `src = ""` 는 문서 URL 을 다시 요청한다. 반드시 속성 자체를 지운다.
+      image.removeAttribute("src");
+      image.style.removeProperty("width");
+    }
+    show("pack-qr-image", false);
+    show("pack-qr-nav", false);
+    setText("pack-qr-index", "");
+    refreshButtons();
+    return;
+  }
+
+  const total = qr.images.length;
+  const page = qr.images[qr.index];
+
+  if (image) {
+    image.src = `data:image/png;base64,${page.png_base64}`;
+    // PNG 은 1모듈 = 1픽셀이다. 정수 배율로만 키운다 — 배율에 소수점이 붙으면 모듈 폭이
+    // 3px/4px 로 들쭉날쭉해져 휴대폰이 초점을 맞춰도 인식하지 못한다.
+    //
+    // 모듈당 최소 3px 을 보장한다. 버전 40(여백 포함 185모듈)이 555px 이 되어 96 DPI 에서
+    // 모듈 하나가 0.79mm 다. 그보다 작으면 폰이 화면에서 읽어내지 못한다.
+    const modules = Number(page.png_modules) || 0;
+    if (modules > 0) {
+      image.style.width = `${modules * Math.max(3, Math.min(10, Math.floor(560 / modules)))}px`;
+    } else {
+      image.style.removeProperty("width");
+    }
+    image.alt =
+      total > 1
+        ? `묶은 결과 텍스트를 담은 QR 코드 ${total}장 중 ${qr.index + 1}번째`
+        : "묶은 결과 텍스트를 담은 QR 코드";
+  }
+  show("pack-qr-image", true);
+
+  // 한 장이면 넘길 곳이 영원히 없다. 뜻이 없는 조작 도구는 잠그기보다 감춘다 — 잠가 두면
+  // 더 있을 것처럼 보인다. (pack-key-strength, pack-progress, pack-reveal 과 같은 규칙)
+  show("pack-qr-nav", total > 1);
+  setText("pack-qr-index", total > 1 ? `${qr.index + 1} / ${total}` : "");
+  refreshButtons();
+}
+
+function stepPackQr(delta) {
+  if (!state.qr) return;
+  const last = state.qr.images.length - 1;
+  // 끝에서 되돌아 감지 않는다. 16장을 순서대로 찍는 중에 1장으로 돌아가 버리면 어디까지
+  // 했는지 잃고, '다음' 이 잠기는 것이 유일한 "다 찍었다" 신호이기도 하다.
+  const next = Math.min(Math.max(state.qr.index + delta, 0), last);
+  if (next === state.qr.index) return;
+  state.qr.index = next;
+  showPackQrPage();
+
+  // 방금 누른 버튼이 끝에서 잠기면 크로미움이 포커스를 body 로 떨어뜨린다. 키보드로 넘기던
+  // 사람이 자리를 잃지 않도록 반대쪽 버튼으로 옮겨 준다.
+  const back = el("pack-qr-prev");
+  const forward = el("pack-qr-next");
+  const active = document.activeElement;
+  if (active === forward && forward?.disabled) back?.focus();
+  else if (active === back && back?.disabled) forward?.focus();
+}
+
+function clearPackQr() {
+  state.qr = null;
+  const section = el("pack-qr");
+  if (section) section.dataset.state = "";
+  show("pack-qr", false);
+  setText("pack-qr-note", "");
+  showPackQrPage();
+}
+
+function qrNote(result, qr) {
+  if (!qr) {
+    const perQr = Number(result.qr_limit_bytes) || 0;
+    const maxQr = Number(result.qr_limit_pieces) || 0;
+    // 한도를 모르면(예전 응답) 숫자를 지어내지 않고 그 문장만 뺀다.
+    const cap =
+      perQr > 0 && maxQr > 0
+        ? ` QR 코드 한 장에 ${qrBytes(perQr)} 씩 최대 ${maxQr}장까지만 나눕니다.`
+        : "";
+    return (
+      `묶은 텍스트가 ${qrBytes(result.container_bytes)}라서 QR 코드로는 보낼 수 없습니다.${cap}\n` +
+      `그보다 많이 나누면 순서대로 스캔해 이어 붙이는 일 자체가 현실적이지 않습니다. ` +
+      `위의 텍스트를 복사해 보내 주세요.`
+    );
+  }
+
+  const total = qr.images.length;
+  if (total === 1) {
+    return (
+      `${qrBytes(qr.images[0].text_bytes)} · 휴대폰 기본 카메라로 비추면 이 텍스트가 그대로 ` +
+      `보입니다. 거기서 복사해 풀기 탭에 붙여넣으면 그대로 풀립니다.`
+    );
+  }
+  return (
+    `${qrBytes(result.container_bytes)} · QR 코드 한 장에 담기지 않아 ${total}장으로 나눴습니다.\n` +
+    `#1 부터 순서대로 스캔해 메모장에 차례로 이어 붙이고, 그 전체를 풀기 탭에 붙여넣으면 ` +
+    `풀립니다.\n` +
+    `각 장 안에 #1/${total} 부터 #${total}/${total} 까지 순서 표시가 들어 있으니 붙여넣은 뒤 ` +
+    `순서를 확인해 주세요 — 표시 줄은 지우지 않아도 됩니다.`
+  );
 }
 
 async function doPack() {
@@ -493,6 +650,7 @@ async function doPack() {
     applySessionKey();
     remember(REMEMBERED.saveDir, parentDir(result.dest));
     renderPackOutput(result);
+    renderPackQr(result);
 
     const saved =
       result.original_bytes > 0
@@ -660,6 +818,8 @@ function wireEvents() {
   });
   el("pack-submit")?.addEventListener("click", doPack);
   el("pack-output-copy")?.addEventListener("click", copyPackOutput);
+  el("pack-qr-prev")?.addEventListener("click", () => stepPackQr(-1));
+  el("pack-qr-next")?.addEventListener("click", () => stepPackQr(1));
 
   el("unpack-pick")?.addEventListener("click", async () => {
     const picked = await invoke("pick_container");

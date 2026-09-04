@@ -15,7 +15,8 @@ RlNYUEFDSzEBAAEBAQAAAEK5K6b6r1aIIlxEpDdMCbgnJMwY3L43uqdbB7QKUNsBAAABAAMAAAAE
 
 - **묶기** — 창으로 파일/폴더를 끌어다 놓고 암호화 키를 넣은 뒤 "묶고 암호화하기".
   압축 + 직렬화 + 암호화를 한 번에 처리하고 `.txt` 로 저장한다. 결과 텍스트를 화면에서 바로
-  확인하고 "전체 복사" 로 클립보드에 담을 수 있다.
+  확인하고 "전체 복사" 로 클립보드에 담을 수 있다. **QR 코드로도 띄운다** — 한 장에 담기지
+  않으면 여러 장으로 나눠 한 번에 한 장씩 보여 주고, 사용자가 순서대로 스캔해 이어 붙인다.
 - **풀기** — `.txt` 파일을 놓거나 **받은 텍스트를 붙여넣고** 같은 키로 "풀고 복호화하기".
   복호화 + 역직렬화 + 압축해제 후 지정한 폴더에 모아 준다.
 
@@ -108,6 +109,56 @@ src-tauri/src/
 초기 버전이 만든 원시 바이너리 컨테이너도 계속 읽을 수 있다. 입력 앞 8바이트가 매직과 같으면
 armor 를 거치지 않는다. 새로 묶을 때는 항상 텍스트로만 쓴다.
 
+### QR 코드 (한 장 2,953바이트 · 최대 16장)
+
+묶은 텍스트를 QR 코드로도 띄운다. 휴대폰 기본 카메라로 비추면 텍스트가 그대로 보이고, 복사해서
+다른 기기의 풀기 탭에 붙여넣으면 파일이 돌아온다. 케이블도 메신저도 계정도 필요 없다.
+
+QR 코드 한 장에 바이트 모드로 들어가는 최대치는 2,953바이트(버전 40, 오류 정정 L)다. armor 가
+4/3 배로 늘려 놓기 때문에 원본이 몇 KB만 넘어도 한 장에는 담기지 않는다. 그때는 **여러 장으로
+나눈다** — 줄바꿈을 없앤 armor 본문을 N등분해 1번 장에 시작 표시, N번 장에 끝 표시를 붙이고,
+각 장에 `#i/N` 순서 표시를 넣는다. 순서대로 이어 붙이면 그대로 유효한 컨테이너가 된다.
+
+```
+-----BEGIN PACKER CONTAINER-----      ← 1번 장에만
+#1/3
+QUFBQkJCQ0ND...
+```
+
+**이어 붙이는 건 사람이 한다.** 규격에는 여러 심볼을 잇는 Structured Append 가 있지만 휴대폰
+**기본** 카메라 앱은 그걸 모른다 — 한 장씩 읽을 뿐이다. 앱도 QR 을 읽지 않는다(내보내기 전용).
+그래서 순서 표시를 텍스트 안에 넣어 붙여넣은 뒤에도 눈으로 확인할 수 있게 했다. `ArmorReader` 는
+본문 어디에 있든 `#숫자/숫자` 만 정확히 건너뛴다 — 줄 끝까지 버리지 않는 이유는, 붙여넣는 과정에서
+줄바꿈이 사라져 `...AbCd#2/3RkZG...` 처럼 뭉쳐도 본문을 잃지 않아야 하기 때문이다. 순서가 어긋나면
+`PieceOrder` 로 짚어 준다. 이게 없으면 한참 뒤 GCM 인증 실패로만 나타나서 안내가 "이 파일은 이
+프로그램으로 묶은 파일이 아닙니다" 같은 **사실과 다른 말**을 하게 된다.
+
+`#` 하나만 예외로 두는 것이 "깨진 붙여넣기를 조용히 통과시키지 않는다" 는 약속을 깨지 않는
+이유는 `armor.rs` 모듈 문서에 적어 두었다. 요지는 두 가지다: `#` 은 손상의 산물이 아니고, 바이트
+손실을 실제로 막는 것은 armor 의 글자 검사가 아니라 청크마다 붙는 GCM 태그와 헤더의 KCV 다.
+
+**16장이 상한이다.** QR 규격의 Structured Append 한계와 같은 값이고, 실측으로 armor 본문 약
+46,000자까지 담긴다. 그보다 커지면 `qr` 이 `null` 로 오고 화면이 크기와 한도를 적어 준다. 장수를
+더 늘리는 것은 기술적으로 가능하지만 순서대로 스캔해 이어 붙이는 일 자체가 현실적이지 않다.
+
+**한 번에 한 장만 크게 보여 준다.** 버전 40 은 177×177모듈(여백 포함 185)이라 16장을 타일로
+늘어놓으면 한 장이 185px 남짓, 모듈 하나가 1픽셀까지 줄어 휴대폰이 읽지 못한다. 그래서 큰 그림
+한 장에 `3 / 16` 번호와 이전·다음만 둔다. 양끝에서 되돌아 감지 않는 것도 의도다 — '다음' 이
+잠기는 것이 "다 찍었다" 는 유일한 신호이고, 아무 장이나 먼저 찍을 수 없어 순서가 어긋나지 않는다.
+
+PNG 은 **1모듈 = 1픽셀**로 만들고 여백(quiet zone) 4모듈을 그림 안에 포함한다. 확대는 화면 쪽에서
+정수 배율로만 한다(모듈당 최소 3px, 버전 40 이면 555px) — 배율에 소수점이 붙으면 모듈 폭이
+3px/4px 로 들쭉날쭉해져 초점이 맞아도 인식되지 않는다. 여백을 CSS 패딩에만 두면 안 된다: 패딩은
+12px 고정인데 모듈은 3~10px 로 변해 배율이 높을 때 4모듈을 채우지 못하고, 화면을 캡처해 잘라내면
+함께 사라진다.
+
+조각 텍스트에는 ASCII 만 넣는다. 바이트 모드 QR 에는 믿을 수 있는 문자셋 선언이 없어 디코더마다
+ISO-8859-1 이나 UTF-8 로 제각기 짐작하는데, 우리 payload 는 전부 ASCII 라 어느 해석으로 읽어도
+바이트가 같다. 한국어 안내는 화면에만 둔다.
+
+이 관용은 리더에만 있고 라이터는 그대로다. `.txt` 형식은 달라지지 않는다. 다만 조각을 이어 붙인
+텍스트는 이 변경 이전 빌드에서 `ArmorDamaged` 가 된다.
+
 ### 설계 근거
 
 - **청크 단위 암호화** — 원샷 GCM 은 평문 전체를 메모리에 올려야 하고 키/nonce 당 약 64 GiB
@@ -144,6 +195,7 @@ armor 를 거치지 않는다. 새로 묶을 때는 항상 텍스트로만 쓴�
 | 탭 | `tab[data-tab=pack\|unpack]`, `panel[data-tab=pack\|unpack]` |
 | 묶기 | `pack-dropzone` `pack-list` `pack-empty` `pack-summary` `pack-clear` `pack-add-files` `pack-add-folders` `pack-key` `pack-key-toggle` `pack-key-strength` `pack-submit` `pack-progress` `pack-progress-fill` `pack-progress-label` `pack-status` `pack-reveal` |
 | 결과 텍스트 | `pack-output` `pack-output-text` `pack-output-copy` `pack-output-note` |
+| 결과 QR | `pack-qr` (`data-state=single\|split\|toobig`) `pack-qr-image` `pack-qr-note` `pack-qr-nav` `pack-qr-prev` `pack-qr-next` `pack-qr-index` |
 | 풀기 | `unpack-dropzone` `unpack-pick` `unpack-file` `unpack-file-name` `unpack-file-meta` `unpack-text` `unpack-text-clear` `unpack-source-note` `unpack-key` `unpack-key-toggle` `unpack-key-hint` `unpack-dest` `unpack-dest-pick` `unpack-submit` `unpack-progress` `unpack-progress-fill` `unpack-progress-label` `unpack-status` `unpack-reveal` |
 | 목록 행 | `row-template` (안에 `[data-field=name]` `[data-field=meta]` `[data-pk=row-remove]`) |
 
@@ -162,6 +214,11 @@ armor 를 거치지 않는다. 새로 묶을 때는 항상 텍스트로만 쓴�
   일도 안 한 것처럼 보인다.
 - **결과 텍스트 영역은 등폭 글꼴로 둔다.** armor 본문은 76자 고정폭이라 등폭이어야 줄이
   가지런히 맞고 "온전히 복사됐다" 는 느낌을 준다.
+- **QR 판은 어두운 테마에서도 흰 바탕이어야 한다.** 색을 반전한 QR 은 휴대폰 기본 카메라가
+  읽지 못한다. `.qr-frame` 의 흰 배경과 `.qr-image` 의 `image-rendering: pixelated`, 고대비
+  모드용 `forced-color-adjust: none` 을 목업 값으로 덮어쓰지 말 것. 확대 배율은 `main.js` 가
+  `png_modules` 의 정수 배로 인라인 지정하고, `.qr-index` 의 `min-width` 는 장을 넘길 때
+  '다음' 버튼이 옆으로 밀리지 않게 하는 값이다.
 
 ## 폰트
 

@@ -4,6 +4,7 @@ pub mod commands;
 pub mod container;
 pub mod crypto;
 pub mod error;
+pub mod qr;
 pub mod safepath;
 
 pub fn run() {

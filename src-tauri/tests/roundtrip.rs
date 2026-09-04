@@ -543,3 +543,213 @@ fn text_is_larger_than_binary_but_still_compresses_well() {
         packed.container_bytes
     );
 }
+
+// ---------------------------------------------------------------- QR
+
+/// 화면에 띄우는 정수 배율. `main.js` 의 규칙과 같은 값이어야 한다.
+///
+/// PNG 은 1모듈 = 1픽셀로 저장하고 확대는 화면 쪽에서 한다. 그래서 검증도 저장된 비트맵이
+/// 아니라 **사용자가 실제로 보는 그림**을 대상으로 해야 한다 — 1픽셀 격자는 디코더가 모듈
+/// 중심을 집어내지 못해서(`DataEcc`), 사람이 폰으로 찍는 상황과 다르다.
+fn display_scale(png_modules: usize) -> usize {
+    (560 / png_modules).clamp(3, 10)
+}
+
+/// Base64 PNG → 8비트 회색조 → 화면 배율로 확대 → QR 디코드.
+fn decode_qr_png(png_base64: &str) -> String {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(png_base64)
+        .unwrap();
+
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    // 1비트로 저장했으므로 8비트 회색조로 펼쳐 받는다 (0 = 검정, 255 = 흰색).
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().unwrap();
+    let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut buf).unwrap();
+    assert_eq!(info.width, info.height, "QR 은 정사각형이다");
+    let width = info.width as usize;
+
+    // 화면이 하는 것과 같은 정수 배율 확대 (보간 없이 네모를 그대로 키운다).
+    let scale = display_scale(width);
+    let side = width * scale;
+    let mut prepared = rqrr::PreparedImage::prepare_from_greyscale(side, side, |x, y| {
+        buf[(y / scale) * width + (x / scale)]
+    });
+    let grids = prepared.detect_grids();
+    assert_eq!(grids.len(), 1, "심볼을 하나만 찾아야 한다");
+    grids[0].decode().unwrap().1
+}
+
+/// 압축도 안 되고 규칙도 없는 바이트열.
+///
+/// 곱셈 해시를 그대로 쓰면 이웃한 값의 차이가 일정해서 zstd 가 규칙을 찾아낸다. 그러면 "QR 에
+/// 안 들어갈 만큼 크다" 같은 크기 조건이 조용히 성립하지 않는다.
+fn incompressible(len: usize) -> Vec<u8> {
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+/// QR 로 옮길 만한 작은 트리. 큰 트리는 QR 한도를 한참 넘는다.
+fn build_small_tree(root: &Path) {
+    write_file(&root.join("메모.txt"), "한글 내용\n두 번째 줄\n".as_bytes());
+    write_file(&root.join("blob.bin"), &[0u8, 1, 2, 255, 254, 128]);
+    write_file(&root.join("empty.txt"), b"");
+    write_file(&root.join("conf/settings.json"), br#"{"theme":"dark","scale":150}"#);
+}
+
+/// 이 기능이 실제로 약속을 지키는지 — 화면의 그림을 폰으로 찍어 이어 붙이면 파일이 돌아온다.
+///
+/// 그림을 눈으로 확인할 수 없으니 PNG 를 되읽어 QR 디코더에 넣고, 나온 문자열을 붙여넣기
+/// 경로(`ContainerSource::Text`)에 그대로 넘겨 원본과 바이트까지 같은지 본다. 이 테스트가
+/// 통과하면 인코딩·여백·조각 나눔·`#` 주석 규칙·리더 관용성이 모두 동시에 맞다는 뜻이다.
+#[test]
+fn qr_pieces_round_trip_through_a_real_decoder() {
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("원본");
+    build_small_tree(&source);
+    // 한 심볼을 넘겨 조각 나눔 경로까지 밟게 한다. 압축이 거의 안 되는 데이터라야 한다.
+    write_file(&source.join("noise.bin"), &incompressible(6000));
+
+    let container = work.path().join("bundle.txt");
+    let key = "열려라 참깨 2026!";
+    let packed = pack_to_file(
+        std::slice::from_ref(&source),
+        key,
+        &container,
+        &mut silent,
+    )
+    .unwrap();
+
+    let images = packed.qr.expect("이 크기는 QR 로 나와야 한다");
+    assert!(!packed.qr_omitted);
+    assert!(images.len() > 1, "조각이 나뉘어야 한다: {}", images.len());
+    // 화면에서 장을 넘길 때 크기가 들썩이지 않도록 모두 같은 규격이어야 한다.
+    assert!(images.iter().all(|i| i.png_modules == images[0].png_modules));
+    assert!(images.iter().all(|i| i.ec_level == images[0].ec_level));
+
+    // 사용자가 조각을 순서대로 찍어 이어 붙인 상황. 카메라 앱이 조각 끝의 줄바꿈을 떼어 낸
+    // 최악의 경우로 만든다 — 그러면 앞 조각 본문 끝에 다음 조각의 순서 표시가 달라붙는다.
+    let mut pasted = String::new();
+    for (at, image) in images.iter().enumerate() {
+        assert_eq!(image.index, at + 1);
+        assert_eq!(image.total, images.len());
+        pasted.push_str(decode_qr_png(&image.png_base64).trim_end_matches('\n'));
+    }
+
+    let dest = work.path().join("복원");
+    let restored = unpack_to_dir(&from_text(&pasted), key, &dest, &mut silent).unwrap();
+    assert!(restored.hash_mismatch.is_empty(), "{:?}", restored.hash_mismatch);
+    assert!(restored.skipped.is_empty(), "{:?}", restored.skipped);
+    assert_trees_match(&source, &dest.join("원본"));
+}
+
+/// 조각을 순서대로 찍지 않으면 무엇이 잘못됐는지 짚어 준다.
+///
+/// 이 안내가 없으면 "이 파일은 이 프로그램으로 묶은 파일이 아닙니다" 나 "손상되었습니다" 가
+/// 나오는데, 둘 다 사실과 다르고 사용자를 엉뚱한 곳으로 보낸다.
+#[test]
+fn reports_pieces_pasted_out_of_order() {
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("원본");
+    build_small_tree(&source);
+    write_file(&source.join("noise.bin"), &incompressible(6000));
+
+    let container = work.path().join("bundle.txt");
+    let key = "순서 테스트";
+    let packed =
+        pack_to_file(std::slice::from_ref(&source), key, &container, &mut silent).unwrap();
+
+    let mut texts: Vec<String> = packed
+        .qr
+        .unwrap()
+        .iter()
+        .map(|image| decode_qr_png(&image.png_base64))
+        .collect();
+    assert!(texts.len() > 2, "순서를 바꿔 볼 만큼 나뉘어야 한다");
+    texts.swap(1, 2);
+
+    let dest = work.path().join("복원");
+    match unpack_to_dir(&from_text(&texts.concat()), key, &dest, &mut silent) {
+        Err(Error::PieceOrder(found)) => {
+            assert!(found.contains('#'), "찾은 순서를 보여 줘야 한다: {found}");
+        }
+        other => panic!("순서가 뒤바뀐 걸 못 짚었다: {other:?}"),
+    }
+    assert_destination_is_clean(&dest);
+}
+
+/// 조각 형식 자체는 디코더 없이도 지켜져야 한다. `rqrr` 을 나중에 걷어내도 이 계약은 남는다.
+#[test]
+fn qr_pieces_survive_the_paste_path_without_a_decoder() {
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("원본");
+    build_small_tree(&source);
+
+    let container = work.path().join("bundle.txt");
+    let key = "조각 형식";
+    pack_to_file(std::slice::from_ref(&source), key, &container, &mut silent).unwrap();
+
+    let text = fs::read_to_string(&container).unwrap();
+    let body = packer_lib::armor::body_of(&text).unwrap();
+    let pieces = packer_lib::armor::pieces(&body, 5);
+
+    let dest = work.path().join("복원");
+    let restored = unpack_to_dir(&from_text(&pieces.concat()), key, &dest, &mut silent).unwrap();
+    assert!(restored.hash_mismatch.is_empty());
+    assert_trees_match(&source, &dest.join("원본"));
+}
+
+/// QR 로 옮길 만한 크기가 아니면 조용히 비워 두고, 화면이 그 이유를 말할 수 있게 한도를 알려 준다.
+#[test]
+fn qr_is_omitted_for_a_large_container() {
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("원본");
+    // 압축이 안 되는 200 KiB — 어떤 나눔으로도 16장에 담기지 않는다.
+    write_file(&source.join("noise.bin"), &incompressible(200 * 1024));
+
+    let container = work.path().join("bundle.txt");
+    let packed =
+        pack_to_file(std::slice::from_ref(&source), "키", &container, &mut silent).unwrap();
+
+    assert!(packed.qr.is_none());
+    assert!(packed.qr_omitted);
+    assert_eq!(packed.qr_limit_pieces, 16);
+    assert_eq!(packed.qr_limit_bytes, 2953);
+    // 묶기 자체는 성공했다. 텍스트는 정상으로 나와야 한다.
+    assert!(packed.container_bytes > 0);
+}
+
+/// 작은 묶음은 한 장으로 나온다. 사용자가 폰을 한 번만 대면 끝나는 경우다.
+#[test]
+fn a_small_bundle_fits_in_a_single_symbol() {
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("메모.txt");
+    write_file(&source, "회의 시간 3시로 변경\n장소는 그대로\n".as_bytes());
+
+    let container = work.path().join("bundle.txt");
+    let key = "한 장이면 충분";
+    let packed =
+        pack_to_file(std::slice::from_ref(&source), key, &container, &mut silent).unwrap();
+
+    let images = packed.qr.expect("작은 메모는 한 장에 담겨야 한다");
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].total, 1);
+
+    // 한 장짜리도 스캔해서 붙여넣으면 그대로 풀린다.
+    let dest = work.path().join("복원");
+    let pasted = decode_qr_png(&images[0].png_base64);
+    unpack_to_dir(&from_text(&pasted), key, &dest, &mut silent).unwrap();
+    assert_eq!(
+        fs::read(dest.join("메모.txt")).unwrap(),
+        fs::read(&source).unwrap()
+    );
+}

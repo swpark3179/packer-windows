@@ -34,8 +34,16 @@ walkdir = "2"
 filetime = "0.2"
 thiserror = "2"
 
+# 기본 기능은 image/svg/pic 렌더러다. PNG 는 직접 그리므로 전부 끈다 — 그러면 의존성이 하나도 없다.
+qrcode = { version = "0.14", default-features = false }
+# muda·tray-icon 이 이미 쓰는 버전. 직접 의존성으로 올려도 잠금 파일에 새 크레이트가 생기지 않는다.
+png = "0.18"
+
 [dev-dependencies]
 tempfile = "3"
+# QR 왕복 테스트용 디코더. img 기능을 끄면 image 크레이트가 붙지 않는다.
+# 0.11 은 rustc 1.85 를 요구해서 이 패키지의 rust-version 을 넘는다.
+rqrr = { version = "0.10", default-features = false }
 
 [profile.release]
 codegen-units = 1

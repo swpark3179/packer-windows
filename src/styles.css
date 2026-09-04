@@ -540,6 +540,8 @@ body[data-busy="true"] {
     border-color: #5a2b2b;
     background: var(--error-bg);
   }
+
+  /* .qr-frame 은 여기서 손대지 않는다 — 색을 반전한 QR 은 휴대폰 카메라가 읽지 못한다. */
 }
 
 /* ---------------------------------------------------------------- 텍스트 결과 / 붙여넣기 */
@@ -608,6 +610,89 @@ body[data-busy="true"] {
   flex: 1;
   height: 1px;
   background: var(--border);
+}
+
+/* ---------------------------------------------------------------- 결과 QR */
+
+.qr {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.qr-nav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* "3 / 16" 은 장을 넘길 때마다 바뀐다. 폭을 고정하지 않으면 자릿수가 늘어나는 순간 '다음'
+ * 버튼이 커서 아래에서 옆으로 밀린다 — 16번 연속으로 눌러야 하는 버튼에서는 치명적이다. */
+.qr-index {
+  min-width: 4.5em;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+/* QR 판은 어두운 테마에서도 반드시 흰 바탕 위 검은 모듈이어야 한다.
+ *
+ * 색을 반전한 QR 은 휴대폰 기본 카메라가 읽지 못한다. 그래서 이 판만은 --surface 같은 테마
+ * 변수를 쓰지 않고 흰색을 못박고, 위의 어두운 테마 블록에서도 건드리지 않는다.
+ *
+ * 패딩은 여백(quiet zone)을 눈에 보이게 넓혀 주는 장식일 뿐이다. 규격이 요구하는 4모듈 여백은
+ * PNG 안에 이미 들어 있다 — 패딩은 12px 고정인데 모듈은 3~10px 로 변해서 이것만으로는 4모듈을
+ * 채우지 못하고, 화면을 캡처해 잘라내는 순간 함께 사라진다. */
+.qr-frame {
+  align-self: flex-start;
+  padding: 12px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.qr-image {
+  display: block;
+  /* 실제 너비는 main.js 가 모듈 수의 정수 배로 인라인 지정한다. 이 값은 그 정보가 없을 때의
+   * 안전망이다. */
+  width: 300px;
+  max-width: 100%;
+  height: auto;
+  /* PNG 은 1모듈 = 1픽셀이고 화면에서는 정수 배율로 키우기만 한다. 보간하면 모듈 경계가 흐려져
+   * 인식률이 떨어지므로 네모를 그대로 키운다. */
+  image-rendering: pixelated;
+}
+
+/* 그림 없이 빈 흰 판만 남으면 고장처럼 보인다. */
+.qr[data-state="toobig"] .qr-frame {
+  display: none;
+}
+
+.qr-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--accent);
+  /* 여러 줄 안내(나눈 장수 / 이어 붙이는 방법 / 순서 확인)를 줄바꿈 그대로 보여 준다. */
+  white-space: pre-line;
+}
+
+/* 실패가 아니라 그냥 안 되는 경우다. 경고색을 쓰면 바로 위의 성공 표시와 서로 어긋난다. */
+.qr[data-state="toobig"] .qr-note {
+  color: var(--text-dim);
+}
+
+/* 고대비 모드는 배경색을 강제로 바꾼다. QR 판이 검은 바탕이 되면 그 자리에서 못 읽는 그림이
+ * 된다. 이 판만 강제 색 적용에서 빼낸다. */
+@media (forced-colors: active) {
+  .qr-frame {
+    forced-color-adjust: none;
+    background: #fff;
+    border-color: #000;
+  }
+
+  .qr-image {
+    forced-color-adjust: none;
+  }
 }
 
 @media (prefers-color-scheme: dark) {
