@@ -32,6 +32,7 @@ use crate::armor::{self, ArmorReader, ArmorWriter};
 use crate::container::{self, ContainerReader, ContainerWriter, Header};
 use crate::crypto;
 use crate::error::{Error, Result};
+use crate::qr;
 use crate::safepath;
 
 pub const EVENT_PACK: &str = "pack-progress";
@@ -53,6 +54,13 @@ const TEXT_PREVIEW_LIMIT: u64 = 2 * 1024 * 1024;
 
 /// 클립보드로 넘길 상한. 이보다 크면 대부분의 에디터가 붙여넣기에서 버티지 못한다.
 const CLIPBOARD_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// QR 로 만들어 볼 만한 컨테이너 크기 상한.
+///
+/// 정확한 판정은 [`qr::render`] 가 실제 인코딩으로 하지만, 2 MiB 텍스트를 붙잡고 조각을 세지
+/// 않도록 여기서 먼저 자른다. 조각 상한(16장)에 담기는 본문이 실측 46,000자쯤이고 줄바꿈과
+/// 표시 줄을 더해도 48 KiB 아래이므로, 이 값 위의 파일은 어차피 QR 로 나오지 않는다.
+const QR_SOURCE_LIMIT: u64 = 48 * 1024;
 
 // ---------------------------------------------------------------- 진행률
 
@@ -146,6 +154,10 @@ impl ContainerSource {
                 if !armor::looks_armored(text) {
                     return Err(Error::NotContainer);
                 }
+                // 여러 조각으로 나눈 QR 을 잘못된 순서로 붙였다면 여기서 짚어 준다. 그냥
+                // 흘려보내면 한참 뒤 헤더 매직이나 GCM 인증 실패로만 나타나서, 안내가 원인을
+                // 엉뚱한 곳("우리 파일이 아니다") 으로 보낸다.
+                armor::verify_pieces(text)?;
                 Ok((Box::new(ArmorReader::new(Cursor::new(text.as_bytes()))), true))
             }
 
@@ -327,6 +339,14 @@ pub struct PackOutcome {
     /// 화면에 바로 띄울 armor 텍스트. 너무 크면 `None` 이고 `preview_omitted` 가 참이 된다.
     pub preview: Option<String>,
     pub preview_omitted: bool,
+    /// 스마트폰 카메라로 찍어 옮길 수 있는 QR 조각들. 한 장씩 순서대로 찍어 이어 붙이면 된다.
+    /// 조각이 `qr_limit_pieces` 를 넘으면 `None` 이고 `qr_omitted` 가 참이 된다.
+    pub qr: Option<Vec<qr::QrImage>>,
+    pub qr_omitted: bool,
+    /// QR 한 장에 담기는 최대 바이트와 최대 장수. 화면의 안내 문구가 그대로 쓴다 —
+    /// 상수를 JS 에 한 번 더 적어 두면 언젠가 어긋난다.
+    pub qr_limit_bytes: usize,
+    pub qr_limit_pieces: usize,
 }
 
 #[tauri::command]
@@ -439,6 +459,16 @@ pub fn pack_to_file(
         (None, true)
     };
 
+    // QR 은 덧붙이는 정보다. 만들다 실패해도 묶기 자체는 이미 성공했으므로 조용히 비워 둔다 —
+    // 그림 하나 때문에 성공한 결과를 에러로 되돌리면 안 된다.
+    //
+    // 이미 메모리에 있는 preview 를 그대로 쓴다. QR_SOURCE_LIMIT 가 TEXT_PREVIEW_LIMIT 보다
+    // 한참 작으므로 QR 대상이면 텍스트는 항상 손에 있고, 파일을 다시 읽을 일이 없다.
+    let qr = match preview.as_deref() {
+        Some(text) if container_bytes <= QR_SOURCE_LIMIT => qr::render(text).unwrap_or(None),
+        _ => None,
+    };
+
     Ok(PackOutcome {
         dest: dest_path.to_string_lossy().to_string(),
         container_bytes,
@@ -449,6 +479,10 @@ pub fn pack_to_file(
         skipped: report.skipped,
         preview,
         preview_omitted,
+        qr_omitted: qr.is_none(),
+        qr,
+        qr_limit_bytes: qr::MAX_SYMBOL_BYTES,
+        qr_limit_pieces: qr::MAX_PIECES,
     })
 }
 

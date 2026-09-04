@@ -21,6 +21,9 @@ pub enum Error {
     #[error("텍스트가 온전하지 않습니다. 시작·끝 표시 줄까지 빠짐없이 복사했는지 확인해 주세요.")]
     ArmorDamaged,
 
+    #[error("QR 조각의 순서가 맞지 않습니다: {0}. 1번 조각부터 차례대로, 빠짐없이 붙여넣어 주세요.")]
+    PieceOrder(String),
+
     #[error("더 새로운 버전({0})으로 묶인 파일입니다. 프로그램을 업데이트해 주세요.")]
     UnsupportedVersion(u16),
 
@@ -54,6 +57,7 @@ impl Error {
             Error::NotContainer => "NotContainer",
             Error::Corrupted => "Corrupted",
             Error::ArmorDamaged => "ArmorDamaged",
+            Error::PieceOrder(_) => "PieceOrder",
             Error::UnsupportedVersion(_) => "UnsupportedVersion",
             Error::PathEscape(_) => "PathEscape",
             Error::EmptyKey => "EmptyKey",

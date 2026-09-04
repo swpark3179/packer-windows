@@ -101,6 +101,9 @@ async function mount(handlers = {}) {
       return Boolean(node) && !node.hidden;
     },
     text: (name) => hook(name)?.textContent ?? null,
+    /** 반사 프로퍼티(.src)는 문서 URL 로 해석되어 속성을 지운 뒤에도 ""(null 아님)을 준다.
+     *  "비운 게 아니라 속성을 제거했다" 는 getAttribute 로만 표현된다. */
+    attr: (name, attribute) => hook(name)?.getAttribute(attribute) ?? null,
     value: (name) => hook(name)?.value ?? null,
     called: (name) => calls.some((c) => c.name === name),
     argsOf: (name) => calls.find((c) => c.name === name)?.args ?? null,
@@ -149,6 +152,39 @@ async function mount(handlers = {}) {
     rows: () => Array.from(window.document.querySelectorAll('[data-pk="pack-list"] .row')),
   };
 }
+
+/** jsdom 은 이미지를 디코드하지 않는다. Rust 가 준 문자열이 src 로 그대로 흘러가는지만 본다. */
+const qrPage = (n) => ({
+  index: n,
+  total: 0, // 아래 qrPages 에서 채운다.
+  png_base64: `QRPNG${n}`,
+  // floor(560/100)=5 → 500px. 클램프 [3,10] 안쪽이라 산술 자체를 못박는다.
+  png_modules: 100,
+  ec_level: "M",
+  text_bytes: 1024,
+});
+const qrPages = (total) =>
+  Array.from({ length: total }, (_, i) => ({ ...qrPage(i + 1), total }));
+
+/** QR 한 장에 담기는 최대 바이트와 최대 장수 (Rust 의 qr::MAX_SYMBOL_BYTES / MAX_PIECES). */
+const QR_LIMIT_BYTES = 2953;
+const QR_LIMIT_PIECES = 16;
+
+const PACK_RESULT = {
+  dest: "C:\\out\\bundle.txt",
+  container_bytes: 1024,
+  original_bytes: 4096,
+  file_count: 2,
+  dir_count: 1,
+  changed: [],
+  skipped: [],
+  preview: ARMOR_TEXT,
+  preview_omitted: false,
+  qr: qrPages(1),
+  qr_omitted: false,
+  qr_limit_bytes: QR_LIMIT_BYTES,
+  qr_limit_pieces: QR_LIMIT_PIECES,
+};
 
 /** 흔한 응답을 미리 채운 핸들러 모음. */
 function handlers(overrides = {}) {
@@ -205,17 +241,7 @@ function handlers(overrides = {}) {
     reveal: async () => null,
     copy_container_to_clipboard: async () => 4096,
 
-    pack: async () => ({
-      dest: "C:\\out\\bundle.txt",
-      container_bytes: 1024,
-      original_bytes: 4096,
-      file_count: 2,
-      dir_count: 1,
-      changed: [],
-      skipped: [],
-      preview: ARMOR_TEXT,
-      preview_omitted: false,
-    }),
+    pack: async () => PACK_RESULT,
 
     unpack: async () => ({
       dest: "C:\\out\\restored",
@@ -441,6 +467,7 @@ describe("묶고 암호화하기", () => {
     assert.equal(app.hook("pack-status").dataset.kind, "error");
     assert.match(app.text("pack-status"), /액세스가 거부되었습니다/);
     assert.equal(app.visible("pack-output"), false);
+    assert.equal(app.visible("pack-qr"), false, "실패한 뒤 지난 QR 이 남으면 엉뚱한 그림을 보낸다");
   });
 
   it("건너뛴 항목이 있으면 경고로 알린다", async () => {
@@ -533,6 +560,190 @@ describe("텍스트 결과 — 요청의 핵심", () => {
 
     assert.equal(app.hook("pack-status").dataset.kind, "error");
     assert.match(app.text("pack-status"), /클립보드로 옮길 수 없습니다/);
+  });
+});
+
+describe("QR 코드 — 휴대폰으로 옮기기", () => {
+  it("묶은 결과를 QR 코드 그림으로도 보여 준다", async () => {
+    const app = await boot();
+    await packOnce(app);
+
+    assert.equal(app.visible("pack-qr"), true);
+    assert.equal(app.hook("pack-qr").dataset.state, "single");
+    assert.equal(app.visible("pack-qr-image"), true);
+    assert.equal(app.attr("pack-qr-image", "src"), "data:image/png;base64,QRPNG1");
+    assert.match(app.text("pack-qr-note"), /기본 카메라/);
+    // 스캔한 다음 무엇을 해야 하는지까지 말해 줘야 쓸모가 있다. 카메라는 뜻 없는 Base64 벽만
+    // 보여 주기 때문이다.
+    assert.match(app.text("pack-qr-note"), /풀기 탭에 붙여넣으면/);
+  });
+
+  it("한 장이면 넘기기 도구가 아예 나오지 않는다", async () => {
+    const app = await boot();
+    await packOnce(app);
+
+    // 뜻이 없는 조작 도구는 잠그기보다 감춘다 — 잠가 두면 더 있을 것처럼 보인다.
+    assert.equal(app.visible("pack-qr-nav"), false);
+    assert.equal(app.text("pack-qr-index"), "");
+  });
+
+  it("QR 그림을 정수 배율로만 키운다", async () => {
+    const app = await boot();
+    await packOnce(app);
+
+    // 모듈 폭에 소수점이 붙으면 휴대폰이 초점을 맞춰도 인식하지 못한다.
+    // 100모듈 → floor(560/100)=5배 → 500px.
+    assert.equal(app.hook("pack-qr-image").style.width, "500px");
+  });
+
+  it("여러 장으로 나뉘면 장수와 이어 붙이는 방법을 알려 준다", async () => {
+    const app = await boot({
+      pack: async () => ({ ...PACK_RESULT, container_bytes: 12 * 1024, qr: qrPages(16) }),
+    });
+    await packOnce(app, "pw123456");
+
+    assert.equal(app.hook("pack-qr").dataset.state, "split");
+    assert.equal(app.visible("pack-qr-nav"), true);
+    assert.equal(app.text("pack-qr-index"), "1 / 16");
+
+    const note = app.text("pack-qr-note");
+    assert.match(note, /16장으로 나눴습니다/);
+    // 앱이 이어 붙여 주지 않는다는 사실을 반드시 말해야 한다.
+    assert.match(note, /순서대로 스캔해 메모장에/);
+    // 추상적인 표기 대신 실제 값이라야 붙여넣은 텍스트에서 알아본다.
+    assert.match(note, /#1\/16 부터 #16\/16 까지/);
+    // 순서 표시를 쓰레기로 보고 지우다 Base64 를 함께 지우는 사고를 막는다.
+    assert.match(note, /지우지 않아도 됩니다/);
+  });
+
+  it("다음·이전으로 장을 넘기고 양끝에서는 잠긴다", async () => {
+    const app = await boot({ pack: async () => ({ ...PACK_RESULT, qr: qrPages(3) }) });
+    await packOnce(app, "pw123456");
+
+    assert.equal(app.text("pack-qr-index"), "1 / 3");
+    assert.equal(app.hook("pack-qr-prev").disabled, true, "첫 장에서는 이전이 잠겨 있어야 한다");
+    assert.equal(app.hook("pack-qr-next").disabled, false);
+    // 첫 장에서 이전을 눌러도 뒤로 돌지 않는다.
+    await app.click("pack-qr-prev");
+    assert.equal(app.text("pack-qr-index"), "1 / 3");
+
+    await app.click("pack-qr-next");
+    assert.equal(app.text("pack-qr-index"), "2 / 3");
+    assert.equal(app.attr("pack-qr-image", "src"), "data:image/png;base64,QRPNG2");
+    assert.equal(app.hook("pack-qr-prev").disabled, false);
+
+    await app.click("pack-qr-next");
+    assert.equal(app.text("pack-qr-index"), "3 / 3");
+    // '다음' 이 잠기는 것이 "다 찍었다" 는 유일한 신호다.
+    assert.equal(app.hook("pack-qr-next").disabled, true);
+    // 끝에서 되돌아 감지도 않는다. 16장을 찍는 중에 1장으로 돌아가면 자리를 잃는다.
+    await app.click("pack-qr-next");
+    assert.equal(app.text("pack-qr-index"), "3 / 3");
+
+    await app.click("pack-qr-prev");
+    assert.equal(app.text("pack-qr-index"), "2 / 3");
+  });
+
+  it("장을 넘기면 그림 설명도 함께 바뀐다", async () => {
+    const app = await boot({ pack: async () => ({ ...PACK_RESULT, qr: qrPages(3) }) });
+    await packOnce(app, "pw123456");
+
+    assert.match(app.attr("pack-qr-image", "alt"), /3장 중 1번째/);
+    await app.click("pack-qr-next");
+    assert.match(app.attr("pack-qr-image", "alt"), /3장 중 2번째/);
+  });
+
+  it("장을 넘겨도 안내 문구는 그대로 있다", async () => {
+    const app = await boot({ pack: async () => ({ ...PACK_RESULT, qr: qrPages(3) }) });
+    await packOnce(app, "pw123456");
+
+    const before = app.text("pack-qr-note");
+    await app.click("pack-qr-next");
+    // 안내는 결과마다 한 번만 정한다. 넘길 때마다 다시 쓰면 읽는 도중에 문장이 바뀐다.
+    assert.equal(app.text("pack-qr-note"), before);
+  });
+
+  it("정해진 장수를 넘으면 크기와 한도와 이유를 말해 준다", async () => {
+    const app = await boot({
+      pack: async () => ({
+        ...PACK_RESULT,
+        dest: "C:\\out\\big.txt",
+        container_bytes: 2 * 1024 * 1024,
+        qr: null,
+        qr_omitted: true,
+      }),
+    });
+    await packOnce(app, "pw123456");
+
+    // 자리를 없애면 "어제는 보였는데" 하고 고장으로 읽힌다. 자리는 두고 이유를 말한다.
+    assert.equal(app.visible("pack-qr"), true);
+    assert.equal(app.hook("pack-qr").dataset.state, "toobig");
+    assert.equal(app.visible("pack-qr-image"), false);
+    // `src=""` 는 문서 URL 을 다시 요청한다. 속성 자체가 없어야 한다.
+    assert.equal(app.attr("pack-qr-image", "src"), null);
+    assert.equal(app.visible("pack-qr-nav"), false);
+
+    const note = app.text("pack-qr-note");
+    assert.match(note, /2\.0 MB/, `실제 크기를 말해 줘야 한다: ${note}`);
+    // 반올림하면 "2.9 KB라서 2.9 KB 를 넘습니다" 가 되어 스스로 모순된다.
+    assert.match(note, /2,953 B/);
+    assert.match(note, /16장까지만/);
+    assert.match(note, /현실적이지 않습니다/, "왜 안 되는지가 빠지면 게으름으로 보인다");
+    // 묶기 자체는 성공했다. 경고로 뒤집지 않는다.
+    assert.equal(app.hook("pack-status").dataset.kind, "ok");
+  });
+
+  it("한도를 알려 주지 않은 응답에도 0 B 같은 숫자를 지어내지 않는다", async () => {
+    const app = await boot({
+      pack: async () => ({
+        ...PACK_RESULT,
+        container_bytes: 2 * 1024 * 1024,
+        qr: null,
+        qr_limit_bytes: undefined,
+        qr_limit_pieces: undefined,
+      }),
+    });
+    await packOnce(app, "pw123456");
+
+    const note = app.text("pack-qr-note");
+    assert.match(note, /2\.0 MB/);
+    assert.doesNotMatch(note, /0 B|0장/, `모르는 한도를 지어내면 안 된다: ${note}`);
+  });
+
+  it("다시 묶기 전에는 지난 QR 이 남지 않는다", async () => {
+    const app = await boot({ pack: async () => ({ ...PACK_RESULT, qr: qrPages(3) }) });
+    await packOnce(app, "pw123456");
+    await app.click("pack-qr-next");
+    assert.equal(app.visible("pack-qr"), true);
+
+    await app.click("pack-clear");
+
+    // 지난 그림이 남으면 *이전* 컨테이너를 새 결과인 줄 알고 찍어 보낸다.
+    assert.equal(app.visible("pack-qr"), false);
+    assert.equal(app.attr("pack-qr-image", "src"), null);
+    assert.equal(app.text("pack-qr-index"), "");
+    assert.equal(app.hook("pack-qr-next").disabled, true);
+  });
+
+  it("작업 중에는 QR 넘기기도 잠긴다", async () => {
+    // QR 이 떠 있는 상태를 유지한 채 다른 작업을 붙잡아 둔다 — 묶기를 다시 걸면 QR 이 먼저
+    // 치워지므로, 풀기를 끝나지 않는 상태로 세워 두고 확인한다.
+    const app = await boot({
+      pack: async () => ({ ...PACK_RESULT, qr: qrPages(3) }),
+      unpack_text: () => new Promise(() => {}),
+    });
+    await packOnce(app, "pw123456");
+    assert.equal(app.hook("pack-qr-next").disabled, false);
+
+    await app.click("pack-qr-next");
+    // 훅은 패널이 감춰져 있어도 문서 전체에서 찾는다. 다른 풀기 테스트와 같은 방식이다.
+    await app.paste("unpack-text", ARMOR_TEXT);
+    await app.click("unpack-dest-pick");
+    await app.click("unpack-submit");
+
+    assert.equal(app.window.document.body.dataset.busy, "true");
+    assert.equal(app.hook("pack-qr-next").disabled, true);
+    assert.equal(app.hook("pack-qr-prev").disabled, true);
   });
 });
 

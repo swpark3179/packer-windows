@@ -88,6 +88,32 @@
           <p class="hint tnum" data-pk="pack-output-note"></p>
         </div>
 
+        <div class="qr" data-pk="pack-qr" hidden>
+          <div class="output-head">
+            <span class="field-label">QR 코드 (휴대폰으로 스캔)</span>
+            <div class="qr-nav" data-pk="pack-qr-nav" role="group" aria-label="QR 코드 넘기기" hidden>
+              <button type="button" class="btn btn-quiet" data-pk="pack-qr-prev">이전</button>
+              <span
+                class="qr-index tnum"
+                data-pk="pack-qr-index"
+                aria-live="polite"
+                aria-atomic="true"
+              ></span>
+              <button type="button" class="btn btn-quiet" data-pk="pack-qr-next">다음</button>
+            </div>
+          </div>
+          <div class="qr-frame">
+            <img
+              class="qr-image"
+              data-pk="pack-qr-image"
+              alt="묶은 결과 텍스트를 담은 QR 코드"
+              draggable="false"
+              hidden
+            />
+          </div>
+          <p class="qr-note tnum" data-pk="pack-qr-note"></p>
+        </div>
+
         <button type="button" class="btn btn-ghost" data-pk="pack-reveal" hidden>탐색기에서 보기</button>
       </section>
 
