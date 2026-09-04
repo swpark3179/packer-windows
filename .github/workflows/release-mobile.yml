@@ -1,0 +1,727 @@
+name: Release (모바일)
+
+# 데스크톱 릴리스(release.yml)와 완전히 분리된 트랙이다. 태그 접두사가 `mobile-v` 라서 서로의
+# 버전을 끌어올리지 않고, 한쪽만 고쳐도 다른 쪽 버전이 따라 오르지 않는다.
+#
+# 결과물은 두 갈래다 — 안드로이드는 서명된 APK 를 GitHub 릴리스에 붙이고, iOS 는 IPA 를
+# TestFlight 에 올린다. IPA 는 릴리스에 붙이지 않는다: TestFlight·ad-hoc 밖에서는 설치할 수
+# 없어서 받는 사람만 헷갈린다. 필요하면 워크플로 아티팩트로 내려받으면 된다.
+#
+# 준비해야 하는 secret 목록과 만드는 방법은 `mobile/RELEASE.md` 에 있다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "올릴 버전 자리"
+        required: true
+        type: choice
+        default: patch
+        options:
+          - major
+          - minor
+          - patch
+      platforms:
+        description: "빌드할 플랫폼"
+        required: true
+        type: choice
+        default: android+ios
+        options:
+          - android+ios
+          - android
+          - ios
+      upload_to_testflight:
+        description: "TestFlight 에 실제로 올린다 (끄면 서명·업로드 자격만 검증한다)"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-mobile
+  cancel-in-progress: false
+
+env:
+  PRODUCT_NAME: "Packer Scanner"
+  BINARY_NAME: packer-scanner
+  APP_ID: org.packer.scanner
+  NODE_VERSION: "22"
+  JAVA_VERSION: "21"
+
+jobs:
+  # ------------------------------------------------------------------ 준비
+  prepare:
+    name: 버전 계산 및 테스트
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+        working-directory: mobile
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      previous_tag: ${{ steps.version.outputs.previous_tag }}
+      build_number: ${{ steps.version.outputs.build_number }}
+
+    steps:
+      - name: 체크아웃
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Node 준비
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      # `npm ci` 를 먼저 해야 테스트가 실제로 돈다. tests/app.test.js 는 jsdom 이 없으면
+      # 조용히 건너뛰므로, 설치 없이 돌리면 절반만 돌고도 CI 는 초록으로 보인다.
+      - name: 모바일 의존성 설치
+        run: npm ci
+
+      - name: 모바일 테스트
+        run: npm test
+
+      # 다음 버전은 releases 페이지의 태그와 저장소 태그를 함께 훑어서 가장 큰 semver 를 기준으로
+      # 정한다(release.yml 과 같은 방식). 다만 `mobile-v` 접두사가 붙은 태그만 본다 — 데스크톱의
+      # `v1.2.3` 과 섞이면 앱을 고치지 않았는데도 모바일 버전이 따라 올라간다.
+      # 양쪽 모두 없으면(최초 릴리스) mobile/package.json 의 version 을 기준으로 삼는다. 그
+      # 값은 첫 릴리스의 씨앗일 뿐이고, 한 번 태그가 생긴 뒤로는 태그가 기준이 된다(버전 올림을
+      # 저장소에 되커밋하지 않는 것도 release.yml 과 같다).
+      - name: 다음 버전 계산
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUMP: ${{ inputs.bump }}
+          PLATFORMS: ${{ inputs.platforms }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+
+          fail() { echo "::error::$1"; exit 1; }
+
+          case "$BUMP" in
+            major|minor|patch) ;;
+            *) fail "알 수 없는 bump 값입니다: '$BUMP' (major·minor·patch 중 하나여야 합니다)" ;;
+          esac
+
+          # 1) releases 페이지의 태그 (초안·프리릴리스 릴리스까지 포함해서 본다)
+          if ! release_tags="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '.[].tag_name')"; then
+            fail "releases 목록을 읽지 못했습니다. 위에 찍힌 gh 오류 메시지를 확인하세요."
+          fi
+          # 2) 저장소 태그 (릴리스 없이 태그만 남은 경우도 잡는다)
+          if ! git_tags="$(git tag --list)"; then
+            fail "git tag 목록을 읽지 못했습니다."
+          fi
+
+          semver='^mobile-v[0-9]+\.[0-9]+\.[0-9]+$'
+          mobile_tags="$(printf '%s\n%s\n' "$release_tags" "$git_tags" | tr -d '[:blank:]' | grep -E "$semver" | sort -u || true)"
+
+          highest=""
+          if [ -n "$mobile_tags" ]; then
+            highest="$(printf '%s\n' "$mobile_tags" | sed 's/^mobile-v//' | sort -V | tail -1)"
+          fi
+
+          if [ -n "$highest" ]; then
+            current="$highest"
+            previous_tag="mobile-v$highest"
+            source_desc="기존 태그 ($previous_tag)"
+          else
+            previous_tag=""
+            current="$(node -p "require('./package.json').version" 2>/dev/null || true)"
+            if ! printf '%s' "$current" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              fail "mobile-v* 태그가 하나도 없고 mobile/package.json 의 version 도 X.Y.Z 형식이 아닙니다: '$current'"
+            fi
+            source_desc="mobile/package.json ($current)"
+          fi
+
+          IFS=. read -r major minor patch <<< "$current"
+          case "$BUMP" in
+            major) next="$((major + 1)).0.0" ;;
+            minor) next="$major.$((minor + 1)).0" ;;
+            patch) next="$major.$minor.$((patch + 1))" ;;
+          esac
+          tag="mobile-v$next"
+
+          # 새 태그가 이미 잡혀 있으면 멈춘다 (기존 릴리스·태그 덮어쓰기 방지).
+          taken=""
+          if printf '%s\n' "$release_tags" | grep -qxF "$tag"; then taken="릴리스가 이미 있습니다"; fi
+          if printf '%s\n' "$git_tags" | grep -qxF "$tag"; then taken="${taken:+$taken / }태그가 이미 있습니다"; fi
+          if [ -n "$taken" ]; then
+            fail "$tag : $taken. 기존 릴리스·태그를 정리하거나 다른 bump 를 선택하세요."
+          fi
+
+          echo "기준 버전 $current (출처: $source_desc) -> 새 버전 $next (태그 $tag, 빌드 $BUILD_NUMBER)"
+
+          {
+            echo "version=$next"
+            echo "tag=$tag"
+            echo "previous_tag=$previous_tag"
+            echo "build_number=$BUILD_NUMBER"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo '## 버전'
+            echo ''
+            echo '| 항목 | 값 |'
+            echo '| --- | --- |'
+            echo "| 기준 버전 | \`$current\` (출처: $source_desc) |"
+            echo "| 증가 단위 | \`$BUMP\` |"
+            echo "| 새 버전 | \`$next\` (태그 \`$tag\`) |"
+            echo "| 빌드 번호 | \`$BUILD_NUMBER\` |"
+            echo "| 플랫폼 | \`$PLATFORMS\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------ 안드로이드
+  android:
+    name: 안드로이드 APK
+    needs: prepare
+    if: contains(inputs.platforms, 'android')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: mobile
+
+    steps:
+      - name: 체크아웃
+        uses: actions/checkout@v7
+
+      - name: Node 준비
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      # mobile/README.md 가 적어 둔 요구 사항 — minSdk 24 를 쓰는 이 프로젝트는 JDK 21 이 필요하다.
+      #
+      # Gradle 캐시는 두지 않는다: `android/` 가 이 시점에 아직 없어서 캐시 키를 만들 근거
+      # (**/*.gradle*)가 없다. 수동 dispatch 전용 워크플로라 캐시로 아낄 시간도 크지 않다.
+      - name: JDK 준비
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: 모바일 의존성 설치
+        run: npm ci
+
+      # `android/` 는 생성물이라 저장소에 없다(mobile/.gitignore). `add:android` 가 프로젝트를
+      # 만들고 patch-native.mjs 로 CAMERA 권한과 ML Kit meta-data 를 다시 넣는다.
+      - name: 안드로이드 프로젝트 생성
+        run: npm run add:android
+
+      - name: 네이티브 설정 확인
+        run: npm run check:native
+
+      # Capacitor 는 버전을 네이티브로 옮겨 주지 않는다. 이 단계를 빼면 매 릴리스가 1.0 (1) 로
+      # 빌드된다 (자세한 근거는 스크립트 첫 주석에 있다).
+      - name: 버전 반영
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD_NUMBER: ${{ needs.prepare.outputs.build_number }}
+        run: node scripts/set-native-version.mjs --version "$VERSION" --build "$BUILD_NUMBER"
+
+      - name: 릴리스 APK 빌드
+        working-directory: mobile/android
+        run: ./gradlew --no-daemon --stacktrace assembleRelease
+
+      # Capacitor 템플릿에는 signingConfig 가 없어서 Gradle 이 서명되지 않은 APK 를 내놓는다.
+      # 생성물인 build.gradle 에 signingConfig 를 끼워 넣는 것보다 apksigner 로 뒤에 서명하는 편이
+      # 템플릿 변화에 덜 깨진다.
+      - name: APK 서명
+        id: apk
+        working-directory: mobile/android
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          fail() { echo "::error::$1"; exit 1; }
+
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS; do
+            if [ -z "${!name}" ]; then
+              fail "secret $name 이 비어 있습니다. mobile/RELEASE.md 의 준비 절차를 확인하세요."
+            fi
+          done
+
+          # 최근 keytool 이 만드는 PKCS12 키스토어는 키 암호와 키스토어 암호가 같아야 한다.
+          # 그래서 ANDROID_KEY_PASSWORD 는 선택 사항으로 두고, 비어 있으면 키스토어 암호를 쓴다.
+          export KEY_PASSWORD="${ANDROID_KEY_PASSWORD:-$ANDROID_KEYSTORE_PASSWORD}"
+
+          keystore="$RUNNER_TEMP/upload.jks"
+          trap 'shred -u "$keystore" 2>/dev/null || rm -f "$keystore"' EXIT
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | tr -d '[:space:]' | openssl base64 -d -A > "$keystore"
+
+          sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          [ -n "$sdk" ] || fail "Android SDK 위치를 찾지 못했습니다 (ANDROID_HOME 이 비어 있습니다)."
+          tools="$(ls -1 "$sdk/build-tools" | sort -V | tail -1)"
+          [ -n "$tools" ] || fail "$sdk/build-tools 에서 build-tools 를 찾지 못했습니다."
+          echo "build-tools $tools 로 서명합니다."
+
+          # 산출물 이름은 AGP 판본에 따라 달라진다. 경로를 박아 두지 않고 찾아서 개수를 확인한다.
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/release/*.apk)
+          if [ "${#apks[@]}" -ne 1 ]; then
+            fail "릴리스 APK 를 정확히 하나 찾지 못했습니다 (${#apks[@]}개): ${apks[*]:-없음}"
+          fi
+          echo "빌드된 APK: ${apks[0]}"
+
+          out_dir="$RUNNER_TEMP/release-artifacts"
+          mkdir -p "$out_dir"
+          name="$BINARY_NAME-v$VERSION-android.apk"
+          signed="$out_dir/$name"
+
+          "$sdk/build-tools/$tools/zipalign" -p -f 4 "${apks[0]}" "$RUNNER_TEMP/aligned.apk"
+          "$sdk/build-tools/$tools/apksigner" sign \
+            --ks "$keystore" \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --key-pass env:KEY_PASSWORD \
+            --out "$signed" \
+            "$RUNNER_TEMP/aligned.apk"
+
+          # 서명이 실제로 붙었는지, 어느 인증서로 붙었는지 로그에 남긴다.
+          "$sdk/build-tools/$tools/apksigner" verify --print-certs "$signed"
+
+          sha="$(sha256sum "$signed" | cut -d' ' -f1)"
+          size_mb="$(awk "BEGIN { printf \"%.1f\", $(stat -c%s "$signed") / 1048576 }")"
+
+          {
+            echo "path=$signed"
+            echo "name=$name"
+            echo "sha256=$sha"
+            echo "size_mb=$size_mb"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo '## 안드로이드'
+            echo ''
+            echo '| 항목 | 값 |'
+            echo '| --- | --- |'
+            echo "| APK | \`$name\` |"
+            echo "| 크기 | $size_mb MB |"
+            echo "| SHA256 | \`$sha\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: APK 아티팩트 업로드
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-apk
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
+
+  # ------------------------------------------------------------------ iOS
+  ios:
+    name: iOS TestFlight
+    needs: prepare
+    if: contains(inputs.platforms, 'ios')
+    # Xcode 판본이 러너 이미지 갱신으로 조용히 바뀌지 않게 이미지를 못박는다. Xcode 를 바꿔 끼우는
+    # 스텝을 두는 대신 이 한 줄만 고치면 되게 한다.
+    runs-on: macos-15
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: mobile
+
+    steps:
+      - name: 체크아웃
+        uses: actions/checkout@v7
+
+      - name: Node 준비
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: Xcode 판본 확인
+        run: xcodebuild -version
+
+      - name: 모바일 의존성 설치
+        run: npm ci
+
+      # `ios/` 도 생성물이라 저장소에 없다. `add:ios` 는 `--packagemanager cocoapods` 를 붙여 주는데,
+      # 이게 이 프로젝트에서 가장 중요한 한 줄이다 — Capacitor 8 의 기본값인 SPM 으로 만들면
+      # QR 스캐너 플러그인(@capacitor-mlkit/barcode-scanning)이 podspec 만 있어서 **조용히 빠지고
+      # 빌드는 성공한다.** 앱이 켜지고 버튼도 보이는데 스캔만 안 되는 상태로 TestFlight 까지 간다.
+      - name: iOS 프로젝트 생성
+        run: npm run add:ios
+
+      # 위의 SPM 함정을 여기서 잡는다 (CapApp-SPM 이 생겼으면 0 이 아닌 코드로 죽는다).
+      - name: 네이티브 설정 확인
+        run: npm run check:native
+
+      - name: 버전 반영
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD_NUMBER: ${{ needs.prepare.outputs.build_number }}
+        run: node scripts/set-native-version.mjs --version "$VERSION" --build "$BUILD_NUMBER"
+
+      # `--repo-update` 를 붙인다: 러너 이미지의 스펙 저장소가 오래되어 플러그인 podspec 을 못 찾는
+      # 일이 있다. CocoaPods 캐시는 두지 않는다 — Podfile.lock 이 이 시점 전에는 없어서 캐시 키를
+      # 만들 수 없다.
+      - name: CocoaPods 설치
+        working-directory: mobile/ios/App
+        run: pod install --repo-update
+
+      # `cap add ios` 는 공유 스킴(.xcscheme)도, 워크스페이스 내용(contents.xcworkspacedata)도
+      # 만들지 않는다 — 후자는 방금 `pod install` 이 만들었다. 스킴이 없으면 아래 archive 가
+      # 알아보기 힘든 메시지로 죽으므로, 여기서 먼저 확인해 원인을 분명히 남긴다.
+      - name: 빌드 스킴 확인
+        working-directory: mobile/ios/App
+        run: |
+          set -euo pipefail
+          xcodebuild -list -workspace App.xcworkspace | tee "$RUNNER_TEMP/schemes.txt"
+          if ! grep -qE '^[[:space:]]+App$' "$RUNNER_TEMP/schemes.txt"; then
+            echo "::error::워크스페이스에 'App' 스킴이 없습니다. 위 목록을 보고 스킴 이름을 확인하거나, ios/App/App.xcodeproj/xcshareddata/xcschemes/App.xcscheme 을 공유 스킴으로 만들어 커밋해야 합니다."
+            exit 1
+          fi
+
+      # CI 에서 코드 서명이 막히는 자리는 거의 항상 여기다. 두 가지가 핵심이다.
+      #
+      #  - `set-key-partition-list` 를 빼면 codesign 이 암호 입력 창을 띄우려다 러너에서 멈춘다.
+      #    (GUI 가 없으니 그대로 타임아웃까지 간다.)
+      #  - `set-keychain-settings -lut` 없이 두면 기본 잠금 시간이 지나 빌드 중간에 키체인이
+      #    다시 잠긴다.
+      #
+      # 프로파일 이름은 secret 으로 받지 않고 .mobileprovision 에서 꺼낸다 — 하나라도 secret 을
+      # 덜 두는 편이 낫고, 프로파일을 새로 내려받았을 때 이름을 같이 고치는 것을 잊을 일도 없다.
+      - name: 서명 자격 증명 준비
+        id: signing
+        env:
+          IOS_DIST_CERT_P12_BASE64: ${{ secrets.IOS_DIST_CERT_P12_BASE64 }}
+          IOS_DIST_CERT_PASSWORD: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          fail() { echo "::error::$1"; exit 1; }
+
+          for name in IOS_DIST_CERT_P12_BASE64 IOS_DIST_CERT_PASSWORD IOS_PROVISIONING_PROFILE_BASE64; do
+            if [ -z "${!name}" ]; then
+              fail "secret $name 이 비어 있습니다. mobile/RELEASE.md 의 준비 절차를 확인하세요."
+            fi
+          done
+          if [ -z "$APPLE_TEAM_ID" ]; then
+            fail "변수 APPLE_TEAM_ID 가 비어 있습니다 (secret 이 아니라 Variables 탭에 넣습니다)."
+          fi
+
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(openssl rand -base64 24)"
+          cert="$RUNNER_TEMP/dist.p12"
+          profile="$RUNNER_TEMP/profile.mobileprovision"
+
+          printf '%s' "$IOS_DIST_CERT_P12_BASE64" | tr -d '[:space:]' | openssl base64 -d -A > "$cert"
+          printf '%s' "$IOS_PROVISIONING_PROFILE_BASE64" | tr -d '[:space:]' | openssl base64 -d -A > "$profile"
+
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$cert" -k "$keychain" -P "$IOS_DIST_CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security -f pkcs12 -A
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain"
+          # 우리 키체인을 검색 목록 맨 앞에 두고, 기존 목록은 뒤에 남긴다.
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+
+          shred -u "$cert" 2>/dev/null || rm -f "$cert"
+
+          echo "키체인에 들어간 서명 신원:"
+          security find-identity -v -p codesigning "$keychain"
+
+          # 프로파일은 UUID 로 저장해야 Xcode 가 찾는다. Xcode 16 이 위치를 옮겼으므로 양쪽에 넣는다.
+          plist="$RUNNER_TEMP/profile.plist"
+          security cms -D -i "$profile" > "$plist"
+          profile_uuid="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$plist")"
+          profile_name="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$plist")"
+          for dir in "$HOME/Library/MobileDevice/Provisioning Profiles" \
+                     "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            mkdir -p "$dir"
+            cp "$profile" "$dir/$profile_uuid.mobileprovision"
+          done
+          echo "프로파일 '$profile_name' ($profile_uuid) 을 설치했습니다."
+
+          {
+            echo "keychain=$keychain"
+            echo "profile_name=$profile_name"
+          } >> "$GITHUB_OUTPUT"
+
+      # 워크스페이스의 모든 타겟에 서명 설정이 적용된다. Capacitor 의 Podfile 은 `use_frameworks!`
+      # 를 쓰므로 플러그인들이 동적 프레임워크로 빌드되는데, 프레임워크 타겟은 프로파일을 품지
+      # 않으니 PROVISIONING_PROFILE_SPECIFIER 는 앱 타겟에만 실제로 쓰인다. 혹시 pod 타겟이
+      # 프로파일을 못 찾는다고 죽으면 RELEASE.md 의 '자주 나는 오류' 표에 우회 방법이 있다.
+      - name: 아카이브
+        env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          PROFILE_NAME: ${{ steps.signing.outputs.profile_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD_NUMBER: ${{ needs.prepare.outputs.build_number }}
+        working-directory: mobile/ios/App
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            MARKETING_VERSION="$VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
+
+      # ExportOptions.plist 는 커밋하지 않고 여기서 만든다 — 팀 ID 와 프로파일 이름이 런타임 값이다.
+      # manageAppVersionAndBuildNumber 를 false 로 두는 것이 중요하다: 켜 두면 Xcode 가 우리가
+      # 넣은 빌드 번호를 제멋대로 바꿔서 TestFlight 쪽 번호와 어긋난다.
+      - name: IPA 내보내기
+        id: ipa
+        env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          PROFILE_NAME: ${{ steps.signing.outputs.profile_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>export</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>teamID</key><string>$APPLE_TEAM_ID</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>$APP_ID</key><string>$PROFILE_NAME</string>
+            </dict>
+            <key>uploadSymbols</key><true/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict>
+          </plist>
+          PLIST
+
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export"
+
+          shopt -s nullglob
+          ipas=("$RUNNER_TEMP/export"/*.ipa)
+          if [ "${#ipas[@]}" -ne 1 ]; then
+            echo "::error::IPA 를 정확히 하나 찾지 못했습니다 (${#ipas[@]}개): ${ipas[*]:-없음}"
+            exit 1
+          fi
+
+          name="$BINARY_NAME-v$VERSION-ios.ipa"
+          ipa="$RUNNER_TEMP/export/$name"
+          mv "${ipas[0]}" "$ipa"
+          size_mb="$(awk "BEGIN { printf \"%.1f\", $(stat -f%z "$ipa") / 1048576 }")"
+
+          {
+            echo "path=$ipa"
+            echo "name=$name"
+            echo "size_mb=$size_mb"
+          } >> "$GITHUB_OUTPUT"
+
+      # upload_to_testflight 를 끄면 --validate-app 까지만 한다. 서명·자격 증명 문제를 다 잡으면서
+      # TestFlight 빌드 번호를 낭비하지 않는다 — 처음 설정할 때 이 모드로 돌리는 것이 좋다.
+      - name: TestFlight 업로드
+        env:
+          APPSTORE_ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+          APPSTORE_KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          APPSTORE_API_PRIVATE_KEY_BASE64: ${{ secrets.APPSTORE_API_PRIVATE_KEY_BASE64 }}
+          UPLOAD: ${{ inputs.upload_to_testflight }}
+          IPA_PATH: ${{ steps.ipa.outputs.path }}
+          IPA_NAME: ${{ steps.ipa.outputs.name }}
+          IPA_SIZE_MB: ${{ steps.ipa.outputs.size_mb }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD_NUMBER: ${{ needs.prepare.outputs.build_number }}
+        run: |
+          set -euo pipefail
+
+          fail() { echo "::error::$1"; exit 1; }
+
+          for name in APPSTORE_ISSUER_ID APPSTORE_KEY_ID APPSTORE_API_PRIVATE_KEY_BASE64; do
+            if [ -z "${!name}" ]; then
+              fail "secret $name 이 비어 있습니다. mobile/RELEASE.md 의 준비 절차를 확인하세요."
+            fi
+          done
+
+          # altool 은 이 경로에서만 .p8 을 찾는다.
+          keys="$HOME/.appstoreconnect/private_keys"
+          mkdir -p "$keys"
+          key_file="$keys/AuthKey_$APPSTORE_KEY_ID.p8"
+          trap 'shred -u "$key_file" 2>/dev/null || rm -f "$key_file"' EXIT
+          printf '%s' "$APPSTORE_API_PRIVATE_KEY_BASE64" | tr -d '[:space:]' | openssl base64 -d -A > "$key_file"
+
+          if [ "$UPLOAD" = "true" ]; then
+            action=--upload-app
+            done_text="TestFlight 에 올렸습니다. App Store Connect 에서 처리가 끝나기까지 10~30분 걸립니다."
+          else
+            action=--validate-app
+            done_text="검증만 했습니다 (upload_to_testflight 가 꺼져 있습니다). 실제로 올리려면 켜고 다시 실행하세요."
+          fi
+
+          xcrun altool "$action" -f "$IPA_PATH" -t ios \
+            --apiKey "$APPSTORE_KEY_ID" --apiIssuer "$APPSTORE_ISSUER_ID"
+
+          echo "$done_text"
+
+          {
+            echo '## iOS'
+            echo ''
+            echo '| 항목 | 값 |'
+            echo '| --- | --- |'
+            echo "| IPA | \`$IPA_NAME\` |"
+            echo "| 크기 | $IPA_SIZE_MB MB |"
+            echo "| 버전 | \`$VERSION\` (빌드 \`$BUILD_NUMBER\`) |"
+            echo "| 업로드 | \`$action\` |"
+            echo ''
+            echo "$done_text"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # IPA 는 릴리스에 붙이지 않고 아티팩트로만 남긴다 (TestFlight 밖에서는 설치할 수 없다).
+      - name: IPA 아티팩트 업로드
+        if: ${{ !cancelled() && steps.ipa.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios-ipa
+          path: ${{ steps.ipa.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 키체인 정리
+        if: always()
+        env:
+          KEYCHAIN: ${{ steps.signing.outputs.keychain }}
+        run: |
+          if [ -n "${KEYCHAIN:-}" ]; then
+            security delete-keychain "$KEYCHAIN" || true
+          fi
+
+  # ------------------------------------------------------------------ 릴리스
+  release:
+    name: GitHub 릴리스
+    needs: [prepare, android, ios]
+    # 안드로이드가 성공했을 때만 릴리스를 만든다. iOS 만 돌린 실행에는 붙일 APK 가 없고, 그 실행의
+    # 결과물은 TestFlight 빌드 자체다 — 빈 릴리스를 만들어 태그만 소모하지 않는다.
+    # 건너뛴 잡의 result 는 'skipped' 라서 `!= 'failure'` 를 통과한다.
+    if: ${{ !cancelled() && needs.android.result == 'success' && needs.ios.result != 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: 체크아웃
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: APK 내려받기
+        uses: actions/download-artifact@v8
+        with:
+          name: android-apk
+          path: artifacts
+
+      # 이전 모바일 태그부터 지금까지의 커밋 중 `mobile/` 를 건드린 것만 싣는다. 데스크톱 커밋이
+      # 훨씬 많아서, 걸러 내지 않으면 앱과 무관한 목록이 릴리스 본문을 덮는다.
+      - name: 변경 이력 작성
+        id: notes
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PREVIOUS_TAG: ${{ needs.prepare.outputs.previous_tag }}
+          BUILD_NUMBER: ${{ needs.prepare.outputs.build_number }}
+          IOS_RESULT: ${{ needs.ios.result }}
+        run: |
+          set -euo pipefail
+
+          apk="$(find artifacts -name '*.apk' -type f | head -1)"
+          [ -n "$apk" ] || { echo "::error::내려받은 APK 를 찾지 못했습니다."; exit 1; }
+          apk_name="$(basename "$apk")"
+          apk_sha="$(sha256sum "$apk" | cut -d' ' -f1)"
+          apk_size="$(awk "BEGIN { printf \"%.1f\", $(stat -c%s "$apk") / 1048576 }")"
+
+          has_previous=0
+          if [ -n "$PREVIOUS_TAG" ] && git rev-parse -q --verify "refs/tags/$PREVIOUS_TAG" >/dev/null; then
+            has_previous=1
+            heading="### 변경 이력 ($PREVIOUS_TAG -> $TAG)"
+            commits="$(git log --no-merges --pretty=format:'- %s (%h)' "$PREVIOUS_TAG..HEAD" -- mobile/)"
+          elif [ -n "$PREVIOUS_TAG" ]; then
+            heading="### 변경 이력 (이전 태그 $PREVIOUS_TAG 를 찾지 못해 전체 커밋을 표시합니다)"
+            commits="$(git log --no-merges --pretty=format:'- %s (%h)' -n 200 -- mobile/)"
+          else
+            heading="### 변경 이력 (최초 릴리스)"
+            commits="$(git log --no-merges --pretty=format:'- %s (%h)' -n 200 -- mobile/)"
+          fi
+          [ -n "$commits" ] || commits="- 모바일 앱 쪽 변경은 없습니다 (릴리스 설정만 바뀌었습니다)."
+
+          notes="$RUNNER_TEMP/release-notes.md"
+          {
+            echo "$heading"
+            echo ''
+            echo "$commits"
+            echo ''
+            echo '### 다운로드'
+            echo ''
+            echo "- \`$apk_name\` — 안드로이드(arm64·armeabi 포함) 설치 파일 · $apk_size MB"
+            echo "  - SHA256: \`$apk_sha\`"
+            echo '  - 스토어를 거치지 않으므로 기기에서 "출처를 알 수 없는 앱" 설치를 한 번 허용해야 합니다.'
+            if [ "$IOS_RESULT" = "success" ]; then
+              echo "- iOS 는 **TestFlight** 로 배포했습니다 (빌드 \`$BUILD_NUMBER\`). IPA 는 TestFlight 밖에서"
+              echo '  설치할 수 없어서 릴리스에 붙이지 않습니다 — 필요하면 이 실행의 워크플로 아티팩트에서 받으세요.'
+            else
+              echo "- iOS 는 이번 실행에서 빌드하지 않았습니다 (\`$IOS_RESULT\`)."
+            fi
+            echo ''
+            echo "빌드 커밋: \`$GITHUB_SHA\`"
+            if [ "$has_previous" = "1" ]; then
+              echo ''
+              echo "**Full Changelog**: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/$PREVIOUS_TAG...$TAG"
+            fi
+          } > "$notes"
+
+          {
+            echo "path=$notes"
+            echo "apk=$apk"
+          } >> "$GITHUB_OUTPUT"
+
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          cat "$notes" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 릴리스 생성 및 APK 업로드
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          APK_PATH: ${{ steps.notes.outputs.apk }}
+          NOTES_PATH: ${{ steps.notes.outputs.path }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" "$APK_PATH" \
+            --title "$PRODUCT_NAME $TAG" \
+            --notes-file "$NOTES_PATH" \
+            --target "$GITHUB_SHA"
+
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "릴리스: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"

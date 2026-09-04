@@ -32,7 +32,7 @@ www/bridge.js      네이티브 호출과 와이어 값
 www/app.js         둘을 화면에 잇는 배선. data-pk 훅으로만 DOM 을 만진다.
 www/index.html     훅만 있는 마크업
 www/styles.css     화면
-scripts/           네이티브 필수 설정 패치 (멱등)
+scripts/           네이티브 필수 설정 패치 · 릴리스 버전 주입 (둘 다 멱등)
 tests/             node:test
 ```
 
@@ -170,6 +170,9 @@ npm test
 - `tests/app.test.js` — `index.html` 을 jsdom 에 올리고 `window.Capacitor` 를 가짜 브리지로
   바꿔치기해 배선을 확인한다 (데스크톱 `tests/frontend.test.js` 와 같은 방식). jsdom 이 없으면
   건너뛴다.
+- `tests/set-native-version.test.js` — 릴리스 버전을 네이티브에 넣는 스크립트를 실제 CLI 로
+  돌려 확인한다. `cap add` 템플릿이 바뀌면 앵커 정규식이 조용히 빗나가는데, 그러면 릴리스가
+  1.0 (1) 로 빌드돼 **두 번째 TestFlight 업로드에서야** 터진다.
 
 실기기 확인은 이렇게 한다:
 
@@ -180,3 +183,15 @@ npm test
 3. 상단 개수가 실제 장수와 같은지, 칩이 채워지는지, 마지막 장에서 자동으로 멈추는지 본다.
 4. 저장한 `.txt` 를 PC 로 옮겨 **풀기 탭에 붙여넣고 원본이 복원되는지** 확인한다. 형식이
    맞았다는 최종 증거는 이것뿐이다.
+
+## 릴리스
+
+`.github/workflows/release-mobile.yml` 이 서명된 APK 를 GitHub 릴리스에 붙이고 IPA 를 TestFlight
+에 올린다. Actions 탭에서 손으로 실행한다. 준비해야 하는 GitHub secret 과 애플·안드로이드 자격
+증명을 만드는 방법은 [`RELEASE.md`](RELEASE.md) 에 있다.
+
+버전은 `mobile-v*` 태그에서 계산하므로 데스크톱 `v*` 릴리스와 섞이지 않는다 — 앱만 고쳤을 때
+데스크톱 버전이 따라 오르지 않는다. 빌드 직전에 `scripts/set-native-version.mjs` 가
+`versionCode` · `versionName` · `CFBundleVersion` 을 넣는데, Capacitor 는 `package.json` 의 버전을
+네이티브로 옮겨 주지 않으므로 이게 없으면 **모든 빌드가 1.0 (1)** 이 되고 App Store Connect 가
+중복 빌드 번호로 거부한다.
