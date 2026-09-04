@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <!-- viewport-fit=cover: 오버레이를 노치 영역까지 깔고, 안전 영역은 CSS 에서 뺀다. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no"
+    />
+    <title>Packer 조각 모으기</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <!--
+      마크업에는 로직이 없다. `app.js` 는 클래스 이름을 하나도 모르고 `data-pk="..."` 훅으로만
+      참조한다 (데스크톱 `src/index.html` 과 같은 규약). 훅 목록은 mobile/README.md 에 있다.
+    -->
+    <div class="app" data-pk="app" data-state="idle">
+      <!-- ------------------------------------------------------------ 준비 -->
+      <section class="screen" data-pk="intro">
+        <div class="intro-body">
+          <h1 class="title">조각 모으기</h1>
+          <p class="lead">
+            PC 화면의 QR 코드를 차례로 비추면 순번을 알아서 맞춰 모읍니다. 다 모이면 하나의
+            텍스트로 합쳐 <code>.txt</code> 로 저장합니다.
+          </p>
+          <ol class="steps">
+            <li>PC 에서 Packer 창을 가능한 크게 키웁니다.</li>
+            <li>아래 버튼을 누르고 QR 코드를 비춥니다.</li>
+            <li>PC 에서 '다음' 으로 장을 넘깁니다. 순서는 상관없습니다.</li>
+          </ol>
+          <p class="note" data-pk="perm-note"></p>
+          <p class="error" data-pk="scan-error" hidden></p>
+        </div>
+
+        <div class="intro-actions">
+          <button type="button" class="btn btn-primary" data-pk="scan-start">스캔 시작</button>
+          <button type="button" class="btn btn-quiet" data-pk="perm-settings" hidden>
+            설정에서 카메라 권한 켜기
+          </button>
+        </div>
+      </section>
+
+      <!-- ------------------------------------------------ 스캔 (카메라 위 오버레이) -->
+      <!--
+        스캔 중에는 이 영역만 보인다. 카메라 미리보기가 웹뷰 뒤에 그려지고 나머지는 모두
+        감춰지므로, 화면에 보여야 할 것은 전부 이 안에 있어야 한다.
+      -->
+      <section class="screen scan" data-pk="scan-overlay">
+        <header class="scan-head">
+          <span class="count tnum" data-pk="scan-progress" aria-live="polite" aria-atomic="true"
+          ></span>
+          <span class="hint" data-pk="scan-total"></span>
+        </header>
+
+        <ul class="chips" data-pk="scan-list" aria-label="조각 순번"></ul>
+
+        <div class="reticle" aria-hidden="true"></div>
+
+        <p class="status" data-pk="scan-status" aria-live="polite"></p>
+
+        <footer class="scan-foot">
+          <button type="button" class="btn btn-quiet" data-pk="scan-torch" hidden>손전등</button>
+          <button type="button" class="btn btn-quiet" data-pk="scan-stop">중단</button>
+        </footer>
+      </section>
+
+      <!-- ------------------------------------------------------------ 결과 -->
+      <section class="screen" data-pk="result">
+        <div class="intro-body">
+          <h1 class="title">다 모았습니다</h1>
+          <p class="lead" data-pk="result-summary"></p>
+          <p class="note">
+            합쳐진 텍스트는 <strong>아직 암호화된 상태</strong>입니다. PC 의 Packer
+            <strong>풀기</strong> 탭에 붙여넣고 묶을 때 쓴 암호를 넣어야 파일이 돌아옵니다.
+          </p>
+          <p class="note" data-pk="result-note"></p>
+        </div>
+
+        <div class="intro-actions">
+          <button type="button" class="btn btn-primary" data-pk="scan-save">.txt 로 저장</button>
+          <button type="button" class="btn btn-quiet" data-pk="scan-reset">다시 모으기</button>
+        </div>
+      </section>
+    </div>
+
+    <!-- 순번 하나. `data-got` 이 인식 여부다. -->
+    <template data-pk="chip-template">
+      <li class="chip tnum" data-got="false"><span data-field="index"></span></li>
+    </template>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

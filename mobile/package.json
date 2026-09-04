@@ -1,0 +1,32 @@
+{
+  "name": "packer-scanner",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Packer 가 내보낸 QR 조각을 모아 하나의 텍스트로 합치는 휴대폰 앱",
+  "scripts": {
+    "test": "node --test tests/collector.test.js tests/app.test.js",
+    "sync": "cap sync && node scripts/patch-native.mjs",
+    "patch-native": "node scripts/patch-native.mjs",
+    "check:native": "node scripts/patch-native.mjs --check",
+    "add:android": "cap add android && node scripts/patch-native.mjs",
+    "add:ios": "cap add ios --packagemanager cocoapods && node scripts/patch-native.mjs",
+    "android": "cap run android",
+    "ios": "cap run ios",
+    "open:android": "cap open android",
+    "open:ios": "cap open ios"
+  },
+  "dependencies": {
+    "@capacitor-community/keep-awake": "^8.0.1",
+    "@capacitor-mlkit/barcode-scanning": "^8.1.1",
+    "@capacitor/android": "^8.5.1",
+    "@capacitor/core": "^8.5.1",
+    "@capacitor/filesystem": "^8.1.3",
+    "@capacitor/haptics": "^8.0.0",
+    "@capacitor/ios": "^8.5.1"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.5.1",
+    "jsdom": "^30.0.1"
+  }
+}

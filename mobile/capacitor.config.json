@@ -1,0 +1,11 @@
+{
+  "appId": "org.packer.scanner",
+  "appName": "Packer Scanner",
+  "webDir": "www",
+  "android": {
+    "allowMixedContent": false
+  },
+  "ios": {
+    "contentInset": "always"
+  }
+}

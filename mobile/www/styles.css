@@ -1,0 +1,280 @@
+/* Packer 조각 모으기 — 화면.
+ *
+ * 글꼴은 싣지 않는다. 데스크톱 앱은 Noto Sans KR 을 직접 담지만(4MB), 안드로이드와 iOS 는
+ * 한국어 글꼴을 이미 갖고 있다.
+ */
+
+:root {
+  --bg: #12141a;
+  --panel: #1b1f28;
+  --line: #2b3140;
+  --text: #eef1f6;
+  --muted: #98a1b3;
+  --accent: #5b9cff;
+  --got: #3ddc84;
+  --warn: #ffb020;
+  --bad: #ff6b6b;
+
+  color-scheme: dark;
+}
+
+/* ------------------------------------------------------------------ 투명 규칙
+ *
+ * 이 블록이 이 파일에서 가장 중요하다. 스캔 중에는 카메라 미리보기가 **웹뷰 뒤에** 네이티브로
+ * 그려지므로, 웹뷰가 조금이라도 불투명하면 화면이 그냥 검게 보인다 — "플러그인이 안 된다" 로
+ * 오해하기 쉬운 증상이 사실은 여기서 나온다.
+ *
+ * 그래서 배경색을 `body` 에 두지 않는다. CSS 규격상 루트 요소의 배경이 투명하면 `body` 의
+ * 배경이 **캔버스로 전파**되고, 캔버스 칠하기는 `visibility: hidden` 의 영향을 받지 않는다.
+ * 즉 `body { background: ... }` 로 두면 플러그인이 body 를 감춰도 배경은 그대로 남아 카메라를
+ * 덮는다. 배경은 반드시 안쪽 래퍼(`[data-pk="app"]`)가 들고 있어야 한다.
+ */
+html,
+body {
+  margin: 0;
+  background: transparent;
+}
+
+.app {
+  min-height: 100dvh;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Apple SD Gothic Neo", Roboto, "Noto Sans KR", sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  -webkit-text-size-adjust: 100%;
+}
+
+/* 스캔 중에는 래퍼도 투명해야 한다. */
+.app[data-state="scanning"] {
+  background: transparent;
+}
+
+/* 플러그인이 스캔을 시작하면 `<body>` 에 이 클래스를 붙인다. 오버레이만 되살린다
+ * (`visibility` 는 상속되므로 자손에서 되돌릴 수 있다). */
+body.barcode-scanner-active {
+  visibility: hidden;
+}
+
+body.barcode-scanner-active [data-pk="scan-overlay"] {
+  visibility: visible;
+}
+
+/* ------------------------------------------------------------------ 화면 전환 */
+
+/* 화면은 서로 배타적이다. `data-state` 하나로만 정한다. */
+.screen {
+  display: none;
+}
+
+.app[data-state="idle"] [data-pk="intro"],
+.app[data-state="denied"] [data-pk="intro"],
+.app[data-state="unsupported"] [data-pk="intro"] {
+  display: flex;
+}
+
+.app[data-state="scanning"] [data-pk="scan-overlay"] {
+  display: flex;
+}
+
+.app[data-state="complete"] [data-pk="result"] {
+  display: flex;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+/* ------------------------------------------------------------------ 준비·결과 */
+
+[data-pk="intro"],
+[data-pk="result"] {
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 24px;
+  min-height: 100dvh;
+  box-sizing: border-box;
+  padding: calc(env(safe-area-inset-top) + 28px) 20px calc(env(safe-area-inset-bottom) + 20px);
+}
+
+.title {
+  margin: 0 0 12px;
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.lead {
+  margin: 0 0 18px;
+  color: var(--text);
+}
+
+.steps {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--muted);
+}
+
+.steps li + li {
+  margin-top: 6px;
+}
+
+.note {
+  margin: 18px 0 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.error {
+  margin: 14px 0 0;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: rgba(255, 107, 107, 0.12);
+  color: var(--bad);
+  font-size: 14px;
+}
+
+code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--panel);
+  font-size: 0.92em;
+}
+
+.intro-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* ------------------------------------------------------------------ 버튼 */
+
+.btn {
+  padding: 15px 18px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  font: inherit;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--panel);
+  cursor: pointer;
+  /* 카메라 위에서도 눌리는 크기를 보장한다. */
+  min-height: 50px;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: #08111f;
+}
+
+.btn-quiet {
+  background: rgba(27, 31, 40, 0.82);
+  border-color: var(--line);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+}
+
+/* ------------------------------------------------------------------ 스캔 오버레이 */
+
+.scan {
+  flex-direction: column;
+  gap: 14px;
+  min-height: 100dvh;
+  box-sizing: border-box;
+  padding: calc(env(safe-area-inset-top) + 14px) 16px calc(env(safe-area-inset-bottom) + 16px);
+}
+
+/* 카메라 위 글자는 배경 없이는 읽히지 않는다. 화면 전체를 덮지 않도록 요소마다 판을 깐다. */
+.scan-head,
+.status,
+.chips {
+  background: rgba(10, 12, 17, 0.72);
+  border-radius: 12px;
+  backdrop-filter: blur(6px);
+}
+
+.scan-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+}
+
+.count {
+  font-size: 24px;
+  font-weight: 700;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 12px;
+  list-style: none;
+}
+
+.chip {
+  display: grid;
+  place-items: center;
+  min-width: 38px;
+  min-height: 38px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--muted);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.chip[data-got="true"] {
+  border-color: var(--got);
+  background: rgba(61, 220, 132, 0.16);
+  color: var(--got);
+}
+
+/* 가운데를 비워 카메라가 보이게 하고, 겨냥할 자리만 표시한다. */
+.reticle {
+  flex: 1;
+  min-height: 120px;
+  margin: 2px 6px;
+  border: 2px dashed rgba(238, 241, 246, 0.35);
+  border-radius: 16px;
+}
+
+.status {
+  margin: 0;
+  padding: 11px 14px;
+  font-size: 14px;
+  min-height: 1.55em;
+}
+
+.status[data-tone="warn"] {
+  color: var(--warn);
+}
+
+.status[data-tone="bad"] {
+  color: var(--bad);
+}
+
+.scan-foot {
+  display: flex;
+  gap: 10px;
+}
+
+.scan-foot .btn {
+  flex: 1;
+}
+
+/* 숫자 폭을 고정한다. 순번이 바뀔 때 글자가 밀리지 않는다 (데스크톱 `.tnum` 과 같은 뜻). */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
