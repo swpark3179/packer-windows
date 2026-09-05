@@ -20,9 +20,9 @@ iOS **IPA** 를 **TestFlight** 에 올린다. Actions 탭에서 손으로 실행
 | `release` | ubuntu | 변경 이력을 만들고 `gh release create` 로 릴리스에 APK 를 붙인다 |
 
 `android/` 와 `ios/` 는 저장소에 없는 **생성물**이라 매 실행마다 새로 만든다. 그래서
-`scripts/patch-native.mjs`(필수 네이티브 설정)와 `scripts/set-native-version.mjs`(버전·빌드 번호)가
-빌드 직전에 반드시 돌아야 하고, 워크플로가 그 순서를 지킨다. 자세한 근거는 두 스크립트의 첫 주석에
-적어 두었다.
+`scripts/patch-native.mjs`(필수 네이티브 설정), `scripts/set-native-version.mjs`(버전·빌드 번호),
+`scripts/set-ios-signing.mjs`(iOS 앱 타겟의 수동 서명 설정)가 빌드 직전에 반드시 돌아야 하고,
+워크플로가 그 순서를 지킨다. 자세한 근거는 세 스크립트의 첫 주석에 적어 두었다.
 
 실행할 때 고르는 것:
 
@@ -214,7 +214,8 @@ TestFlight **내부 테스터**(팀 구성원)는 처리가 끝나면 바로 받
 | `find-identity` 가 신원을 0개 찾는다 | `.p12` 에 개인키가 없다. Keychain Access 의 **나의 인증서**에서 다시 내보낸다 (2-3) |
 | codesign 이 응답 없이 멈춘다 | 워크플로가 `security set-key-partition-list` 로 막아 둔 증상이다. 이게 뜨면 키체인 준비 스텝이 실패한 것이니 그 로그를 본다 |
 | `No profile for team 'XXXX' matching '…' found` | 프로파일이 그 팀·App ID 것이 아니거나, App Store 용이 아니다 (2-4 를 다시) |
-| **Pods 타겟**에서 프로파일 오류가 난다 | Capacitor 의 Podfile 이 `use_frameworks!` 를 써서 플러그인이 동적 프레임워크로 빌드되기 때문이다. 우회: `아카이브` 스텝에 `CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO` 를 넣어 서명 없이 아카이브하고, 서명은 `IPA 내보내기` 의 `-exportArchive` 에 맡긴다 (ExportOptions.plist 가 이미 수동 서명으로 되어 있다) |
+| `… does not support provisioning profiles … (in target 'nanopb' from project 'Pods')` | `xcodebuild NAME=value` 로 넘긴 빌드 설정은 타겟을 골라 줄 수 없어 **워크스페이스의 모든 타겟**에 적용된다. pod 타겟은 프로파일을 품을 수 없어서 죽는다. 그래서 서명 설정은 명령줄이 아니라 `서명 설정 적용` 스텝(`scripts/set-ios-signing.mjs`)이 앱 타겟 빌드 설정에 직접 넣는다. 이 오류가 다시 났다면 `아카이브` 스텝에 서명 관련 설정이 되돌아온 것이다 (Podfile 의 `post_install` 로는 못 막는다 — 명령줄 설정이 프로젝트 파일 설정보다 우선한다) |
+| `앱 타겟의 Release 빌드 설정을 찾지 못했다` | Capacitor 템플릿의 `project.pbxproj` 가 바뀌어 `scripts/set-ios-signing.mjs` 의 앵커가 빗나갔다. `mobile/tests/set-ios-signing.test.js` 의 고정 판본과 실제 파일을 견주어 앵커를 고친다 |
 | `워크스페이스에 'App' 스킴이 없습니다` | `cap add ios` 는 공유 스킴을 만들지 않는다. 로그의 스킴 목록을 보고 이름을 확인하거나, 맥에서 Xcode 로 한 번 열어 `ios/App/App.xcodeproj/xcshareddata/xcschemes/App.xcscheme` 을 만들어 커밋한다 |
 | 앱은 켜지는데 **스캔이 안 된다** | iOS 프로젝트가 SPM 으로 만들어졌다. `npm run check:native` 가 잡아 주지만, 손으로 `npx cap add ios` 를 쓰면 이 상태가 된다 — 반드시 `npm run add:ios` |
 | `No suitable application records were found` | App Store Connect 에 앱을 아직 등록하지 않았다 (2-2 의 2번) |
