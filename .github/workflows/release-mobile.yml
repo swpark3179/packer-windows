@@ -470,14 +470,30 @@ jobs:
             echo "profile_name=$profile_name"
           } >> "$GITHUB_OUTPUT"
 
-      # 워크스페이스의 모든 타겟에 서명 설정이 적용된다. Capacitor 의 Podfile 은 `use_frameworks!`
-      # 를 쓰므로 플러그인들이 동적 프레임워크로 빌드되는데, 프레임워크 타겟은 프로파일을 품지
-      # 않으니 PROVISIONING_PROFILE_SPECIFIER 는 앱 타겟에만 실제로 쓰인다. 혹시 pod 타겟이
-      # 프로파일을 못 찾는다고 죽으면 RELEASE.md 의 '자주 나는 오류' 표에 우회 방법이 있다.
-      - name: 아카이브
+      # 서명 설정은 **명령줄이 아니라 프로젝트 파일**에 넣는다. `xcodebuild NAME=value` 는 타겟을
+      # 골라 줄 수 없어서 워크스페이스의 모든 타겟 — Pods 프로젝트의 pod 타겟까지 — 에 적용되는데,
+      # 프레임워크·정적 라이브러리 타겟은 프로파일을 품을 수 없으므로 이렇게 죽는다:
+      #
+      #   error: nanopb does not support provisioning profiles. … but provisioning profile …
+      #   has been manually specified. (in target 'nanopb' from project 'Pods')
+      #
+      # Podfile 의 post_install 로 pod 타겟 설정을 지워도 소용없다 — 명령줄 설정이 프로젝트 파일
+      # 설정보다 우선한다. 그래서 앱 타겟의 Release 빌드 설정에 직접 써 넣는다. pod 타겟은
+      # CocoaPods 기본값(빌드 중에는 서명하지 않고, 앱의 `[CP] Embed Pods Frameworks` 가 나중에
+      # 앱과 같은 신원으로 서명한다)을 그대로 쓴다. 자세한 내용은 스크립트 첫 주석에 있다.
+      #
+      # `pod install` 뒤에 돌려야 한다 — pod install 이 project.pbxproj 를 다시 쓰기 때문이다.
+      - name: 서명 설정 적용
         env:
           APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
           PROFILE_NAME: ${{ steps.signing.outputs.profile_name }}
+        run: node scripts/set-ios-signing.mjs --team "$APPLE_TEAM_ID" --profile "$PROFILE_NAME"
+
+      # 여기서는 서명과 무관한 값만 명령줄로 넘긴다. 버전은 `set-native-version.mjs` 가 Info.plist 에
+      # 리터럴로 박아 두므로 사실 없어도 되지만, 템플릿이 `$(MARKETING_VERSION)` 참조로 돌아가도
+      # 값이 흔들리지 않게 같이 넘긴다. 이 둘은 pod 타겟에 적용돼도 해가 없다.
+      - name: 아카이브
+        env:
           VERSION: ${{ needs.prepare.outputs.version }}
           BUILD_NUMBER: ${{ needs.prepare.outputs.build_number }}
         working-directory: mobile/ios/App
@@ -489,10 +505,6 @@ jobs:
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/App.xcarchive" \
-            CODE_SIGN_STYLE=Manual \
-            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
-            CODE_SIGN_IDENTITY="Apple Distribution" \
-            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
             MARKETING_VERSION="$VERSION" \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
 
