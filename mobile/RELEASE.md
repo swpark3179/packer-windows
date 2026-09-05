@@ -16,7 +16,7 @@ iOS **IPA** 를 **TestFlight** 에 올린다. Actions 탭에서 손으로 실행
 | --- | --- | --- |
 | `prepare` | ubuntu | `mobile-v*` 태그를 훑어 다음 버전을 정하고, `npm ci && npm test` 로 앱 테스트를 돌린다 |
 | `android` | ubuntu | `npm run add:android` → Gradle `assembleRelease` → `zipalign` + `apksigner` 로 서명 |
-| `ios` | macos-15 | `npm run add:ios` → `pod install` → `xcodebuild archive` → IPA → `altool` 로 TestFlight |
+| `ios` | macos-26 | iOS 26 SDK 이상을 담은 Xcode 를 고른 뒤 → `npm run add:ios` → `pod install` → `xcodebuild archive` → IPA → `altool` 로 TestFlight |
 | `release` | ubuntu | 변경 이력을 만들고 `gh release create` 로 릴리스에 APK 를 붙인다 |
 
 `android/` 와 `ios/` 는 저장소에 없는 **생성물**이라 매 실행마다 새로 만든다. 그래서
@@ -221,6 +221,8 @@ TestFlight **내부 테스터**(팀 구성원)는 처리가 끝나면 바로 받
 | `No suitable application records were found` | App Store Connect 에 앱을 아직 등록하지 않았다 (2-2 의 2번) |
 | `Authentication credentials are missing or invalid` | `APPSTORE_KEY_ID` 와 `.p8` 파일이 서로 다른 키다. 또는 API 키의 권한이 App Manager 보다 낮다 |
 | `an attribute with a value that has already been used` | 빌드 번호가 중복이다. 아래 '빌드 번호' 를 본다 |
+| `SDK version issue. This app was built with the iOS 18.5 SDK. All iOS and iPadOS apps must be built with the iOS 26 SDK or later` (409) | 낡은 Xcode 로 빌드됐다. **러너 이미지를 못박아도 Xcode 판본은 못박히지 않는다** — 이미지에는 Xcode 가 여러 벌 들어 있고 기본 선택본이 가장 새 판본이 아닐 수 있다(macos-15 의 기본값은 Xcode 26.x 를 담고도 16.4 였다). 워크플로의 `Xcode 고르기` 스텝이 iOS SDK 가 `MIN_IOS_SDK_MAJOR` 이상인 가장 새 Xcode 를 골라 이 상황을 막는다. 이 오류가 다시 났다면 Apple 이 요구 판본을 올린 것이니 워크플로 env 의 `MIN_IOS_SDK_MAJOR` 를 올린다 |
+| `iOS 26 SDK 이상을 담은 Xcode 를 러너에서 찾지 못했습니다` | 위 스텝이 **빌드를 시작하기 전에** 막아 세운 것이다 (업로드에서 30분 뒤에 죽는 것보다 낫다). 러너 이미지에 그만한 Xcode 가 없다는 뜻이니 `runs-on` 을 더 새 macOS 이미지로 올린다. 어떤 Xcode 가 있는지는 그 스텝 로그가 판본별 SDK 와 함께 찍어 둔다 |
 | `pod install` 이 podspec 을 못 찾는다 | `mobile/ios/App` 에서 `pod install --repo-update` 를 직접 돌려 본다. 그래도 안 되면 플러그인 버전이 CocoaPods 트렁크에 아직 없는지 확인한다 |
 | `could not find compatible versions for pod "GoogleMLKit/BarcodeScanning"` … `required a higher minimum deployment target` | Podfile 의 배포 타깃이 GoogleMLKit 이 요구하는 값보다 낮다. `npm run add:ios` 가 15.5 로 올려 주므로, 이 오류가 났다면 `npx cap add ios` 를 손으로 썼거나 플러그인이 더 높은 값을 요구하도록 올라간 것이다. 후자면 `mobile/scripts/patch-native.mjs` 의 `IOS_DEPLOYMENT_TARGET` 을 올린다 |
 
@@ -242,3 +244,4 @@ TestFlight **내부 테스터**(팀 구성원)는 처리가 끝나면 바로 받
 | 프로비저닝 프로파일 | 1년, 또는 인증서를 새로 만들 때마다 |
 | API 키 `.p8` | 만료 없음 (직접 폐기할 때까지) |
 | 키스토어 | 없음 — **영구 보관** |
+| 러너 이미지 · Xcode | Apple 이 업로드에 요구하는 최소 SDK 를 올릴 때 (새 iOS 가 나오고 이듬해쯤). 워크플로 env 의 `MIN_IOS_SDK_MAJOR` 를 올리고, `Xcode 고르기` 가 그만한 Xcode 를 못 찾으면 `runs-on` 도 더 새 이미지로 올린다 |
