@@ -18,6 +18,18 @@ import { fileURLToPath } from "node:url";
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const checkOnly = process.argv.includes("--check");
 
+// GoogleMLKit 8.0.0 (`@capacitor-mlkit/barcode-scanning` 8.x 이 `~> 8.0.0` 으로 끌어온다) 의
+// podspec 이 iOS 15.5 이상을 요구한다. Capacitor 8 템플릿은 Podfile 도 Xcode 프로젝트도 15.0 으로
+// 나오므로, 그대로 두면 `pod install` 이 의존성을 풀지 못하고 죽는다:
+//
+//   [!] CocoaPods could not find compatible versions for pod "GoogleMLKit/BarcodeScanning":
+//       ... Specs satisfying the `GoogleMLKit/BarcodeScanning (~> 8.0.0)` dependency were found,
+//       but they required a higher minimum deployment target.
+//
+// Podfile 만 올리면 Pods 는 15.5 로, 앱 타겟은 15.0 으로 빌드된다. 앱이 자기 최소 버전보다 높은
+// 프레임워크를 링크하는 꼴이라 15.0~15.4 기기에서 실행 중에 죽는다. 그래서 양쪽을 같이 올린다.
+const IOS_DEPLOYMENT_TARGET = "15.5";
+
 let changed = 0;
 let missing = 0;
 let skipped = 0;
@@ -60,6 +72,54 @@ function ensure(file, label, needle, insert) {
   report(file, label, "added");
 }
 
+/** `a` 가 `b` 보다 낮으면 음수. "15.10" 을 15.1 로 읽지 않도록 자리별로 비교한다. */
+function compareVersions(a, b) {
+  const left = a.split(".").map(Number);
+  const right = b.split(".").map(Number);
+  for (let i = 0; i < Math.max(left.length, right.length); i += 1) {
+    const diff = (left[i] ?? 0) - (right[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+/**
+ * `re` 가 잡은 배포 타깃이 `minimum` 보다 낮으면 올린다. 이미 같거나 높으면 그대로 둔다 —
+ * 템플릿이 언젠가 더 높은 값으로 나와도 끌어내리지 않는다.
+ *
+ * 정규식은 반드시 **세 덩어리**로, `g` 플래그를 붙여 잡는다 — (앞) (버전) (뒤). pbxproj 처럼
+ * 같은 설정이 타겟·설정마다 여러 번 나오는 파일을 한 번에 고치기 위해서다.
+ *
+ * @param {string} file 대상 파일
+ * @param {string} label 사람이 읽을 이름
+ * @param {RegExp} re 버전을 세 덩어리로 잡는 정규식 (`g` 필요)
+ * @param {string} minimum 최소 버전
+ */
+function ensureDeploymentTarget(file, label, re, minimum) {
+  const content = fs.readFileSync(file, "utf8");
+  const found = [...content.matchAll(re)];
+  if (found.length === 0) {
+    // 템플릿이 바뀌어 자리를 놓친 것이다. 조용히 넘어가면 pod install 이 원인을 알기 어려운
+    // 메시지로 죽는다.
+    console.log(`  ✗ ${label} — 바꿀 자리를 찾지 못했다 (${rel(file)} 의 템플릿이 바뀌었다)`);
+    missing += 1;
+    return;
+  }
+  if (found.every((match) => compareVersions(match[2], minimum) >= 0)) {
+    report(file, label, "present");
+    return;
+  }
+  if (checkOnly) {
+    report(file, label, "missing");
+    return;
+  }
+  const next = content.replace(re, (all, before, current, after) =>
+    compareVersions(current, minimum) < 0 ? before + minimum + after : all,
+  );
+  fs.writeFileSync(file, next);
+  report(file, label, "added");
+}
+
 // ---------------------------------------------------------------- 안드로이드
 
 const manifest = path.join(root, "android", "app", "src", "main", "AndroidManifest.xml");
@@ -98,6 +158,7 @@ if (!fs.existsSync(manifest)) {
 
 const plist = path.join(root, "ios", "App", "App", "Info.plist");
 const podfile = path.join(root, "ios", "App", "Podfile");
+const pbxproj = path.join(root, "ios", "App", "App.xcodeproj", "project.pbxproj");
 const spmDir = path.join(root, "ios", "App", "CapApp-SPM");
 
 // Capacitor 8 은 iOS 를 기본으로 **Swift Package Manager** 로 만든다. 그런데 스캐너 플러그인은
@@ -152,11 +213,28 @@ if (!fs.existsSync(plist)) {
   );
 }
 
+// Podfile 의 platform 줄은 pod 해석(resolution)에 쓰인다. 여기가 낮으면 pod install 이 아예
+// 실패한다. `cap sync` 는 `def capacitor_pods` 블록과 `require_relative` 줄만 다시 쓰므로,
+// 한 번 올려 두면 sync 를 몇 번 하든 15.5 로 남는다.
 if (fs.existsSync(podfile)) {
   console.log(`ios (${rel(podfile)})`);
-  // 플러그인이 iOS 15.5 이상을 요구한다. 템플릿은 15.0 으로 나온다.
-  ensure(podfile, "deployment target 15.5", "platform :ios, '15.5'", (content) =>
-    content.replace(/platform :ios, '[\d.]+'/, "platform :ios, '15.5'"),
+  ensureDeploymentTarget(
+    podfile,
+    `Podfile 배포 타깃 ${IOS_DEPLOYMENT_TARGET} 이상`,
+    /(platform :ios, ')([\d.]+)(')/g,
+    IOS_DEPLOYMENT_TARGET,
+  );
+}
+
+// 앱 타겟도 같이 올린다. Podfile 만 올리면 Pods 는 15.5, 앱은 15.0 으로 빌드돼 15.0~15.4 기기에서
+// 실행 중에 죽는다. `cap sync` 는 project.pbxproj 를 건드리지 않으니 한 번 넣으면 그대로 남는다.
+if (fs.existsSync(pbxproj)) {
+  console.log(`ios (${rel(pbxproj)})`);
+  ensureDeploymentTarget(
+    pbxproj,
+    `IPHONEOS_DEPLOYMENT_TARGET ${IOS_DEPLOYMENT_TARGET} 이상`,
+    /(IPHONEOS_DEPLOYMENT_TARGET = )([\d.]+)(;)/g,
+    IOS_DEPLOYMENT_TARGET,
   );
 }
 

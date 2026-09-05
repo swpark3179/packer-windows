@@ -355,10 +355,17 @@ jobs:
       - name: 모바일 의존성 설치
         run: npm ci
 
-      # `ios/` 도 생성물이라 저장소에 없다. `add:ios` 는 `--packagemanager cocoapods` 를 붙여 주는데,
-      # 이게 이 프로젝트에서 가장 중요한 한 줄이다 — Capacitor 8 의 기본값인 SPM 으로 만들면
-      # QR 스캐너 플러그인(@capacitor-mlkit/barcode-scanning)이 podspec 만 있어서 **조용히 빠지고
-      # 빌드는 성공한다.** 앱이 켜지고 버튼도 보이는데 스캔만 안 되는 상태로 TestFlight 까지 간다.
+      # `ios/` 도 생성물이라 저장소에 없다. `add:ios` (scripts/add-ios.mjs) 가 세 가지를 한다.
+      #
+      #  1. `--packagemanager cocoapods` 로 만든다. 이게 이 프로젝트에서 가장 중요한 한 줄이다 —
+      #     Capacitor 8 의 기본값인 SPM 으로 만들면 QR 스캐너 플러그인
+      #     (@capacitor-mlkit/barcode-scanning)이 podspec 만 있어서 **조용히 빠지고 빌드는
+      #     성공한다.** 앱이 켜지고 버튼도 보이는데 스캔만 안 되는 상태로 TestFlight 까지 간다.
+      #  2. 배포 타깃을 15.5 로 올린다. 템플릿은 15.0 인데 GoogleMLKit 8.0.0 이 15.5 이상을
+      #     요구해서, 올리기 전에는 `pod install` 이 의존성을 풀지 못하고 죽는다.
+      #  3. 그 뒤에 `cap sync ios` 로 pod install 을 다시 돌린다.
+      #
+      # 자세한 순서와 이유는 mobile/scripts/add-ios.mjs 첫 주석에 있다.
       - name: iOS 프로젝트 생성
         run: npm run add:ios
 
@@ -372,10 +379,11 @@ jobs:
           BUILD_NUMBER: ${{ needs.prepare.outputs.build_number }}
         run: node scripts/set-native-version.mjs --version "$VERSION" --build "$BUILD_NUMBER"
 
-      # `--repo-update` 를 붙인다: 러너 이미지의 스펙 저장소가 오래되어 플러그인 podspec 을 못 찾는
-      # 일이 있다. CocoaPods 캐시는 두지 않는다 — Podfile.lock 이 이 시점 전에는 없어서 캐시 키를
-      # 만들 수 없다.
-      - name: CocoaPods 설치
+      # 실제 설치는 위 `add:ios` 안에서 이미 끝났다. 여기서 한 번 더 돌리는 것은 두 가지 때문이다 —
+      # `--repo-update` 로 스펙 저장소가 오래된 경우를 잡고, 앞선 스텝들을 거친 Podfile 과 Pods 가
+      # 실제로 맞는지 확인한다. 달라진 게 없으면 금방 끝난다. CocoaPods 캐시는 두지 않는다 —
+      # Podfile.lock 이 워크플로 시작 시점에는 없어서 캐시 키를 만들 수 없다.
+      - name: CocoaPods 확인
         working-directory: mobile/ios/App
         run: pod install --repo-update
 
