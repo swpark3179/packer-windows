@@ -67,12 +67,27 @@ Capacitor 8 은 iOS 를 기본으로 Swift Package Manager 로 만든다. 그런
 `capacitor.config.json` 에 저장되지 않으므로 `npx cap add ios` 를 직접 쓰면 안 된다.
 `npm run check:native` 가 SPM 으로 만들어진 경우를 잡아내 알려 준다.
 
+`npx cap add ios --packagemanager cocoapods` 를 손으로 쓰는 것도 안 된다. 이 명령은 프로젝트를
+만든 **뒤 곧바로** `pod install` 까지 돌리는데, 템플릿 Podfile 의 배포 타깃(15.0)이 스캐너
+플러그인이 끌어오는 GoogleMLKit 8.0.0 의 요구(15.5)보다 낮아서 반드시 실패한다:
+
+```
+[!] CocoaPods could not find compatible versions for pod "GoogleMLKit/BarcodeScanning":
+    ... they required a higher minimum deployment target.
+```
+
+배포 타깃을 올리는 `patch-native.mjs` 는 Podfile 이 생긴 **뒤에**만 돌 수 있으므로,
+`npm run add:ios` (`scripts/add-ios.mjs`) 가 순서를 대신 지켜 준다 — 생성 → 배포 타깃 올리기 →
+`cap sync ios` 로 `pod install` 다시. 마지막에 플러그인 목록(`packageClassList`)이 채워졌는지도
+확인한다. 이게 비면 앱은 켜지는데 스캔·파일 저장이 조용히 죽는다.
+
 iOS 빌드에는 **macOS** 가 필요하다(`pod install`, `xcodebuild`). 프로젝트 생성 자체는 리눅스에서도
-되지만 빌드는 안 된다. 맥에서:
+되지만 — Capacitor 가 `pod` 이 없으면 경고만 남기고 넘어간다 — 빌드는 안 된다. 맥에서는
+`npm run add:ios` 가 `pod install` 까지 끝내 주므로 바로 열면 된다:
 
 ```bash
-cd mobile/ios/App && pod install
-cd .. && npm run open:ios     # 서명 팀 설정 후 실기기에서 실행 (시뮬레이터는 카메라가 없다)
+npm run open:ios              # 서명 팀 설정 후 실기기에서 실행 (시뮬레이터는 카메라가 없다)
+cd ios/App && pod install     # Pods 가 Podfile 과 어긋났을 때만
 ```
 
 ### 자동으로 들어가는 네이티브 설정
@@ -86,7 +101,8 @@ cd .. && npm run open:ios     # 서명 팀 설정 후 실기기에서 실행 (�
 | `AndroidManifest.xml` | ML Kit `DEPENDENCIES` meta-data | 첫 스캔에서 모델을 기다린다 |
 | `Info.plist` | `NSCameraUsageDescription` | 카메라를 켜는 순간 앱이 죽는다 |
 | `Info.plist` | `UIFileSharingEnabled`, `LSSupportsOpeningDocumentsInPlace` | 저장한 `.txt` 를 '파일' 앱에서 꺼낼 수 없다 |
-| `Podfile` | `platform :ios, '15.5'` | 플러그인 최소 요구를 못 맞춰 `pod install` 이 실패한다 |
+| `Podfile` | `platform :ios, '15.5'` | GoogleMLKit 8.0.0 의 최소 요구를 못 맞춰 `pod install` 이 실패한다 |
+| `App.xcodeproj` | `IPHONEOS_DEPLOYMENT_TARGET = 15.5` | 앱이 자기보다 최소 버전이 높은 프레임워크를 링크해 15.0~15.4 기기에서 죽는다 |
 
 안드로이드 빌드는 **JDK 21** 이 필요하다 (`minSdk 24`).
 

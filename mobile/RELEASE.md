@@ -220,7 +220,8 @@ TestFlight **내부 테스터**(팀 구성원)는 처리가 끝나면 바로 받
 | `No suitable application records were found` | App Store Connect 에 앱을 아직 등록하지 않았다 (2-2 의 2번) |
 | `Authentication credentials are missing or invalid` | `APPSTORE_KEY_ID` 와 `.p8` 파일이 서로 다른 키다. 또는 API 키의 권한이 App Manager 보다 낮다 |
 | `an attribute with a value that has already been used` | 빌드 번호가 중복이다. 아래 '빌드 번호' 를 본다 |
-| `pod install` 이 podspec 을 못 찾는다 | 워크플로가 이미 `--repo-update` 를 쓴다. 그래도 안 되면 플러그인 버전이 CocoaPods 트렁크에 아직 없는지 확인한다 |
+| `pod install` 이 podspec 을 못 찾는다 | `mobile/ios/App` 에서 `pod install --repo-update` 를 직접 돌려 본다. 그래도 안 되면 플러그인 버전이 CocoaPods 트렁크에 아직 없는지 확인한다 |
+| `could not find compatible versions for pod "GoogleMLKit/BarcodeScanning"` … `required a higher minimum deployment target` | Podfile 의 배포 타깃이 GoogleMLKit 이 요구하는 값보다 낮다. `npm run add:ios` 가 15.5 로 올려 주므로, 이 오류가 났다면 `npx cap add ios` 를 손으로 썼거나 플러그인이 더 높은 값을 요구하도록 올라간 것이다. 후자면 `mobile/scripts/patch-native.mjs` 의 `IOS_DEPLOYMENT_TARGET` 을 올린다 |
 
 ## 6. 버전 · 빌드 번호 · 갱신 주기
 
