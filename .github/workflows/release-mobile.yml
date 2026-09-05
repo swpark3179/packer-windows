@@ -49,6 +49,9 @@ env:
   APP_ID: org.packer.scanner
   NODE_VERSION: "22"
   JAVA_VERSION: "21"
+  # App Store Connect 가 요구하는 최소 iOS SDK 메이저 판본. Apple 이 이 요구를 올리면
+  # (iOS 26 -> 27 …) 이 한 줄만 고치면 된다 — iOS 잡이 이 값으로 Xcode 를 고른다.
+  MIN_IOS_SDK_MAJOR: "26"
 
 jobs:
   # ------------------------------------------------------------------ 준비
@@ -329,9 +332,11 @@ jobs:
     name: iOS TestFlight
     needs: prepare
     if: contains(inputs.platforms, 'ios')
-    # Xcode 판본이 러너 이미지 갱신으로 조용히 바뀌지 않게 이미지를 못박는다. Xcode 를 바꿔 끼우는
-    # 스텝을 두는 대신 이 한 줄만 고치면 되게 한다.
-    runs-on: macos-15
+    # 이미지를 못박아도 **Xcode 판본은 못박히지 않는다** — 이미지에는 Xcode 가 여러 벌 들어 있고
+    # 그 중 기본으로 선택된 것이 가장 새 판본이라는 보장이 없다 (macos-15 이미지는 Xcode 26.x 를
+    # 담고도 기본값이 16.4 였다). 그래서 이미지는 여기서 고르고, Xcode 는 아래 `Xcode 고르기`
+    # 스텝이 SDK 를 보고 고른다.
+    runs-on: macos-26
     timeout-minutes: 60
     defaults:
       run:
@@ -349,8 +354,50 @@ jobs:
           cache: npm
           cache-dependency-path: mobile/package-lock.json
 
-      - name: Xcode 판본 확인
-        run: xcodebuild -version
+      # 러너 이미지의 **기본 Xcode 를 믿지 않는다.** 기본값이 낡으면 빌드는 멀쩡히 끝나고 30분 뒤
+      # 업로드에서만 이렇게 죽는다:
+      #
+      #   Validation failed (409) SDK version issue. This app was built with the iOS 18.5 SDK.
+      #   All iOS and iPadOS apps must be built with the iOS 26 SDK or later …
+      #
+      # 그래서 설치된 Xcode 를 훑어 iOS SDK 가 MIN_IOS_SDK_MAJOR 이상인 것 중 가장 새 판본을 골라
+      # DEVELOPER_DIR 로 못박는다. 뒤따르는 pod install · xcodebuild · altool 이 모두 이 Xcode 를
+      # 쓴다. 조건을 만족하는 Xcode 가 이미지에 없으면 빌드를 시작하기 전에 여기서 죽는다 —
+      # 그때는 러너 이미지(runs-on)를 더 새 것으로 올려야 한다는 뜻이다.
+      - name: Xcode 고르기
+        run: |
+          set -euo pipefail
+
+          best=""
+          best_sdk=""
+          for app in /Applications/Xcode*.app; do
+            developer="$app/Contents/Developer"
+            [ -x "$developer/usr/bin/xcodebuild" ] || continue
+            # `-showsdks` 는 기기용(iphoneosNN.N)과 시뮬레이터용을 함께 찍는다. 업로드 심사가 보는
+            # 것은 기기용 SDK 라서 그쪽만 센다.
+            sdk="$(DEVELOPER_DIR="$developer" xcodebuild -showsdks 2>/dev/null |
+              sed -n 's/.*-sdk iphoneos\([0-9][0-9.]*\).*/\1/p' | sort -V | tail -1)"
+            [ -n "$sdk" ] || continue
+            echo "$app : iOS SDK $sdk"
+            if [ -z "$best_sdk" ] || [ "$(printf '%s\n%s\n' "$best_sdk" "$sdk" | sort -V | tail -1)" = "$sdk" ]; then
+              best="$developer"
+              best_sdk="$sdk"
+            fi
+          done
+
+          if [ -z "$best" ] || [ "${best_sdk%%.*}" -lt "$MIN_IOS_SDK_MAJOR" ]; then
+            echo "::error::iOS $MIN_IOS_SDK_MAJOR SDK 이상을 담은 Xcode 를 러너에서 찾지 못했습니다 (가장 새 SDK: ${best_sdk:-없음}). App Store Connect 는 그보다 낮은 SDK 로 만든 빌드를 거절합니다. 워크플로의 runs-on 을 더 새 러너 이미지로 올리세요."
+            exit 1
+          fi
+
+          # DEVELOPER_DIR 이 xcode-select 보다 우선한다. 둘 다 맞춰 두면 DEVELOPER_DIR 을 보지 않는
+          # 도구(직접 `xcode-select -p` 를 읽는 스크립트)까지 같은 Xcode 를 쓴다.
+          export DEVELOPER_DIR="$best"
+          echo "DEVELOPER_DIR=$best" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$best"
+
+          echo "iOS SDK $best_sdk 를 담은 Xcode 를 골랐습니다: $best"
+          xcodebuild -version
 
       - name: 모바일 의존성 설치
         run: npm ci
