@@ -136,6 +136,28 @@ export function barcodeText(barcode) {
   return "";
 }
 
+/**
+ * 심볼에서 **원시 바이트**를 꺼낸다. 스트림 모드 프레임용이다.
+ *
+ * 조각 모드는 ASCII 텍스트라 `rawValue` 로 충분하지만, 스트림 프레임은 XOR 된 바이너리다.
+ * `rawValue` 는 UTF-8 로 해석됐을 때만 채워진다고 타입 정의가 못박아 두었으므로 바이너리에서는
+ * 비거나 깨진 글자가 온다. 그래서 여기서는 `rawValue` 를 **보지 않는다.**
+ *
+ * 자바 바이트는 음수로 올 수 있어 `& 0xff` 로 되돌린다.
+ */
+export function barcodeBytes(barcode) {
+  const bytes = barcode?.bytes;
+  if (Array.isArray(bytes) && bytes.length > 0) {
+    return Uint8Array.from(bytes, (byte) => byte & 0xff);
+  }
+  // `bytes` 를 주지 않는 기기를 위한 최후의 수단. ASCII 범위 밖이 섞이면 어차피 CRC 가 잡는다.
+  const raw = barcode?.rawValue;
+  if (typeof raw === "string" && raw.length > 0) {
+    return Uint8Array.from(raw, (ch) => ch.charCodeAt(0) & 0xff);
+  }
+  return new Uint8Array(0);
+}
+
 // ---------------------------------------------------------------- 손전등
 
 export async function torchAvailable() {
@@ -325,7 +347,8 @@ export async function buzz(kind) {
   }
 }
 
-/// 스캔하는 동안 화면이 꺼지지 않게 한다. 16장을 넘기다 화면이 꺼지면 흐름이 끊긴다.
+/// 스캔하는 동안 화면이 꺼지지 않게 한다. 자동 넘김이 한 바퀴 도는 동안 화면이 꺼지면
+/// 흐름이 끊긴다 — 128장이면 45초쯤 폰을 들고만 있게 된다.
 export async function keepAwake(on) {
   const api = plugin("KeepAwake");
   if (!api) return;

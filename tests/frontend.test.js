@@ -113,6 +113,8 @@ async function mount(handlers = {}) {
       await settle();
       await settle();
     },
+    /** 자동 넘김처럼 시간이 흘러야 하는 것을 기다린다. */
+    wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     type: async (name, value) => {
       const input = hook(name);
       input.value = value;
@@ -166,9 +168,21 @@ const qrPage = (n) => ({
 const qrPages = (total) =>
   Array.from({ length: total }, (_, i) => ({ ...qrPage(i + 1), total }));
 
+/**
+ * `total` 장짜리 나눔을 흉내 내는 응답 조각.
+ *
+ * 그림은 응답에 실려 오지 않는다 — 첫 장만 함께 오고 나머지는 `qr_piece` 로 받아 간다
+ * (조각 상한이 128장이라 전부 실으면 응답이 메가바이트가 된다).
+ */
+const qrPlan = (total) => ({
+  qr_plan: { total, png_modules: 100, ec_level: "M" },
+  qr_first: { ...qrPage(1), total },
+  qr_omitted: false,
+});
+
 /** QR 한 장에 담기는 최대 바이트와 최대 장수 (Rust 의 qr::MAX_SYMBOL_BYTES / MAX_PIECES). */
 const QR_LIMIT_BYTES = 2953;
-const QR_LIMIT_PIECES = 16;
+const QR_LIMIT_PIECES = 128;
 
 const PACK_RESULT = {
   dest: "C:\\out\\bundle.txt",
@@ -180,8 +194,7 @@ const PACK_RESULT = {
   skipped: [],
   preview: ARMOR_TEXT,
   preview_omitted: false,
-  qr: qrPages(1),
-  qr_omitted: false,
+  ...qrPlan(1),
   qr_limit_bytes: QR_LIMIT_BYTES,
   qr_limit_pieces: QR_LIMIT_PIECES,
 };
@@ -201,6 +214,20 @@ function handlers(overrides = {}) {
       file_count: paths.length,
       dir_count: 0,
     }),
+
+    /// 뷰어가 장을 넘길 때마다 한 장씩 받아 간다. 실제 명령과 같이 1부터 센다.
+    qr_piece: async ({ index }) => ({ ...qrPage(index), total: 0 }),
+
+    qr_stream_open: async () => ({
+      total_bytes: 400 * 1024,
+      block_size: 1441,
+      blocks: 285,
+      fingerprint: "0123456789abcdef",
+      png_modules: 133,
+      frames_needed: 317,
+    }),
+    qr_stream_frame: async ({ seq }) => ({ png_base64: `FRAME${seq}`, png_modules: 133 }),
+    qr_stream_close: async () => null,
 
     inspect: async ({ path: p }) => ({
       source: "file",
@@ -598,7 +625,7 @@ describe("QR 코드 — 휴대폰으로 옮기기", () => {
 
   it("여러 장으로 나뉘면 장수와 이어 붙이는 방법을 알려 준다", async () => {
     const app = await boot({
-      pack: async () => ({ ...PACK_RESULT, container_bytes: 12 * 1024, qr: qrPages(16) }),
+      pack: async () => ({ ...PACK_RESULT, container_bytes: 12 * 1024, ...qrPlan(16) }),
     });
     await packOnce(app, "pw123456");
 
@@ -608,16 +635,80 @@ describe("QR 코드 — 휴대폰으로 옮기기", () => {
 
     const note = app.text("pack-qr-note");
     assert.match(note, /16장으로 나눴습니다/);
-    // 앱이 이어 붙여 주지 않는다는 사실을 반드시 말해야 한다.
-    assert.match(note, /순서대로 스캔해 메모장에/);
+    // 이제 쉬운 길이 먼저다 — 자동 넘김 + 조각 모으기 앱.
+    assert.match(note, /자동 넘김/);
+    assert.match(note, /한 바퀴 돌면 멈춥니다/);
+    // 손으로 이어 붙이는 길도 남아 있고, 앱이 이어 붙여 주지 않는다는 사실도 말해야 한다.
+    assert.match(note, /손으로 이어 붙일 수도 있습니다/);
     // 추상적인 표기 대신 실제 값이라야 붙여넣은 텍스트에서 알아본다.
     assert.match(note, /#1\/16 부터 #16\/16 까지/);
     // 순서 표시를 쓰레기로 보고 지우다 Base64 를 함께 지우는 사고를 막는다.
     assert.match(note, /지우지 않아도 됩니다/);
   });
 
+  it("자동 넘김이 스스로 장을 넘기고 마지막 장에서 멈춘다", async () => {
+    const app = await boot({ pack: async () => ({ ...PACK_RESULT, ...qrPlan(3) }) });
+    await packOnce(app, "pw123456");
+
+    // 속도를 최소로 내려 테스트가 오래 걸리지 않게 한다.
+    app.hook("pack-qr-speed").value = "300";
+    await app.click("pack-qr-play");
+    assert.equal(app.text("pack-qr-play"), "멈춤");
+    assert.equal(app.hook("pack-qr-play").getAttribute("aria-pressed"), "true");
+
+    await app.wait(1100);
+
+    assert.equal(app.text("pack-qr-index"), "3 / 3");
+    // 한 바퀴 돌면 멈춘다. '다음' 이 잠기는 것이 "다 찍었다" 는 유일한 신호라서, 무한히
+    // 돌면 그 신호가 사라진다.
+    assert.equal(app.text("pack-qr-play"), "자동 넘김");
+    assert.equal(app.hook("pack-qr-next").disabled, true);
+  });
+
+  it("자동 넘김 중에 손으로 넘기면 자동이 비켜 준다", async () => {
+    const app = await boot({ pack: async () => ({ ...PACK_RESULT, ...qrPlan(8) }) });
+    await packOnce(app, "pw123456");
+
+    app.hook("pack-qr-speed").value = "1500";
+    await app.click("pack-qr-play");
+    await app.click("pack-qr-next");
+
+    // 둘이 동시에 장을 옮기면 어느 쪽도 못 쫓는다.
+    assert.equal(app.text("pack-qr-play"), "자동 넘김");
+    assert.equal(app.text("pack-qr-index"), "2 / 8");
+  });
+
+  it("한 장짜리에는 자동 넘김이 뜻이 없다", async () => {
+    const app = await boot();
+    await packOnce(app);
+    // nav 자체가 감춰지므로 버튼도 함께 사라진다.
+    assert.equal(app.visible("pack-qr-nav"), false);
+    assert.equal(app.hook("pack-qr-play").disabled, true);
+  });
+
+  it("그림은 한 장씩 받아 온다", async () => {
+    // 조각 상한이 128장이라 전부 실어 보내면 응답이 메가바이트가 된다.
+    const asked = [];
+    const app = await boot({
+      pack: async () => ({ ...PACK_RESULT, ...qrPlan(4) }),
+      qr_piece: async ({ index }) => {
+        asked.push(index);
+        return { ...qrPage(index), total: 4 };
+      },
+    });
+    await packOnce(app, "pw123456");
+
+    // 첫 장은 묶기 응답에 실려 오므로 다시 묻지 않는다.
+    assert.ok(!asked.includes(1), `1번은 이미 받았다: ${asked}`);
+    // 대신 앞의 몇 장을 미리 받아 둔다 — 자동 넘김의 체류 시간 안에 그림이 도착해야 한다.
+    assert.ok(asked.includes(2), `미리 받아야 한다: ${asked}`);
+
+    await app.click("pack-qr-next");
+    assert.equal(app.attr("pack-qr-image", "src"), "data:image/png;base64,QRPNG2");
+  });
+
   it("다음·이전으로 장을 넘기고 양끝에서는 잠긴다", async () => {
-    const app = await boot({ pack: async () => ({ ...PACK_RESULT, qr: qrPages(3) }) });
+    const app = await boot({ pack: async () => ({ ...PACK_RESULT, ...qrPlan(3) }) });
     await packOnce(app, "pw123456");
 
     assert.equal(app.text("pack-qr-index"), "1 / 3");
@@ -645,7 +736,7 @@ describe("QR 코드 — 휴대폰으로 옮기기", () => {
   });
 
   it("장을 넘기면 그림 설명도 함께 바뀐다", async () => {
-    const app = await boot({ pack: async () => ({ ...PACK_RESULT, qr: qrPages(3) }) });
+    const app = await boot({ pack: async () => ({ ...PACK_RESULT, ...qrPlan(3) }) });
     await packOnce(app, "pw123456");
 
     assert.match(app.attr("pack-qr-image", "alt"), /3장 중 1번째/);
@@ -654,7 +745,7 @@ describe("QR 코드 — 휴대폰으로 옮기기", () => {
   });
 
   it("장을 넘겨도 안내 문구는 그대로 있다", async () => {
-    const app = await boot({ pack: async () => ({ ...PACK_RESULT, qr: qrPages(3) }) });
+    const app = await boot({ pack: async () => ({ ...PACK_RESULT, ...qrPlan(3) }) });
     await packOnce(app, "pw123456");
 
     const before = app.text("pack-qr-note");
@@ -669,7 +760,8 @@ describe("QR 코드 — 휴대폰으로 옮기기", () => {
         ...PACK_RESULT,
         dest: "C:\\out\\big.txt",
         container_bytes: 2 * 1024 * 1024,
-        qr: null,
+        qr_plan: null,
+        qr_first: null,
         qr_omitted: true,
       }),
     });
@@ -687,10 +779,88 @@ describe("QR 코드 — 휴대폰으로 옮기기", () => {
     assert.match(note, /2\.0 MB/, `실제 크기를 말해 줘야 한다: ${note}`);
     // 반올림하면 "2.9 KB라서 2.9 KB 를 넘습니다" 가 되어 스스로 모순된다.
     assert.match(note, /2,953 B/);
-    assert.match(note, /16장까지만/);
+    assert.match(note, /128장까지만/);
     assert.match(note, /현실적이지 않습니다/, "왜 안 되는지가 빠지면 게으름으로 보인다");
     // 묶기 자체는 성공했다. 경고로 뒤집지 않는다.
     assert.equal(app.hook("pack-status").dataset.kind, "ok");
+  });
+
+  it("조각 모드에 담기면 스트림을 제안하지 않는다", async () => {
+    // 스트림은 기본 카메라로 찍어 붙여넣을 수 없다. 되는 쪽이 있으면 언제나 그쪽이 낫다.
+    const app = await boot({ pack: async () => ({ ...PACK_RESULT, ...qrPlan(3) }) });
+    await packOnce(app, "pw123456");
+    assert.equal(app.visible("pack-qr-stream"), false);
+  });
+
+  it("조각 모드에 안 담기면 스트림을 제안한다", async () => {
+    const app = await boot({
+      pack: async () => ({
+        ...PACK_RESULT,
+        container_bytes: 400 * 1024,
+        qr_plan: null,
+        qr_first: null,
+        qr_omitted: true,
+      }),
+    });
+    await packOnce(app, "pw123456");
+
+    assert.equal(app.visible("pack-qr-stream"), true);
+    // 조각 모드가 왜 안 되는지는 여전히 말해 준다.
+    assert.match(app.text("pack-qr-note"), /128장까지만/);
+  });
+
+  it("스트림은 프레임을 계속 흘려 보내고, 끝을 약속하지 않는다", async () => {
+    const app = await boot({
+      pack: async () => ({
+        ...PACK_RESULT,
+        container_bytes: 400 * 1024,
+        qr_plan: null,
+        qr_first: null,
+        qr_omitted: true,
+      }),
+    });
+    await packOnce(app, "pw123456");
+
+    app.hook("pack-qr-speed").value = "300";
+    await app.click("pack-qr-stream-start");
+
+    assert.equal(app.hook("pack-qr").dataset.state, "stream");
+    assert.equal(app.attr("pack-qr-image", "src"), "data:image/png;base64,FRAME0");
+    // 조각 모드의 넘기기는 뜻이 없다 — 끝이 없으므로 '다음' 도 없다.
+    assert.equal(app.visible("pack-qr-nav"), false);
+
+    // 예상 시간을 그대로 적어 준다. 45분이 걸릴 일을 말없이 시작하면 안 된다.
+    const note = app.text("pack-qr-note");
+    assert.match(note, /317장/);
+    assert.match(note, /분 걸립니다/);
+    // 기본 카메라로 안 된다는 사실을 감추지 않는다.
+    assert.match(note, /기본 카메라로 찍어 붙여넣을 수 없습니다/);
+
+    await app.wait(800);
+    const sent = Number(app.text("pack-qr-index").replace(/[^\d]/g, ""));
+    assert.ok(sent >= 2, `${sent}장만 보냈다`);
+    assert.notEqual(app.attr("pack-qr-image", "src"), "data:image/png;base64,FRAME0");
+  });
+
+  it("스트림을 멈추면 컨테이너를 붙잡고 있지 않는다", async () => {
+    const app = await boot({
+      pack: async () => ({
+        ...PACK_RESULT,
+        container_bytes: 400 * 1024,
+        qr_plan: null,
+        qr_first: null,
+        qr_omitted: true,
+      }),
+    });
+    await packOnce(app, "pw123456");
+
+    await app.click("pack-qr-stream-start");
+    assert.equal(app.text("pack-qr-stream-start"), "그만 보내기");
+
+    await app.click("pack-qr-stream-start");
+    assert.ok(app.called("qr_stream_close"), "붙잡고 있던 바이트를 놓아야 한다");
+    assert.equal(app.text("pack-qr-stream-start"), "스트림으로 보내기");
+    assert.equal(app.visible("pack-qr-image"), false);
   });
 
   it("한도를 알려 주지 않은 응답에도 0 B 같은 숫자를 지어내지 않는다", async () => {
@@ -698,7 +868,8 @@ describe("QR 코드 — 휴대폰으로 옮기기", () => {
       pack: async () => ({
         ...PACK_RESULT,
         container_bytes: 2 * 1024 * 1024,
-        qr: null,
+        qr_plan: null,
+        qr_first: null,
         qr_limit_bytes: undefined,
         qr_limit_pieces: undefined,
       }),
@@ -711,7 +882,7 @@ describe("QR 코드 — 휴대폰으로 옮기기", () => {
   });
 
   it("다시 묶기 전에는 지난 QR 이 남지 않는다", async () => {
-    const app = await boot({ pack: async () => ({ ...PACK_RESULT, qr: qrPages(3) }) });
+    const app = await boot({ pack: async () => ({ ...PACK_RESULT, ...qrPlan(3) }) });
     await packOnce(app, "pw123456");
     await app.click("pack-qr-next");
     assert.equal(app.visible("pack-qr"), true);
@@ -729,7 +900,7 @@ describe("QR 코드 — 휴대폰으로 옮기기", () => {
     // QR 이 떠 있는 상태를 유지한 채 다른 작업을 붙잡아 둔다 — 묶기를 다시 걸면 QR 이 먼저
     // 치워지므로, 풀기를 끝나지 않는 상태로 세워 두고 확인한다.
     const app = await boot({
-      pack: async () => ({ ...PACK_RESULT, qr: qrPages(3) }),
+      pack: async () => ({ ...PACK_RESULT, ...qrPlan(3) }),
       unpack_text: () => new Promise(() => {}),
     });
     await packOnce(app, "pw123456");

@@ -13,7 +13,8 @@
 
 use packer_lib::{armor, qr};
 
-const ALSO_FIX: &str = "mobile/www/collector.js 와 mobile/tests/collector.test.js 도 함께 고쳐야 한다";
+const ALSO_FIX: &str =
+    "mobile/www/collector.js 와 mobile/tests/collector.test.js 도 함께 고쳐야 한다";
 
 /// 테스트용 armor 본문. Base64 글자만 쓰고 길이는 4의 배수로 둔다 (실제 본문이 늘 그렇다).
 fn body(length: usize) -> String {
@@ -67,15 +68,53 @@ fn mobile_body_of(piece: &str) -> String {
 #[test]
 fn markers_are_exactly_what_the_mobile_parser_looks_for() {
     // 상수를 자기 자신과 비교하면 아무것도 못 잡는다. 글자 그대로 적어 둔다.
-    assert_eq!(armor::BEGIN_MARKER, "-----BEGIN PACKER CONTAINER-----", "{ALSO_FIX}");
-    assert_eq!(armor::END_MARKER, "-----END PACKER CONTAINER-----", "{ALSO_FIX}");
+    assert_eq!(
+        armor::BEGIN_MARKER,
+        "-----BEGIN PACKER CONTAINER-----",
+        "{ALSO_FIX}"
+    );
+    assert_eq!(
+        armor::END_MARKER,
+        "-----END PACKER CONTAINER-----",
+        "{ALSO_FIX}"
+    );
     assert_eq!(armor::PIECE_MARK, '#', "{ALSO_FIX}");
-    assert_eq!(qr::MAX_PIECES, 16, "{ALSO_FIX}");
 
     // 본문 글자에 `#` 가 없다는 것이 모바일 파서가 순서 표시를 집어내는 근거다. `/` 는 Base64
     // 글자라서 `/` 만으로는 안 된다.
     assert!(!armor::PIECE_MARK.is_ascii_alphanumeric());
     assert!(armor::PIECE_MARK != '+' && armor::PIECE_MARK != '/' && armor::PIECE_MARK != '=');
+}
+
+/// 조각 수 상한은 **더 이상 모바일과 짝지어진 값이 아니다.**
+///
+/// 예전에는 `collector.js` 가 `total > MAX_PIECES` 인 조각을 전부 거절했다. 그래서 데스크톱
+/// 상수를 올리는 순간 구버전 앱이 신버전 QR 을 100% 거부했고, 상수 상향이 앱 스토어 배포를
+/// 기다려야 하는 작업이 됐다. 그 검사를 없앤 지금 앱은 순번이 맞기만 하면 몇 장이든 받는다.
+///
+/// 대신 지켜야 하는 것은 **표시의 모양**이다. 100장을 넘으면 `#100/128` 처럼 세 자리가 되는데,
+/// 자릿수 고정을 가정한 파서가 있으면 거기서 조용히 깨진다.
+#[test]
+fn piece_marks_stay_parseable_past_a_hundred_pieces() {
+    // 128 × 8 자. `pieces()` 는 조각 길이를 4의 배수로 올림하므로, 딱 128조각이 나오려면
+    // ceil(len / 128) 자체가 4의 배수여야 한다.
+    let body: String = std::iter::repeat_n('A', 128 * 8).collect();
+    let cut = armor::pieces(&body, 128);
+    assert_eq!(cut.len(), 128, "{ALSO_FIX}");
+
+    // 모바일 `collector.js` 의 PIECE_MARK_PATTERN = /#(\d+)\/(\d+)/ 과 같은 판단.
+    for (at, piece) in cut.iter().enumerate() {
+        let want = format!("#{}/128", at + 1);
+        assert!(
+            piece.contains(&want),
+            "{ALSO_FIX}: {}번 조각에 {want} 가 없다",
+            at + 1
+        );
+    }
+    assert!(cut[99].contains("#100/128"), "{ALSO_FIX}: 세 자리 순번");
+
+    // 그리고 이어 붙이면 그대로 원래 본문이 나온다 — 자릿수가 늘어도 리더가 표시만 걷어낸다.
+    assert_eq!(mobile_body_of(&cut.concat()), body);
 }
 
 #[test]
@@ -103,7 +142,10 @@ fn single_symbol_shape_has_no_piece_mark() {
     let body = body(120);
     let whole = armor::wrap_single_line(&body);
 
-    assert_eq!(whole, format!("-----BEGIN PACKER CONTAINER-----\n{body}\n-----END PACKER CONTAINER-----\n"));
+    assert_eq!(
+        whole,
+        format!("-----BEGIN PACKER CONTAINER-----\n{body}\n-----END PACKER CONTAINER-----\n")
+    );
     assert!(!whole.contains(armor::PIECE_MARK), "{ALSO_FIX}");
 
     // 반대로 `pieces(_, 1)` 은 한 장이어도 표시를 붙인다. 두 모양 다 들어올 수 있다.
@@ -121,12 +163,20 @@ fn piece_marks_are_plain_ascii_decimals_in_order() {
         for (at, piece) in cut.iter().enumerate() {
             // 자리 채움도 공백도 없다. `#3/16` 이고 `#03/16` 이나 `# 3/16` 이 아니다.
             let mark = format!("#{}/{total}\n", at + 1);
-            assert!(piece.contains(&mark), "{parts}조각 중 {}번: {ALSO_FIX}", at + 1);
+            assert!(
+                piece.contains(&mark),
+                "{parts}조각 중 {}번: {ALSO_FIX}",
+                at + 1
+            );
             assert_eq!(piece.matches(armor::PIECE_MARK).count(), 1, "{ALSO_FIX}");
 
             // 시작 표시는 1번 장에만, 끝 표시는 마지막 장에만.
             assert_eq!(piece.contains(armor::BEGIN_MARKER), at == 0, "{ALSO_FIX}");
-            assert_eq!(piece.contains(armor::END_MARKER), at + 1 == total, "{ALSO_FIX}");
+            assert_eq!(
+                piece.contains(armor::END_MARKER),
+                at + 1 == total,
+                "{ALSO_FIX}"
+            );
         }
     }
 }
@@ -148,13 +198,24 @@ fn non_final_pieces_are_uniform_and_group_aligned() {
         }
 
         let per = bodies[0].len();
-        assert_eq!(per % 4, 0, "조각 본문이 4자 묶음 경계에서 잘리지 않는다. {ALSO_FIX}");
+        assert_eq!(
+            per % 4,
+            0,
+            "조각 본문이 4자 묶음 경계에서 잘리지 않는다. {ALSO_FIX}"
+        );
         for slice in &bodies[..bodies.len() - 1] {
-            assert_eq!(slice.len(), per, "마지막이 아닌 조각 길이가 제각각이다. {ALSO_FIX}");
+            assert_eq!(
+                slice.len(),
+                per,
+                "마지막이 아닌 조각 길이가 제각각이다. {ALSO_FIX}"
+            );
         }
 
         let last = bodies.last().unwrap().len();
-        assert!(last > 0 && last <= per, "마지막 조각 길이가 범위를 벗어났다. {ALSO_FIX}");
+        assert!(
+            last > 0 && last <= per,
+            "마지막 조각 길이가 범위를 벗어났다. {ALSO_FIX}"
+        );
     }
 }
 

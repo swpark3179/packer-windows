@@ -21,7 +21,9 @@ pub enum Error {
     #[error("텍스트가 온전하지 않습니다. 시작·끝 표시 줄까지 빠짐없이 복사했는지 확인해 주세요.")]
     ArmorDamaged,
 
-    #[error("QR 조각의 순서가 맞지 않습니다: {0}. 1번 조각부터 차례대로, 빠짐없이 붙여넣어 주세요.")]
+    #[error(
+        "QR 조각의 순서가 맞지 않습니다: {0}. 1번 조각부터 차례대로, 빠짐없이 붙여넣어 주세요."
+    )]
     PieceOrder(String),
 
     #[error("더 새로운 버전({0})으로 묶인 파일입니다. 프로그램을 업데이트해 주세요.")]
@@ -94,7 +96,11 @@ impl Error {
     /// io 계층을 통과해 돌아온 에러에서 원래 종류를 복원한다.
     pub fn recover(e: std::io::Error) -> Error {
         if e.get_ref().is_some_and(|r| r.is::<Wrapped>()) {
-            match e.into_inner().expect("검사에서 Some 확인됨").downcast::<Wrapped>() {
+            match e
+                .into_inner()
+                .expect("검사에서 Some 확인됨")
+                .downcast::<Wrapped>()
+            {
                 Ok(w) => return w.0,
                 Err(other) => return Error::Io(other.to_string()),
             }

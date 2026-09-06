@@ -12,7 +12,6 @@ import { describe, it } from "node:test";
 import {
   BEGIN_MARKER,
   END_MARKER,
-  MAX_PIECES,
   addPiece,
   createCollection,
   isComplete,
@@ -160,7 +159,12 @@ describe("parsePiece", () => {
   it("말이 안 되는 순번은 range", () => {
     assert.deepEqual(parsePiece("#4/3\nQUFB\n"), { ok: false, reason: "range" });
     assert.deepEqual(parsePiece("#0/3\nQUFB\n"), { ok: false, reason: "range" });
-    assert.deepEqual(parsePiece(`#1/${MAX_PIECES + 1}\nQUFB\n`), { ok: false, reason: "range" });
+    // 상한은 없앴다 — 데스크톱이 조각 수를 올려도 구버전 앱이 전부 거절하지 않아야 한다.
+    // 여전히 말이 안 되는 순번만 거절한다.
+    assert.equal(parsePiece(`#1/200\nQUFB\n`).ok, true, "200장도 받아야 한다");
+    assert.deepEqual(parsePiece(`#3/2\nQUFB\n`), { ok: false, reason: "range" });
+    assert.deepEqual(parsePiece(`#0/2\nQUFB\n`), { ok: false, reason: "range" });
+    assert.deepEqual(parsePiece(`#1/999999999\nQUFB\n`), { ok: false, reason: "range" });
   });
 });
 
@@ -295,11 +299,13 @@ describe("joinCollection", () => {
     assert.equal(joinCollection(collection), single);
   });
 
-  it("상한 16장까지 합쳐진다", () => {
-    const body = makeBody(MAX_PIECES * 2880);
-    const pieces = makePieces(body, MAX_PIECES);
+  it("128장도 합쳐진다", () => {
+    // 데스크톱 상한(`qr.rs` 의 MAX_PIECES)이 여기 적혀 있지 않은 것이 핵심이다. 저쪽이 올라도
+    // 앱은 고치지 않아도 된다.
+    const body = makeBody(128 * 2880);
+    const pieces = makePieces(body, 128);
 
-    assert.equal(pieces.length, MAX_PIECES);
+    assert.equal(pieces.length, 128);
     assert.equal(joinCollection(collectAll(pieces)), wrapSingleLine(body));
   });
 

@@ -17,11 +17,14 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use rand::RngCore;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
@@ -33,6 +36,7 @@ use crate::container::{self, ContainerReader, ContainerWriter, Header};
 use crate::crypto;
 use crate::error::{Error, Result};
 use crate::qr;
+use crate::qrstream;
 use crate::safepath;
 
 pub const EVENT_PACK: &str = "pack-progress";
@@ -57,10 +61,13 @@ const CLIPBOARD_LIMIT: u64 = 64 * 1024 * 1024;
 
 /// QR 로 만들어 볼 만한 컨테이너 크기 상한.
 ///
-/// 정확한 판정은 [`qr::render`] 가 실제 인코딩으로 하지만, 2 MiB 텍스트를 붙잡고 조각을 세지
-/// 않도록 여기서 먼저 자른다. 조각 상한(16장)에 담기는 본문이 실측 46,000자쯤이고 줄바꿈과
-/// 표시 줄을 더해도 48 KiB 아래이므로, 이 값 위의 파일은 어차피 QR 로 나오지 않는다.
-const QR_SOURCE_LIMIT: u64 = 48 * 1024;
+/// 정확한 판정은 [`qr::plan`] 이 실제 인코딩으로 하지만, 2 MiB 텍스트를 붙잡고 조각을 세지
+/// 않도록 여기서 먼저 자른다.
+///
+/// **이 값이 [`qr::MAX_PIECES`] 와 함께 움직이지 않으면 조각 상한을 올려도 아무 일이 일어나지
+/// 않는다** — 여기서 먼저 잘리기 때문이다. 조각 상한 64장에 담기는 컨테이너가 실측 약
+/// 137 KiB 이고 armor 가 4/3 배로 늘리므로, 그보다 넉넉히 위에 둔다.
+const QR_SOURCE_LIMIT: u64 = 256 * 1024;
 
 // ---------------------------------------------------------------- 진행률
 
@@ -158,7 +165,10 @@ impl ContainerSource {
                 // 흘려보내면 한참 뒤 헤더 매직이나 GCM 인증 실패로만 나타나서, 안내가 원인을
                 // 엉뚱한 곳("우리 파일이 아니다") 으로 보낸다.
                 armor::verify_pieces(text)?;
-                Ok((Box::new(ArmorReader::new(Cursor::new(text.as_bytes()))), true))
+                Ok((
+                    Box::new(ArmorReader::new(Cursor::new(text.as_bytes()))),
+                    true,
+                ))
             }
 
             ContainerSource::File(path) => {
@@ -169,9 +179,9 @@ impl ContainerSource {
                 // 앞부분만 엿본다. 초기 버전이 만든 원시 바이너리 컨테이너도 읽어 줘야
                 // 이미 만들어 둔 파일이 갑자기 열리지 않는 일이 없다. 새로 묶을 때는 항상
                 // 텍스트로만 쓴다.
-                let head = reader
-                    .fill_buf()
-                    .map_err(|e| Error::io(&format!("{} 를 읽을 수 없습니다", path.display()), e))?;
+                let head = reader.fill_buf().map_err(|e| {
+                    Error::io(&format!("{} 를 읽을 수 없습니다", path.display()), e)
+                })?;
                 let raw = head.starts_with(container::MAGIC);
 
                 if raw {
@@ -339,14 +349,153 @@ pub struct PackOutcome {
     /// 화면에 바로 띄울 armor 텍스트. 너무 크면 `None` 이고 `preview_omitted` 가 참이 된다.
     pub preview: Option<String>,
     pub preview_omitted: bool,
-    /// 스마트폰 카메라로 찍어 옮길 수 있는 QR 조각들. 한 장씩 순서대로 찍어 이어 붙이면 된다.
+    /// 스마트폰 카메라로 찍어 옮길 수 있는 QR 조각의 **요약**. 몇 장인지와 어떤 크기인지만
+    /// 담는다. 그림은 [`qr_piece`] 로 한 장씩 꺼내 간다 — 뷰어는 한 번에 한 장만 보여 주고,
+    /// 조각 상한이 64장이라 전부 실어 보내면 응답이 수백 KiB 가 된다.
+    ///
     /// 조각이 `qr_limit_pieces` 를 넘으면 `None` 이고 `qr_omitted` 가 참이 된다.
-    pub qr: Option<Vec<qr::QrImage>>,
+    pub qr_plan: Option<qr::QrPlanInfo>,
+    /// 첫 장만 함께 실어 보낸다. 결과가 뜨자마자 보여 줄 수 있어 왕복 한 번을 아낀다.
+    pub qr_first: Option<qr::QrImage>,
     pub qr_omitted: bool,
     /// QR 한 장에 담기는 최대 바이트와 최대 장수. 화면의 안내 문구가 그대로 쓴다 —
     /// 상수를 JS 에 한 번 더 적어 두면 언젠가 어긋난다.
     pub qr_limit_bytes: usize,
     pub qr_limit_pieces: usize,
+}
+
+/// 마지막으로 묶은 결과의 QR 나눔.
+///
+/// 그림을 미리 다 그려 응답에 싣는 대신, 나눔만 여기 붙잡아 두고 뷰어가 장을 넘길 때마다 한
+/// 장씩 그려 준다 ([`qr_piece`]). 조각 상한이 64장이라 전부 실으면 응답이 수백 KiB 가 되고,
+/// 상한을 더 올리면 곧 메가바이트가 된다.
+///
+/// **담고 있는 것은 armor 텍스트 조각들이고, 그건 이미 암호화된 바이트다.** 평문도 암호도 여기
+/// 들어오지 않는다 — 그 둘은 여전히 어디에도 남기지 않는다.
+#[derive(Default)]
+pub struct QrSlot(Mutex<Option<qr::QrPlan>>);
+
+impl QrSlot {
+    fn put(&self, plan: Option<qr::QrPlan>) {
+        // 잠금이 깨졌다면 담고 있던 나눔을 버리고 새것으로 채운다. QR 그림 하나 때문에 앱을
+        // 죽일 이유가 없다.
+        match self.0.lock() {
+            Ok(mut slot) => *slot = plan,
+            Err(poisoned) => *poisoned.into_inner() = plan,
+        }
+    }
+}
+
+/// QR 조각 한 장을 그려 준다. `index` 는 1부터 센다.
+///
+/// 뷰어가 장을 넘길 때마다 부른다. 앞뒤 몇 장을 미리 받아 두므로 자동 넘김의 체류 시간 안에
+/// 넉넉히 들어온다.
+#[tauri::command]
+pub async fn qr_piece(app: AppHandle, index: usize) -> Result<qr::QrImage> {
+    blocking(move || {
+        let slot = app.state::<QrSlot>();
+        let guard = slot
+            .0
+            .lock()
+            .map_err(|_| Error::Internal("QR 나눔을 읽을 수 없습니다".to_string()))?;
+        guard
+            .as_ref()
+            .ok_or_else(|| Error::Internal("보여 줄 QR 이 없습니다".to_string()))?
+            .image(index)
+    })
+    .await
+}
+
+// ---------------------------------------------------------------- QR 스트림
+
+/// 지금 내보내고 있는 스트림.
+///
+/// 조각 모드의 [`QrSlot`] 과 같은 자리다. 담는 것은 **암호화된 컨테이너 바이트**이고, 평문도
+/// 암호도 여기 들어오지 않는다.
+#[derive(Default)]
+pub struct StreamSlot(Mutex<Option<qrstream::Encoder>>);
+
+/// 스트림을 열 때 화면이 받는 것.
+#[derive(Serialize)]
+pub struct StreamOpened {
+    #[serde(flatten)]
+    pub info: qrstream::StreamInfo,
+    /// 프레임 하나를 그린 심볼의 한 변(모듈 수). 화면이 배율을 정하는 데 쓴다.
+    pub png_modules: usize,
+    /// 블록 수에 5% 를 더한 값 — 대략 이만큼 보내면 폰이 다 푼다. 예상 시간을 적는 데 쓴다.
+    pub frames_needed: usize,
+}
+
+/// 컨테이너 파일을 열어 스트림 인코더를 세운다.
+///
+/// armor 텍스트가 아니라 **되돌린 원시 바이트**를 흘린다. Base64 를 한 겹 벗기면 프레임마다
+/// 33% 를 더 담을 수 있고, 폰이 마지막에 다시 armor 로 감싸면 `.txt` 는 똑같이 나온다.
+#[tauri::command]
+pub async fn qr_stream_open(app: AppHandle, path: String) -> Result<StreamOpened> {
+    blocking(move || {
+        let file = PathBuf::from(&path);
+        let text = fs::read(&file)
+            .map_err(|e| Error::io(&format!("{} 를 열 수 없습니다", file.display()), e))?;
+
+        // 초기 버전이 만든 원시 바이너리 컨테이너도 그대로 받는다 (`armor.rs` 의 관용과 같다).
+        let source = match std::str::from_utf8(&text) {
+            Ok(as_text) if armor::looks_armored(as_text) => {
+                let body = armor::body_of(as_text)?;
+                BASE64_STANDARD
+                    .decode(body.as_bytes())
+                    .map_err(|_| Error::ArmorDamaged)?
+            }
+            _ => text,
+        };
+
+        let capacity = qr::stream_capacity();
+        let block_size = capacity.saturating_sub(qrstream::HEADER_LEN).max(1);
+        let encoder = qrstream::Encoder::new(&source, block_size)?;
+
+        // 프레임 하나를 실제로 그려 화면이 쓸 배율을 알아 온다. 모든 프레임이 같은 크기다.
+        let png_modules = qr::render_frame(&encoder.frame(0))?.png_modules;
+        // LT 부호의 실측 오버헤드는 5~8% 다. 넉넉히 잡아 화면이 시간을 과소평가하지 않게 한다.
+        let frames_needed = encoder.blocks() + encoder.blocks().div_ceil(12) + 8;
+
+        let opened = StreamOpened {
+            info: encoder.info(),
+            png_modules,
+            frames_needed,
+        };
+        match app.state::<StreamSlot>().0.lock() {
+            Ok(mut slot) => *slot = Some(encoder),
+            Err(poisoned) => *poisoned.into_inner() = Some(encoder),
+        }
+        Ok(opened)
+    })
+    .await
+}
+
+/// `seq` 번째 프레임의 그림. 화면이 끝없이 세어 올리며 부른다.
+#[tauri::command]
+pub async fn qr_stream_frame(app: AppHandle, seq: u32) -> Result<qr::QrFrame> {
+    blocking(move || {
+        let slot = app.state::<StreamSlot>();
+        let guard = slot
+            .0
+            .lock()
+            .map_err(|_| Error::Internal("스트림을 읽을 수 없습니다".to_string()))?;
+        let encoder = guard
+            .as_ref()
+            .ok_or_else(|| Error::Internal("열려 있는 스트림이 없습니다".to_string()))?;
+        qr::render_frame(&encoder.frame(seq))
+    })
+    .await
+}
+
+/// 스트림을 닫는다. 컨테이너 바이트를 메모리에 붙잡고 있을 이유가 없어지면 곧바로 놓는다.
+#[tauri::command]
+pub async fn qr_stream_close(app: AppHandle) -> Result<()> {
+    match app.state::<StreamSlot>().0.lock() {
+        Ok(mut slot) => *slot = None,
+        Err(poisoned) => *poisoned.into_inner() = None,
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -374,12 +523,20 @@ fn pack_blocking(
     }
     let dest_path = PathBuf::from(&dest);
 
+    // `Reporter` 가 핸들을 가져가므로 QR 나눔을 담아 둘 몫을 따로 챙긴다. `AppHandle` 복제는
+    // 참조 세기만 올린다.
+    let handle = app.clone();
     let mut reporter = Reporter::new(app, EVENT_PACK, "packing");
-    let outcome = pack_to_file(&roots, &passphrase, &dest_path, &mut |t| reporter.on(t));
+    let packed = pack_to_file_with_qr(&roots, &passphrase, &dest_path, &mut |t| reporter.on(t));
     passphrase.zeroize();
-    if outcome.is_ok() {
+    if packed.is_ok() {
         reporter.finish();
     }
+    let outcome = packed.map(|(outcome, plan)| {
+        // 나눔을 붙잡아 둬야 `qr_piece` 가 장을 넘길 때마다 다시 계산하지 않는다.
+        handle.state::<QrSlot>().put(plan);
+        outcome
+    });
 
     match outcome {
         Ok(o) => Ok(o),
@@ -399,6 +556,20 @@ pub fn pack_to_file(
     dest_path: &Path,
     on: &mut dyn FnMut(Tick),
 ) -> Result<PackOutcome> {
+    pack_to_file_with_qr(roots, passphrase, dest_path, on).map(|(outcome, _)| outcome)
+}
+
+/// [`pack_to_file`] 과 같되 QR 나눔도 함께 돌려준다.
+///
+/// 나눔은 [`PackOutcome`] 에 담지 않는다. 그 구조체는 IPC 로 건너가는 것이고 나눔은 조각
+/// 텍스트를 통째로 들고 있어서, 실어 보내면 응답이 수백 KiB 가 된다. 명령 래퍼만 이걸 받아
+/// [`QrSlot`] 에 넣어 두고, 뷰어는 [`qr_piece`] 로 한 장씩 가져간다.
+pub fn pack_to_file_with_qr(
+    roots: &[PathBuf],
+    passphrase: &str,
+    dest_path: &Path,
+    on: &mut dyn FnMut(Tick),
+) -> Result<(PackOutcome, Option<qr::QrPlan>)> {
     // 호출자(명령 래퍼)도 검사하지만, 이 함수 자체의 불변식이므로 여기서도 지킨다.
     // 빈 키로 묶인 컨테이너는 아무나 열 수 있으니 조용히 통과시키면 안 된다.
     if passphrase.is_empty() {
@@ -465,25 +636,32 @@ pub fn pack_to_file(
     // 이미 메모리에 있는 preview 를 그대로 쓴다. QR_SOURCE_LIMIT 가 TEXT_PREVIEW_LIMIT 보다
     // 한참 작으므로 QR 대상이면 텍스트는 항상 손에 있고, 파일을 다시 읽을 일이 없다.
     let qr = match preview.as_deref() {
-        Some(text) if container_bytes <= QR_SOURCE_LIMIT => qr::render(text).unwrap_or(None),
+        Some(text) if container_bytes <= QR_SOURCE_LIMIT => qr::plan(text).unwrap_or(None),
         _ => None,
     };
+    // 첫 장은 함께 실어 보낸다. 결과가 뜨자마자 보여 줄 수 있어 왕복 한 번을 아낀다.
+    let qr_first = qr.as_ref().and_then(|plan| plan.image(1).ok());
+    let qr_plan = qr.as_ref().map(qr::QrPlan::info);
 
-    Ok(PackOutcome {
-        dest: dest_path.to_string_lossy().to_string(),
-        container_bytes,
-        original_bytes: report.total_bytes,
-        file_count: report.file_count,
-        dir_count: report.dir_count,
-        changed: report.changed,
-        skipped: report.skipped,
-        preview,
-        preview_omitted,
-        qr_omitted: qr.is_none(),
+    Ok((
+        PackOutcome {
+            dest: dest_path.to_string_lossy().to_string(),
+            container_bytes,
+            original_bytes: report.total_bytes,
+            file_count: report.file_count,
+            dir_count: report.dir_count,
+            changed: report.changed,
+            skipped: report.skipped,
+            preview,
+            preview_omitted,
+            qr_omitted: qr_plan.is_none(),
+            qr_plan,
+            qr_first,
+            qr_limit_bytes: qr::MAX_SYMBOL_BYTES,
+            qr_limit_pieces: qr::MAX_PIECES,
+        },
         qr,
-        qr_limit_bytes: qr::MAX_SYMBOL_BYTES,
-        qr_limit_pieces: qr::MAX_PIECES,
-    })
+    ))
 }
 
 // ---------------------------------------------------------------- 텍스트 다루기

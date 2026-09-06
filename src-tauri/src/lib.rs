@@ -5,10 +5,16 @@ pub mod container;
 pub mod crypto;
 pub mod error;
 pub mod qr;
+pub mod qrstream;
 pub mod safepath;
 
 pub fn run() {
     tauri::Builder::default()
+        // 마지막 묶기의 QR 나눔을 들고 있는 자리. 그림을 미리 다 그려 응답에 싣지 않고,
+        // 뷰어가 장을 넘길 때마다 `qr_piece` 가 여기서 꺼내 한 장씩 그린다.
+        .manage(commands::QrSlot::default())
+        // 스트림 모드가 흘려 보내는 컨테이너 바이트. 조각 모드의 QrSlot 과 같은 자리다.
+        .manage(commands::StreamSlot::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -17,6 +23,10 @@ pub fn run() {
             commands::inspect,
             commands::inspect_text,
             commands::pack,
+            commands::qr_piece,
+            commands::qr_stream_open,
+            commands::qr_stream_frame,
+            commands::qr_stream_close,
             commands::unpack,
             commands::unpack_text,
             commands::copy_container_to_clipboard,

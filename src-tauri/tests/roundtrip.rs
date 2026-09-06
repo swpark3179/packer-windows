@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use packer_lib::archive::Tick;
-use packer_lib::commands::{pack_to_file, unpack_to_dir, ContainerSource};
+use packer_lib::commands::{pack_to_file, pack_to_file_with_qr, unpack_to_dir, ContainerSource};
 use packer_lib::error::Error;
 
 fn write_file(path: &Path, contents: &[u8]) {
@@ -17,15 +17,29 @@ fn write_file(path: &Path, contents: &[u8]) {
 
 /// 테스트용 트리를 만든다. 여러 계층, 빈 파일, 빈 폴더, 한글 이름, 이진 데이터를 섞는다.
 fn build_tree(root: &Path) {
-    write_file(&root.join("readme.md"), b"# Packer\n\xed\x95\x9c\xea\xb8\x80 \xeb\xb3\xb8\xeb\xac\xb8");
-    write_file(&root.join("src/main.rs"), b"fn main() { println!(\"hi\"); }");
+    write_file(
+        &root.join("readme.md"),
+        b"# Packer\n\xed\x95\x9c\xea\xb8\x80 \xeb\xb3\xb8\xeb\xac\xb8",
+    );
+    write_file(
+        &root.join("src/main.rs"),
+        b"fn main() { println!(\"hi\"); }",
+    );
     write_file(&root.join("src/nested/deep/note.txt"), b"deep value");
-    write_file(&root.join("자료/보고서 2026.csv"), "가,나,다\n1,2,3\n".as_bytes());
+    write_file(
+        &root.join("자료/보고서 2026.csv"),
+        "가,나,다\n1,2,3\n".as_bytes(),
+    );
     write_file(&root.join("empty.txt"), b"");
     // 압축이 실제로 줄일 수 있는 반복 데이터.
-    write_file(&root.join("data/repeat.bin"), &vec![0xABu8; 3 * 1024 * 1024]);
+    write_file(
+        &root.join("data/repeat.bin"),
+        &vec![0xABu8; 3 * 1024 * 1024],
+    );
     // 압축이 거의 안 되는 데이터도 섞는다.
-    let noise: Vec<u8> = (0..512 * 1024).map(|i| ((i * 2654435761u64 as usize) >> 13) as u8).collect();
+    let noise: Vec<u8> = (0..512 * 1024)
+        .map(|i| ((i * 2654435761u64 as usize) >> 13) as u8)
+        .collect();
     write_file(&root.join("data/noise.bin"), &noise);
     fs::create_dir_all(root.join("빈폴더")).unwrap();
 }
@@ -156,7 +170,10 @@ fn wrong_key_is_reported_and_leaves_nothing_behind() {
 fn many_file_container(work: &Path) -> PathBuf {
     let source = work.join("s");
     for i in 0..20 {
-        write_file(&source.join(format!("f{i}.bin")), &vec![i as u8; 200 * 1024]);
+        write_file(
+            &source.join(format!("f{i}.bin")),
+            &vec![i as u8; 200 * 1024],
+        );
     }
     let container = work.join("b.txt");
     pack_to_file(&[source], "pw", &container, &mut silent).unwrap();
@@ -232,8 +249,14 @@ fn does_not_overwrite_existing_files_in_destination() {
     let restored = unpack_to_dir(&from_file(&container), "pw", &dest, &mut silent).unwrap();
 
     assert_eq!(restored.renamed.len(), 1, "{:?}", restored.renamed);
-    assert_eq!(fs::read(dest.join("proj/precious.txt")).unwrap(), b"do not lose me");
-    assert_eq!(fs::read(dest.join("proj (2)/a.txt")).unwrap(), b"new content");
+    assert_eq!(
+        fs::read(dest.join("proj/precious.txt")).unwrap(),
+        b"do not lose me"
+    );
+    assert_eq!(
+        fs::read(dest.join("proj (2)/a.txt")).unwrap(),
+        b"new content"
+    );
 }
 
 #[test]
@@ -265,10 +288,15 @@ fn progress_totals_match_the_real_payload() {
 
     let mut announced_total = 0u64;
     let mut advanced = 0u64;
-    pack_to_file(std::slice::from_ref(&source), "pw", &container, &mut |t| match t {
-        Tick::Total(n) => announced_total = n,
-        Tick::Advance { bytes, .. } => advanced += bytes,
-    })
+    pack_to_file(
+        std::slice::from_ref(&source),
+        "pw",
+        &container,
+        &mut |t| match t {
+            Tick::Total(n) => announced_total = n,
+            Tick::Advance { bytes, .. } => advanced += bytes,
+        },
+    )
     .unwrap();
     assert_eq!(announced_total, 1_000_000);
     assert_eq!(advanced, 1_000_000);
@@ -296,7 +324,13 @@ fn empty_key_is_rejected_on_both_sides() {
     assert!(matches!(err, Error::EmptyKey), "예상과 다름: {err:?}");
 
     pack_to_file(&[source], "pw", &container, &mut silent).unwrap();
-    let err = unpack_to_dir(&from_file(&container), "", &work.path().join("out"), &mut silent).unwrap_err();
+    let err = unpack_to_dir(
+        &from_file(&container),
+        "",
+        &work.path().join("out"),
+        &mut silent,
+    )
+    .unwrap_err();
     assert!(matches!(err, Error::EmptyKey), "예상과 다름: {err:?}");
 }
 
@@ -306,7 +340,13 @@ fn rejects_files_that_are_not_containers() {
     let not_ours = work.path().join("photo.jpg");
     fs::write(&not_ours, vec![0xFFu8; 4096]).unwrap();
 
-    let err = unpack_to_dir(&from_file(&not_ours), "pw", &work.path().join("out"), &mut silent).unwrap_err();
+    let err = unpack_to_dir(
+        &from_file(&not_ours),
+        "pw",
+        &work.path().join("out"),
+        &mut silent,
+    )
+    .unwrap_err();
     assert!(matches!(err, Error::NotContainer), "예상과 다름: {err:?}");
 }
 
@@ -329,7 +369,8 @@ fn handles_a_large_file() {
     }
 
     let container = work.path().join("big.txt");
-    let packed = pack_to_file(std::slice::from_ref(&source), "pw", &container, &mut silent).unwrap();
+    let packed =
+        pack_to_file(std::slice::from_ref(&source), "pw", &container, &mut silent).unwrap();
     assert_eq!(packed.original_bytes, 120 * 1024 * 1024);
 
     let dest = work.path().join("out");
@@ -350,7 +391,13 @@ fn output_is_copy_pasteable_text() {
     write_file(&source.join("blob.bin"), &[0u8, 1, 2, 255, 254, 128]);
 
     let container = work.path().join("bundle.txt");
-    pack_to_file(std::slice::from_ref(&source), "pw123456", &container, &mut silent).unwrap();
+    pack_to_file(
+        std::slice::from_ref(&source),
+        "pw123456",
+        &container,
+        &mut silent,
+    )
+    .unwrap();
 
     // 1) UTF-8 텍스트로 읽힌다 (바이너리라면 여기서 실패한다).
     let text = fs::read_to_string(&container).expect("텍스트로 읽히지 않는다");
@@ -402,10 +449,18 @@ fn unpacks_from_text_pasted_into_a_message() {
     write_file(&source.join("note.txt"), b"hello from a chat message");
 
     let container = work.path().join("bundle.txt");
-    pack_to_file(std::slice::from_ref(&source), "pw123456", &container, &mut silent).unwrap();
+    pack_to_file(
+        std::slice::from_ref(&source),
+        "pw123456",
+        &container,
+        &mut silent,
+    )
+    .unwrap();
 
     // 메일이나 메신저로 오갈 때 앞뒤에 사람 말이 붙고 줄바꿈이 LF 로 바뀌는 일이 흔하다.
-    let body = fs::read_to_string(&container).unwrap().replace("\r\n", "\n");
+    let body = fs::read_to_string(&container)
+        .unwrap()
+        .replace("\r\n", "\n");
     let messy = format!("안녕하세요!\n아래 내용 풀어 보세요.\n\n{body}\n\n감사합니다.\n");
 
     let dest = work.path().join("out");
@@ -423,8 +478,13 @@ fn pack_hands_back_text_ready_to_copy() {
     write_file(&source.join("a.txt"), b"small enough to preview");
 
     let container = work.path().join("bundle.txt");
-    let packed =
-        pack_to_file(std::slice::from_ref(&source), "pw123456", &container, &mut silent).unwrap();
+    let packed = pack_to_file(
+        std::slice::from_ref(&source),
+        "pw123456",
+        &container,
+        &mut silent,
+    )
+    .unwrap();
 
     // 작은 결과물은 화면에 바로 띄울 수 있게 텍스트를 함께 돌려준다.
     assert!(!packed.preview_omitted);
@@ -434,7 +494,10 @@ fn pack_hands_back_text_ready_to_copy() {
     // 그 텍스트만으로 풀 수 있어야 한다.
     let dest = work.path().join("out");
     unpack_to_dir(&from_text(&preview), "pw123456", &dest, &mut silent).unwrap();
-    assert_eq!(fs::read(dest.join("s/a.txt")).unwrap(), b"small enough to preview");
+    assert_eq!(
+        fs::read(dest.join("s/a.txt")).unwrap(),
+        b"small enough to preview"
+    );
 }
 
 #[test]
@@ -457,7 +520,13 @@ fn reports_text_that_was_copied_incompletely() {
     write_file(&source.join("a.bin"), &vec![3u8; 8192]);
 
     let container = work.path().join("bundle.txt");
-    pack_to_file(std::slice::from_ref(&source), "pw123456", &container, &mut silent).unwrap();
+    pack_to_file(
+        std::slice::from_ref(&source),
+        "pw123456",
+        &container,
+        &mut silent,
+    )
+    .unwrap();
 
     // 끝 표시 줄까지 못 긁어 온 흔한 실수.
     let full = fs::read_to_string(&container).unwrap();
@@ -480,7 +549,13 @@ fn wrong_key_on_pasted_text_is_still_reported_precisely() {
     write_file(&source.join("a.txt"), b"secret");
 
     let container = work.path().join("bundle.txt");
-    pack_to_file(std::slice::from_ref(&source), "right-key", &container, &mut silent).unwrap();
+    pack_to_file(
+        std::slice::from_ref(&source),
+        "right-key",
+        &container,
+        &mut silent,
+    )
+    .unwrap();
     let pasted = fs::read_to_string(&container).unwrap();
 
     let err = unpack_to_dir(
@@ -504,7 +579,13 @@ fn still_reads_a_raw_binary_container() {
     write_file(&source.join("legacy.txt"), b"packed by the old build");
 
     let armored = work.path().join("bundle.txt");
-    pack_to_file(std::slice::from_ref(&source), "pw123456", &armored, &mut silent).unwrap();
+    pack_to_file(
+        std::slice::from_ref(&source),
+        "pw123456",
+        &armored,
+        &mut silent,
+    )
+    .unwrap();
 
     // armor 를 벗겨 옛 형식(원시 바이너리)을 그대로 만들어 낸다.
     let mut raw = Vec::new();
@@ -532,8 +613,13 @@ fn text_is_larger_than_binary_but_still_compresses_well() {
     write_file(&source.join("repeat.bin"), &vec![0x42u8; 4 * 1024 * 1024]);
 
     let container = work.path().join("bundle.txt");
-    let packed =
-        pack_to_file(std::slice::from_ref(&source), "pw123456", &container, &mut silent).unwrap();
+    let packed = pack_to_file(
+        std::slice::from_ref(&source),
+        "pw123456",
+        &container,
+        &mut silent,
+    )
+    .unwrap();
 
     assert_eq!(packed.original_bytes, 4 * 1024 * 1024);
     assert!(
@@ -553,6 +639,13 @@ fn text_is_larger_than_binary_but_still_compresses_well() {
 /// 중심을 집어내지 못해서(`DataEcc`), 사람이 폰으로 찍는 상황과 다르다.
 fn display_scale(png_modules: usize) -> usize {
     (560 / png_modules).clamp(3, 10)
+}
+
+/// 나눔에서 모든 조각을 그려 낸다.
+///
+/// 앱은 뷰어가 장을 넘길 때마다 한 장씩 그리지만(`qr_piece`), 테스트는 전부를 봐야 한다.
+fn all_pieces(plan: &packer_lib::qr::QrPlan) -> Vec<packer_lib::qr::QrImage> {
+    (1..=plan.total()).map(|i| plan.image(i).unwrap()).collect()
 }
 
 /// Base64 PNG → 8비트 회색조 → 화면 배율로 확대 → QR 디코드.
@@ -603,7 +696,10 @@ fn build_small_tree(root: &Path) {
     write_file(&root.join("메모.txt"), "한글 내용\n두 번째 줄\n".as_bytes());
     write_file(&root.join("blob.bin"), &[0u8, 1, 2, 255, 254, 128]);
     write_file(&root.join("empty.txt"), b"");
-    write_file(&root.join("conf/settings.json"), br#"{"theme":"dark","scale":150}"#);
+    write_file(
+        &root.join("conf/settings.json"),
+        br#"{"theme":"dark","scale":150}"#,
+    );
 }
 
 /// 이 기능이 실제로 약속을 지키는지 — 화면의 그림을 폰으로 찍어 이어 붙이면 파일이 돌아온다.
@@ -621,19 +717,23 @@ fn qr_pieces_round_trip_through_a_real_decoder() {
 
     let container = work.path().join("bundle.txt");
     let key = "열려라 참깨 2026!";
-    let packed = pack_to_file(
-        std::slice::from_ref(&source),
-        key,
-        &container,
-        &mut silent,
-    )
-    .unwrap();
+    let (packed, plan) =
+        pack_to_file_with_qr(std::slice::from_ref(&source), key, &container, &mut silent).unwrap();
 
-    let images = packed.qr.expect("이 크기는 QR 로 나와야 한다");
+    let images = all_pieces(plan.as_ref().expect("이 크기는 QR 로 나와야 한다"));
     assert!(!packed.qr_omitted);
+    // 요약과 실제 그림이 어긋나면 뷰어가 있지도 않은 장을 넘기려 한다.
+    assert_eq!(packed.qr_plan.as_ref().unwrap().total, images.len());
+    // 첫 장은 응답에 함께 실려 온다.
+    assert_eq!(
+        packed.qr_first.as_ref().unwrap().png_base64,
+        images[0].png_base64
+    );
     assert!(images.len() > 1, "조각이 나뉘어야 한다: {}", images.len());
     // 화면에서 장을 넘길 때 크기가 들썩이지 않도록 모두 같은 규격이어야 한다.
-    assert!(images.iter().all(|i| i.png_modules == images[0].png_modules));
+    assert!(images
+        .iter()
+        .all(|i| i.png_modules == images[0].png_modules));
     assert!(images.iter().all(|i| i.ec_level == images[0].ec_level));
 
     // 사용자가 조각을 순서대로 찍어 이어 붙인 상황. 카메라 앱이 조각 끝의 줄바꿈을 떼어 낸
@@ -647,7 +747,11 @@ fn qr_pieces_round_trip_through_a_real_decoder() {
 
     let dest = work.path().join("복원");
     let restored = unpack_to_dir(&from_text(&pasted), key, &dest, &mut silent).unwrap();
-    assert!(restored.hash_mismatch.is_empty(), "{:?}", restored.hash_mismatch);
+    assert!(
+        restored.hash_mismatch.is_empty(),
+        "{:?}",
+        restored.hash_mismatch
+    );
     assert!(restored.skipped.is_empty(), "{:?}", restored.skipped);
     assert_trees_match(&source, &dest.join("원본"));
 }
@@ -665,12 +769,10 @@ fn reports_pieces_pasted_out_of_order() {
 
     let container = work.path().join("bundle.txt");
     let key = "순서 테스트";
-    let packed =
-        pack_to_file(std::slice::from_ref(&source), key, &container, &mut silent).unwrap();
+    let (_, plan) =
+        pack_to_file_with_qr(std::slice::from_ref(&source), key, &container, &mut silent).unwrap();
 
-    let mut texts: Vec<String> = packed
-        .qr
-        .unwrap()
+    let mut texts: Vec<String> = all_pieces(&plan.unwrap())
         .iter()
         .map(|image| decode_qr_png(&image.png_base64))
         .collect();
@@ -713,16 +815,18 @@ fn qr_pieces_survive_the_paste_path_without_a_decoder() {
 fn qr_is_omitted_for_a_large_container() {
     let work = tempfile::tempdir().unwrap();
     let source = work.path().join("원본");
-    // 압축이 안 되는 200 KiB — 어떤 나눔으로도 16장에 담기지 않는다.
-    write_file(&source.join("noise.bin"), &incompressible(200 * 1024));
+    // 압축이 안 되는 400 KiB — 어떤 나눔으로도 조각 상한에 담기지 않는다.
+    write_file(&source.join("noise.bin"), &incompressible(400 * 1024));
 
     let container = work.path().join("bundle.txt");
-    let packed =
-        pack_to_file(std::slice::from_ref(&source), "키", &container, &mut silent).unwrap();
+    let (packed, plan) =
+        pack_to_file_with_qr(std::slice::from_ref(&source), "키", &container, &mut silent).unwrap();
 
-    assert!(packed.qr.is_none());
+    assert!(plan.is_none());
+    assert!(packed.qr_plan.is_none());
+    assert!(packed.qr_first.is_none());
     assert!(packed.qr_omitted);
-    assert_eq!(packed.qr_limit_pieces, 16);
+    assert_eq!(packed.qr_limit_pieces, 128);
     assert_eq!(packed.qr_limit_bytes, 2953);
     // 묶기 자체는 성공했다. 텍스트는 정상으로 나와야 한다.
     assert!(packed.container_bytes > 0);
@@ -737,12 +841,13 @@ fn a_small_bundle_fits_in_a_single_symbol() {
 
     let container = work.path().join("bundle.txt");
     let key = "한 장이면 충분";
-    let packed =
-        pack_to_file(std::slice::from_ref(&source), key, &container, &mut silent).unwrap();
+    let (packed, plan) =
+        pack_to_file_with_qr(std::slice::from_ref(&source), key, &container, &mut silent).unwrap();
 
-    let images = packed.qr.expect("작은 메모는 한 장에 담겨야 한다");
+    let images = all_pieces(plan.as_ref().expect("작은 메모는 한 장에 담겨야 한다"));
     assert_eq!(images.len(), 1);
     assert_eq!(images[0].total, 1);
+    assert_eq!(packed.qr_plan.as_ref().unwrap().total, 1);
 
     // 한 장짜리도 스캔해서 붙여넣으면 그대로 풀린다.
     let dest = work.path().join("복원");

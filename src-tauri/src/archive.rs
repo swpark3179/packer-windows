@@ -192,7 +192,10 @@ pub fn scan(roots: &[PathBuf]) -> Result<Scan> {
             }
 
             let Ok(relative) = item.path().strip_prefix(root) else {
-                skipped.push(format!("{} — 경로를 해석할 수 없습니다", item.path().display()));
+                skipped.push(format!(
+                    "{} — 경로를 해석할 수 없습니다",
+                    item.path().display()
+                ));
                 continue;
             };
 
@@ -220,7 +223,10 @@ pub fn scan(roots: &[PathBuf]) -> Result<Scan> {
             let meta = match item.metadata() {
                 Ok(m) => m,
                 Err(e) => {
-                    skipped.push(format!("{} — 정보를 읽을 수 없습니다: {e}", item.path().display()));
+                    skipped.push(format!(
+                        "{} — 정보를 읽을 수 없습니다: {e}",
+                        item.path().display()
+                    ));
                     continue;
                 }
             };
@@ -345,7 +351,11 @@ pub fn write_payload<W: Write>(
     };
 
     let mut hashes = Vec::with_capacity(scan.sources.len());
-    let file_entries = scan.manifest.entries.iter().filter(|e| e.kind == Kind::File);
+    let file_entries = scan
+        .manifest
+        .entries
+        .iter()
+        .filter(|e| e.kind == Kind::File);
 
     let mut buf = vec![0u8; COPY_BUF];
     for (entry, source) in file_entries.zip(scan.sources.iter()) {
@@ -366,7 +376,10 @@ pub fn write_payload<W: Write>(
             hasher.update(&buf[..n]);
             out.write_all(&buf[..n])?;
             remaining -= n as u64;
-            on(Tick::Advance { bytes: n as u64, path: &entry.rel_path });
+            on(Tick::Advance {
+                bytes: n as u64,
+                path: &entry.rel_path,
+            });
         }
 
         if remaining > 0 {
@@ -378,7 +391,10 @@ pub fn write_payload<W: Write>(
                 hasher.update(&zeros[..n]);
                 out.write_all(&zeros[..n])?;
                 remaining -= n as u64;
-                on(Tick::Advance { bytes: n as u64, path: &entry.rel_path });
+                on(Tick::Advance {
+                    bytes: n as u64,
+                    path: &entry.rel_path,
+                });
             }
         } else {
             // 파일이 커졌는지도 확인한다 — 남은 바이트가 있으면 잘린 것이다.
@@ -478,7 +494,10 @@ pub fn read_payload<R: Read>(
                                 Error::io(&format!("{} 에 쓸 수 없습니다", path.display()), e)
                             })?;
                             remaining -= want as u64;
-                            on(Tick::Advance { bytes: want as u64, path: &entry.rel_path });
+                            on(Tick::Advance {
+                                bytes: want as u64,
+                                path: &entry.rel_path,
+                            });
                         }
                         file.flush().map_err(|e| {
                             Error::io(&format!("{} 를 마무리할 수 없습니다", path.display()), e)
@@ -564,10 +583,17 @@ mod tests {
 
         assert_eq!(report.file_count, 4);
         assert!(report.skipped.is_empty(), "{:?}", report.skipped);
-        assert!(report.hash_mismatch.is_empty(), "{:?}", report.hash_mismatch);
+        assert!(
+            report.hash_mismatch.is_empty(),
+            "{:?}",
+            report.hash_mismatch
+        );
 
         assert_eq!(fs::read(dest.join("proj/readme.md")).unwrap(), b"# hello");
-        assert_eq!(fs::read(dest.join("proj/src/main.rs")).unwrap(), b"fn main() {}");
+        assert_eq!(
+            fs::read(dest.join("proj/src/main.rs")).unwrap(),
+            b"fn main() {}"
+        );
         assert_eq!(
             fs::read(dest.join("proj/src/deep/nested/note.txt")).unwrap(),
             b"deep"
@@ -699,7 +725,10 @@ mod tests {
         // 일부러 틀린 해시를 넣는다.
         write_blob(
             &mut payload,
-            &encode(&Trailer { hashes: vec![[9u8; 32]] }).unwrap(),
+            &encode(&Trailer {
+                hashes: vec![[9u8; 32]],
+            })
+            .unwrap(),
         )
         .unwrap();
 
@@ -738,7 +767,8 @@ mod tests {
             if let Tick::Advance { bytes, .. } = t {
                 seen += bytes;
             }
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(seen, 3000);
         assert_eq!(scan.total_bytes, 3000);
     }
