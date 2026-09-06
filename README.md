@@ -255,18 +255,71 @@ Base64 를 한 겹 벗기면 33% 를 더 담을 수 있고, 어차피 사람이 
 어긋날 수 있는 자리만 하나 늘어난다.
 
 **처리율.** payload 는 프레임당 1,441바이트다(`qr::stream_capacity()` 1,465에서 헤더 24를 뺀
-값 — 125모듈 상한이 버전 27까지 허용한다). 프레임당 350ms 면 **초당 약 4.1 KB**:
+값 — 125모듈 상한이 버전 27까지 허용한다). 프레임당 350ms 면 **초당 약 4.1 KB**, 150ms 면
+**초당 약 9.6 KB** 다:
 
-| 컨테이너 | 프레임 | 걸리는 시간 |
-| --- | --- | --- |
-| 1 MB | 약 760 | 약 4분 |
-| 10 MB | 약 7,800 | 약 45분 |
-| 16 MiB (상한) | 약 12,500 | 약 73분 |
+| 컨테이너 | 프레임 | 350ms | 150ms |
+| --- | --- | --- | --- |
+| 1 MB | 약 760 | 약 4분 | 약 2분 |
+| 10 MB | 약 7,800 | 약 45분 | 약 20분 |
+| 16 MiB (상한) | 약 12,500 | 약 73분 | 약 31분 |
 
 화면은 시작하기 전에 이 숫자를 그대로 적는다. 45분이 걸릴 일을 말없이 시작하면 안 된다.
 16 MiB 상한은 "여기까지가 쓸 만하다" 가 아니라 **"여기부터는 확실히 아니다"** 라는 선이다 —
 컨테이너는 어차피 텍스트라서 클립보드(64 MiB)나 메일 첨부가 몇 초면 끝난다. QR 이 이기는 경우는
 물리적으로 망이 끊긴 자리뿐이다.
+
+#### 스트림에서는 놓친 프레임의 값이 다르다 — 그래서 더 빨리 넘길 수 있다
+
+조각 모드의 300ms 하한은 **한 프레임의 인식률**을 지키는 값이다. 거기서 한 장을 놓치면 그 장이
+다시 올 때까지 한 바퀴를 기다려야 하므로, 놓치지 않는 것이 언제나 이긴다. 파운틴 부호에서는
+그 항이 없다 — 놓친 프레임은 다음 프레임이 그대로 대신한다. 그래서 목표가 **초당 실제로
+들어가는 바이트**로 바뀌고, 조금 놓치더라도 자주 넘기는 편이 이긴다.
+
+그래도 0 으로 갈 수는 없다. 두 벽이 남고, 둘 다 **더 빨리 넘길수록 총량이 주는** 쪽으로 민다.
+
+- **폰이 초당 푸는 심볼 수에 천장이 있다.** ML Kit 의 디코드는 125모듈 심볼에 40~120ms 이고 그
+  위에 카메라 노출·초점이 얹혀, 실제로는 초당 8~12장 언저리다. 그보다 빨리 넘긴 프레임은 그냥
+  지나간다.
+- **롤링 셔터가 프레임을 찢는다.** 폰은 한 장을 위에서 아래로 15~30ms 에 걸쳐 읽는데, 그 사이에
+  화면이 넘어가면 위아래가 다른 심볼인 그림이 찍혀 아무것도 읽히지 않는다. 체류 시간 D 에서 못
+  쓰게 되는 비율이 대략 (읽는 시간)/D 이므로, D 를 줄이면 넘기는 횟수는 선형으로 늘지만 성공률이
+  그만큼 깎인다.
+
+둘을 곱하면 처리량은 **단조가 아니다.** 최적점이 폰의 분석 주기 언저리(대략 100~150ms)에 있고
+그보다 아래로는 오히려 준다. `150ms` 를 하한으로 잡은 것은 그 곡선이 아직 완만한 마지막
+자리이기 때문이다 — 기기 편차를 감안하면 여기가 "어느 폰에서도 손해는 아니다" 라고 말할 수
+있는 선이다.
+
+**그래서 켜야 열린다.** 150ms 는 초당 6.7회이고, 초당 3회를 넘겨 바뀌는 고대비 그림은
+WCAG 2.3.1 이 경고하는 구간이다. 기본값 350ms(초당 2.9회)는 그 선 아래에 두고, 빠른 구간은
+'빠르게 보내기' 를 켠 사람에게만 연다. 켜도 값이 저절로 내려가지는 않는다 — 열어 줄 뿐이다.
+화면은 무엇을 열었는지, 무엇이 위험한지, 그리고 **폰이 못 따라오면 오히려 느려진다**는 사실을
+함께 적는다. 확인하는 법도 같이 적는다: 폰에 뜨는 `초당 n장` 이 늘지 않으면 도로 올리면 된다.
+
+**그리는 자리에서 프레임을 기다리지 않는다.** 예전에는 `qr_stream_frame` 을 기다렸다가 그 뒤에
+체류 시간을 셌다. 실제 간격이 `체류 시간 + 만드는 시간` 이라 슬라이더에 적힌 것보다 늘 느렸고,
+체류 시간을 줄일수록 그 오차의 비중이 커졌다 — 350ms 에서 10% 남짓이던 것이 150ms 에서는 25%
+가 된다. 지금은 조각 모드처럼 **세 프레임을 앞서 만들어 두고**(`STREAM_PREFETCH`), 다음 프레임을
+그릴 **시각**을 잡는다. 늦었을 때 몰아 넘기지는 않는다 — 따라잡기는 프레임 두 장을 거의 동시에
+지나가게 하는 일이라 폰이 둘 다 놓친다.
+
+#### 다시 켤 때 프레임 번호를 0 으로 되돌리면 안 된다
+
+스트림에는 '되감기' 가 없다. 프레임은 매번 새로 만들어지고 아무 프레임이나 같은 값을 하므로,
+뒤로 가는 것은 폰이 **이미 본 번호**를 다시 보내는 일이라 언제나 손해다. 앞으로 이어 가는 것만
+뜻이 있다.
+
+그런데 그 손해가 자동으로 일어나던 자리가 있었다. 폰은 프레임 번호로 중복을 가리는데
+(`mobile/www/stream.js` 의 `seen`), PC 가 스트림을 다시 열 때 번호를 0 부터 시작하면 이미
+3,000장을 모아 둔 폰은 그 3,000장을 **전부 중복으로 버린다**. 화면은 멀쩡히 도는데 폰은 한 장도
+받지 못하고, 폰의 계기는 그 상태를 "PC 쪽 스트림이 멈춰 있는지 봐 주세요" 라고 **거꾸로** 읽는다
+(새 프레임 없이 중복만 느는 것은 원래 PC 가 멈췄다는 뜻이기 때문이다). 사람은 그 말을 따라 PC
+스트림을 다시 켜고, 번호는 또 0 이 된다.
+
+그래서 같은 컨테이너면 번호를 이어 붙인다. 아직 그리지 않고 미리 만들어 둔 프레임의 번호도
+되돌려 놓는다 — 폰에게는 한 번도 보이지 않은 번호들이라 태울 이유가 없다. 결과가 바뀌면
+(`clearPackQr`) 이어 갈 자리도 함께 버린다.
 
 **두 언어가 같은 난수열을 내야 한다.** 인코더는 `src-tauri/src/qrstream.rs`, 디코더는
 `mobile/www/stream.js` 다. 블록 선택이 한 비트라도 어긋나면 프레임은 멀쩡히 읽히는데 XOR 이
@@ -316,7 +369,7 @@ xorshift 를 규격으로 못박고(자바스크립트에 64비트 정수가 없
 | 탭 | `tab[data-tab=pack\|unpack]`, `panel[data-tab=pack\|unpack]` |
 | 묶기 | `pack-dropzone` `pack-list` `pack-empty` `pack-summary` `pack-clear` `pack-add-files` `pack-add-folders` `pack-key` `pack-key-toggle` `pack-key-strength` `pack-submit` `pack-progress` `pack-progress-fill` `pack-progress-label` `pack-status` `pack-reveal` |
 | 결과 텍스트 | `pack-output` `pack-output-text` `pack-output-copy` `pack-output-note` |
-| 결과 QR | `pack-qr` (`data-state=single\|split\|toobig\|stream`) `pack-qr-image` `pack-qr-note` `pack-qr-nav` `pack-qr-prev` `pack-qr-next` `pack-qr-index` `pack-qr-play` `pack-qr-speed` `pack-qr-speed-label` `pack-qr-jump` `pack-qr-goto` `pack-qr-goto-go` `pack-qr-goto-clear` `pack-qr-goto-note` `pack-qr-stream` `pack-qr-stream-start` `pack-qr-stream-note` |
+| 결과 QR | `pack-qr` (`data-state=single\|split\|toobig\|stream`) `pack-qr-image` `pack-qr-note` `pack-qr-nav` `pack-qr-prev` `pack-qr-next` `pack-qr-index` `pack-qr-play` `pack-qr-speed` `pack-qr-speed-label` `pack-qr-jump` `pack-qr-goto` `pack-qr-goto-go` `pack-qr-goto-clear` `pack-qr-goto-note` `pack-qr-stream` `pack-qr-stream-start` `pack-qr-stream-note` `pack-qr-stream-speed` `pack-qr-stream-speed-label` `pack-qr-stream-fast` `pack-qr-stream-fast-note` |
 | 풀기 | `unpack-dropzone` `unpack-pick` `unpack-file` `unpack-file-name` `unpack-file-meta` `unpack-text` `unpack-text-clear` `unpack-source-note` `unpack-key` `unpack-key-toggle` `unpack-key-hint` `unpack-dest` `unpack-dest-pick` `unpack-submit` `unpack-progress` `unpack-progress-fill` `unpack-progress-label` `unpack-status` `unpack-reveal` |
 | 목록 행 | `row-template` (안에 `[data-field=name]` `[data-field=meta]` `[data-pk=row-remove]`) |
 

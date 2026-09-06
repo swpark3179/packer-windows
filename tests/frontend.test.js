@@ -121,6 +121,13 @@ async function mount(handlers = {}) {
       input.dispatchEvent(new window.Event("input", { bubbles: true }));
       await settle();
     },
+    /** 체크박스를 켜고 끈다. `click` 과 달리 상태를 직접 정해 두 번 누르는 실수를 없앤다. */
+    check: async (name, on) => {
+      const input = hook(name);
+      input.checked = on;
+      input.dispatchEvent(new window.Event("change", { bubbles: true }));
+      await settle();
+    },
     /** 텍스트 영역에 붙여넣고 확인 요청이 나가기까지 기다린다. */
     paste: async (name, value) => {
       const input = hook(name);
@@ -996,6 +1003,113 @@ describe("QR 코드 — 휴대폰으로 옮기기", () => {
     assert.ok(app.called("qr_stream_close"), "붙잡고 있던 바이트를 놓아야 한다");
     assert.equal(app.text("pack-qr-stream-start"), "스트림으로 보내기");
     assert.equal(app.visible("pack-qr-image"), false);
+  });
+
+  it("빠르게 보내기를 켜야 300ms 아래가 열린다", async () => {
+    const app = await boot({
+      pack: async () => ({
+        ...PACK_RESULT,
+        container_bytes: 400 * 1024,
+        qr_plan: null,
+        qr_first: null,
+        qr_omitted: true,
+      }),
+    });
+    await packOnce(app, "pw123456");
+
+    const speed = app.hook("pack-qr-stream-speed");
+    // 기본 하한은 초당 3회 아래에 있다 (WCAG 2.3.1).
+    assert.equal(speed.min, "300");
+    assert.equal(app.text("pack-qr-stream-fast-note"), "");
+
+    await app.check("pack-qr-stream-fast", true);
+    assert.equal(speed.min, "150");
+    // 켜도 저절로 빨라지지 않는다 — 열어 줄 뿐이다.
+    assert.equal(speed.value, "350");
+    // 무엇을 열었는지, 무엇이 위험한지, 왜 빨라지지 않을 수 있는지를 다 적는다.
+    const note = app.text("pack-qr-stream-fast-note");
+    assert.match(note, /150ms 까지 열었습니다/);
+    assert.match(note, /빛에 민감한/);
+    assert.match(note, /초당 n장/);
+
+    speed.value = "150";
+    speed.dispatchEvent(new app.window.Event("input", { bubbles: true }));
+    assert.equal(app.text("pack-qr-stream-speed-label"), "150ms");
+
+    // 끄면 열어 뒀던 구간에서 데리고 나온다. 안 그러면 토글이 거짓말이 된다.
+    await app.check("pack-qr-stream-fast", false);
+    assert.equal(speed.min, "300");
+    assert.equal(speed.value, "300");
+    assert.equal(app.text("pack-qr-stream-speed-label"), "300ms");
+    assert.equal(app.text("pack-qr-stream-fast-note"), "");
+  });
+
+  it("껐다 켜면 프레임 번호를 이어 간다", async () => {
+    // 폰은 번호로 중복을 가린다. 0번부터 다시 보내면 이미 모아 둔 것이 전부 중복으로 버려지고,
+    // 폰의 계기는 그 상태를 "PC 가 멈췄다" 고 거꾸로 읽는다.
+    const asked = [];
+    const app = await boot({
+      pack: async () => ({
+        ...PACK_RESULT,
+        container_bytes: 400 * 1024,
+        qr_plan: null,
+        qr_first: null,
+        qr_omitted: true,
+      }),
+      qr_stream_frame: async ({ seq }) => {
+        asked.push(seq);
+        return { png_base64: `FRAME${seq}`, png_modules: 133 };
+      },
+    });
+    await packOnce(app, "pw123456");
+
+    await app.click("pack-qr-stream-start");
+    await app.wait(800);
+    const sent = Number(app.text("pack-qr-index").split(" ")[0]);
+    assert.ok(sent >= 2, `${sent}장만 보냈다`);
+
+    await app.click("pack-qr-stream-start");
+    const restarted = asked.length;
+    await app.click("pack-qr-stream-start");
+
+    const after = asked.slice(restarted);
+    assert.ok(after.length > 0, "다시 켰는데 프레임을 만들지 않았다");
+    assert.ok(Math.min(...after) >= sent, `${Math.min(...after)}번으로 되돌아갔다 (${sent}장 보낸 뒤)`);
+    // 보낸 장수도 이어 간다 — 폰이 모아 둔 것을 살렸으므로 0% 로 되돌리면 거짓이 된다.
+    assert.ok(Number(app.text("pack-qr-index").split(" ")[0]) >= sent);
+    // 이어 간다는 사실은 프레임마다 바뀌는 줄이 아니라 결과 안내에 적힌다 (곧 덮이지 않게).
+    assert.match(app.text("pack-qr-note"), /이어서 보냅니다/);
+  });
+
+  it("스트림은 그리는 자리에서 프레임을 기다리지 않는다", async () => {
+    // 만드는 시간이 체류 시간에 얹히면 슬라이더에 적힌 간격이 실제 간격이 아니게 된다.
+    // 그 오차는 빠른 구간에서 특히 크다 — 150ms 에 40ms 가 붙으면 27% 가 어긋난다.
+    const app = await boot({
+      pack: async () => ({
+        ...PACK_RESULT,
+        container_bytes: 400 * 1024,
+        qr_plan: null,
+        qr_first: null,
+        qr_omitted: true,
+      }),
+      qr_stream_frame: async ({ seq }) => {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        return { png_base64: `FRAME${seq}`, png_modules: 133 };
+      },
+    });
+    await packOnce(app, "pw123456");
+
+    await app.check("pack-qr-stream-fast", true);
+    const speed = app.hook("pack-qr-stream-speed");
+    speed.value = "150";
+    speed.dispatchEvent(new app.window.Event("input", { bubbles: true }));
+
+    await app.click("pack-qr-stream-start");
+    await app.wait(900);
+
+    // 150ms 라면 900ms 에 6장 언저리다. 만드는 40ms 가 매번 얹혔다면 190ms 라 4장에 그친다.
+    const sent = Number(app.text("pack-qr-index").split(" ")[0]);
+    assert.ok(sent >= 5, `150ms 로 900ms 를 돌았는데 ${sent}장만 보냈다`);
   });
 
   it("한도를 알려 주지 않은 응답에도 0 B 같은 숫자를 지어내지 않는다", async () => {
