@@ -18,6 +18,7 @@ import {
   joinCollection,
   missingIndices,
   parsePiece,
+  summarizeIndices,
 } from "../www/collector.js";
 
 // ---------------------------------------------------------------- 픽스처
@@ -321,5 +322,37 @@ describe("joinCollection", () => {
   it("전체 장수를 모르면 남은 순번도 모른다", () => {
     assert.deepEqual(missingIndices(createCollection()), []);
     assert.equal(isComplete(createCollection()), false);
+  });
+});
+
+// ---------------------------------------------------------------- 남은 순번 적기
+
+describe("summarizeIndices", () => {
+  /**
+   * **표기가 데스크톱과 맞아야 한다.** 이 글자를 그대로 PC 의 '놓친 장 부르기' 에 옮겨 치면
+   * 그 장들만 돌아야 하고, 그쪽 파서는 `src/main.js` 의 `parsePageList` 다. 여기서 `~` 를
+   * 다른 기호로 바꾸면 그 길이 조용히 끊긴다.
+   */
+  it("이어진 번호를 범위로 접는다", () => {
+    assert.deepEqual(summarizeIndices([1, 2, 3, 7]), { text: "1~3, 7", more: 0 });
+    assert.deepEqual(summarizeIndices([5]), { text: "5", more: 0 });
+    assert.deepEqual(summarizeIndices([]), { text: "", more: 0 });
+    // 두 개짜리는 접지 않는다 — "3~4" 나 "3, 4" 나 길이가 같고, 하나씩 적는 편이 읽기 쉽다.
+    assert.deepEqual(summarizeIndices([3, 4]).text, "3~4");
+  });
+
+  it("너무 길면 뒤를 접고 몇 묶음이 남았는지 알려 준다", () => {
+    // 카메라 위 한 줄에 들어가야 한다. 그만큼 많이 남았으면 옮겨 적는 것보다 한 바퀴 더 도는
+    // 편이 빠르므로, 잘라 낸 사실만 정확히 말한다.
+    const many = [1, 3, 5, 7, 9, 11];
+    assert.deepEqual(summarizeIndices(many), { text: "1, 3, 5, 7", more: 2 });
+    assert.deepEqual(summarizeIndices(many, 6), { text: "1, 3, 5, 7, 9, 11", more: 0 });
+  });
+
+  it("빠진 순번을 그대로 받아 적는다", () => {
+    const collection = collectAll(makePieces(makeBody(300), 5).filter((_, at) => at !== 1));
+    const { text, more } = summarizeIndices(missingIndices(collection));
+    assert.equal(text, "2");
+    assert.equal(more, 0);
   });
 });

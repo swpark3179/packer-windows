@@ -13,7 +13,9 @@
 //   결과 텍스트 pack-output, pack-output-text, pack-output-copy, pack-output-note
 //   결과 QR    pack-qr (data-state=single|split|toobig), pack-qr-image, pack-qr-note,
 //             pack-qr-nav, pack-qr-prev, pack-qr-next, pack-qr-index,
-//             pack-qr-play, pack-qr-speed, pack-qr-speed-label
+//             pack-qr-play, pack-qr-speed, pack-qr-speed-label,
+//             pack-qr-jump, pack-qr-goto, pack-qr-goto-go, pack-qr-goto-clear,
+//             pack-qr-goto-note
 //   풀기      unpack-dropzone, unpack-pick, unpack-file, unpack-file-name,
 //             unpack-file-meta, unpack-text, unpack-text-clear, unpack-source-note,
 //             unpack-key, unpack-key-toggle, unpack-key-hint, unpack-dest,
@@ -42,7 +44,10 @@ const state = {
   /// 방금 묶어 낸 결과. `{ dest, text }`
   packed: null,
   /// 결과 QR 의 나눔과 지금 보고 있는 장.
-  /// `{ total, pngModules, index, cache, playing, timer, dwellMs }` (없으면 null)
+  /// `{ total, pngModules, index, cache, playing, timer, dwellMs, only, lap }` (없으면 null)
+  ///
+  /// `only` 는 '놓친 장 부르기' 로 불러낸 번호 목록이다 (없으면 null). 목록이 있으면 넘기기와
+  /// 자동 넘김이 **그 장들만** 오간다.
   qr: null,
   /// 스트림 모드로 흘려 보내는 중. `{ seq, timer, info, sent }` (아니면 null)
   stream: null,
@@ -424,8 +429,12 @@ function refreshButtons() {
   const qrPrev = el("pack-qr-prev");
   const qrNext = el("pack-qr-next");
   const qrPlay = el("pack-qr-play");
-  if (qrPrev) qrPrev.disabled = state.busy || !qr || qr.index === 0;
-  if (qrNext) qrNext.disabled = state.busy || !qr || qr.index >= qr.total - 1;
+  // 놓친 장 목록이 있으면 양끝은 **목록의** 양끝이다. 전체의 1번·마지막 장이 아니다.
+  const at = qrOnlyAt(qr);
+  const atFirst = qr?.only ? at === 0 : qr?.index === 0;
+  const atLast = qr?.only ? at === qr.only.length - 1 : Boolean(qr) && qr.index >= qr.total - 1;
+  if (qrPrev) qrPrev.disabled = state.busy || !qr || atFirst;
+  if (qrNext) qrNext.disabled = state.busy || !qr || atLast;
   // 재생은 끝 장에서도 열어 둔다 — 거기서 누르면 처음부터 다시 돈다.
   if (qrPlay) qrPlay.disabled = state.busy || !qr || qr.total <= 1;
 
@@ -437,6 +446,9 @@ function refreshButtons() {
     "unpack-text-clear",
     "pack-key-toggle",
     "unpack-key-toggle",
+    "pack-qr-goto",
+    "pack-qr-goto-go",
+    "pack-qr-goto-clear",
   ]) {
     const node = el(hook);
     if (node) node.disabled = state.busy;
@@ -532,6 +544,10 @@ function renderPackQr(result) {
         playing: false,
         timer: null,
         dwellMs: qrDwellFromUi(),
+        /// 놓친 장 목록 (1부터). 없으면 null — 그때는 전체를 순서대로 돈다.
+        only: null,
+        /// 그 목록을 몇 바퀴째 돌고 있는지. 목록은 되풀이하므로 이 숫자만이 진행을 말해 준다.
+        lap: 0,
       }
     : null;
 
@@ -548,6 +564,10 @@ function renderPackQr(result) {
   // 안내 문구는 결과마다 한 번만 정한다. 장을 넘길 때는 건드리지 않는다 — 읽는 도중에 문장이
   // 바뀌면 읽던 자리를 잃는다.
   setText("pack-qr-note", qrNote(result, state.qr));
+  // 지난 결과의 놓친 장 목록이 남아 있으면 새 묶음의 엉뚱한 장을 부른다.
+  const jump = el("pack-qr-goto");
+  if (jump) jump.value = "";
+  setText("pack-qr-goto-note", "");
   showPackQrPage();
   void prefetchQr();
 
@@ -623,11 +643,40 @@ async function tickQrStream() {
 
   stream.seq += 1;
   stream.sent += 1;
-  setText("pack-qr-index", `${stream.sent.toLocaleString("ko-KR")} 프레임`);
-  setText("pack-qr-stream-note", "보내는 중입니다. 폰이 다 모으면 알아서 멈춥니다.");
+
+  // **보낸 장수만 세면 진행을 볼 수 없다.** 끝이 없는 스트림이라도 "대략 이만큼 보내면 폰이
+  // 다 푼다" 는 양(`frames_needed`)은 알고 있으므로, 그 대비로 적는다. 폰도 같은 식으로
+  // 자기 진행을 재고 있어서(`mobile/www/stream.js` 의 `framesNeeded`) 두 화면의 숫자가
+  // 같은 뜻을 갖는다.
+  const needed = Number(stream.info?.frames_needed) || 0;
+  const sent = stream.sent.toLocaleString("ko-KR");
+  setText(
+    "pack-qr-index",
+    needed > 0 ? `${sent} / 약 ${needed.toLocaleString("ko-KR")} 프레임` : `${sent} 프레임`,
+  );
+  setText("pack-qr-stream-note", streamNote(stream.sent, needed));
   setText("pack-qr-stream-start", "그만 보내기");
 
   stream.timer = setTimeout(() => void tickQrStream(), qrDwellFromUi());
+}
+
+/**
+ * 스트림을 보내는 동안의 한 줄.
+ *
+ * 한 바퀴를 넘겨도 멈추지 않는다는 사실을 그때 가서 말해 준다. 조각 모드와 달리 **같은
+ * 프레임을 다시 보내는 것이 아니라** 매번 새 프레임을 만들기 때문에, 한 바퀴를 넘겨 계속
+ * 보내는 것이 낭비가 아니라는 것을 알아야 그대로 두게 된다.
+ */
+function streamNote(sent, needed) {
+  if (needed <= 0) return "보내는 중입니다. 폰이 다 모으면 알아서 멈춥니다.";
+  if (sent >= needed) {
+    const lap = Math.floor(sent / needed) + 1;
+    return (
+      `한 바퀴를 다 보냈습니다 (${lap}바퀴째). 폰이 아직 다 못 모았으면 그대로 두세요 — ` +
+      `프레임은 매번 새로 만들어지므로 계속 보내는 것이 낭비가 아닙니다.`
+    );
+  }
+  return `보내는 중입니다 — 한 바퀴의 ${Math.round((sent / needed) * 100)}%. 폰이 다 모으면 알아서 멈춥니다.`;
 }
 
 function stopQrStream() {
@@ -673,12 +722,16 @@ async function fetchQrPiece(index) {
   }
 }
 
-/// 지금 장의 앞뒤 몇 장을 미리 받아 둔다.
+/// 곧 보여 줄 몇 장을 미리 받아 둔다.
 async function prefetchQr() {
   const qr = state.qr;
   if (!qr) return;
+  // 놓친 장 목록을 도는 중이면 다음에 나올 장은 **목록의** 다음 장이다. 전체 순서로 미리
+  // 받으면 정작 곧 그릴 장이 체류 시간 안에 도착하지 못한다.
+  const at = Math.max(qrOnlyAt(qr), 0);
   for (let ahead = 0; ahead <= QR_PREFETCH; ahead += 1) {
-    await fetchQrPiece(qr.index + 1 + ahead);
+    const page = qr.only ? qr.only[(at + ahead) % qr.only.length] : qr.index + 1 + ahead;
+    await fetchQrPiece(page);
     if (state.qr !== qr) return;
   }
 }
@@ -697,6 +750,7 @@ function showPackQrPage() {
     show("pack-qr-image", false);
     show("pack-qr-nav", false);
     setText("pack-qr-index", "");
+    renderQrJump();
     refreshButtons();
     return;
   }
@@ -729,8 +783,160 @@ function showPackQrPage() {
   // 한 장이면 넘길 곳이 영원히 없다. 뜻이 없는 조작 도구는 잠그기보다 감춘다 — 잠가 두면
   // 더 있을 것처럼 보인다. (pack-key-strength, pack-progress, pack-reveal 과 같은 규칙)
   show("pack-qr-nav", total > 1);
-  setText("pack-qr-index", total > 1 ? `${qr.index + 1} / ${total}` : "");
+  // 놓친 장 목록을 도는 중에는 "전체에서 몇 번째" 만으로는 어디쯤인지 알 수 없다.
+  const at = qrOnlyAt(qr);
+  const inList = qr.only && at !== -1 ? ` · 부른 장 ${at + 1}/${qr.only.length}` : "";
+  setText("pack-qr-index", total > 1 ? `${qr.index + 1} / ${total}${inList}` : "");
+  renderQrJump();
   refreshButtons();
+}
+
+// ------------------------------------------------------------ 놓친 장 부르기
+//
+// 폰이 알려 준 번호를 그대로 받아 **그 장만** 보여 준다.
+//
+// 조각 모드에서 가장 오래 걸리는 구간은 마지막 몇 장이다. 순번이 고정돼 있으니 한 장을
+// 놓치면 그 장이 다시 올 때까지 기다려야 하고, 순차 슬라이드쇼에서 그건 한 바퀴를 통째로
+// 다시 도는 일이다 — 128장이면 두 장 때문에 45초를 기다린다. 폰은 이미 어느 장이 빠졌는지
+// 알고 화면에 적고 있으므로(`mobile/www/app.js` 의 `남은 순번 3, 7, 12~15`), 그 글자를
+// 그대로 옮겨 치면 그 장들만 돌게 하는 것이 가장 짧은 길이다.
+//
+// 표기는 폰이 쓰는 것과 맞춰 두었다 — `~` 범위, 쉼표 구분. 손이 먼저 가는 `-` 도 받는다.
+
+/// 번호 하나 또는 범위. 범위를 먼저 시도해야 "12~15" 가 12 와 15 로 흩어지지 않는다.
+const PAGE_TOKEN = /(\d+)\s*[-~]\s*(\d+)|(\d+)/g;
+
+/**
+ * "3, 7, 12~15" → `{ pages: [3, 7, 12, 13, 14, 15], dropped, junk }`.
+ *
+ * `dropped` 는 1~total 밖의 번호가 있었는지, `junk` 는 숫자로 읽을 수 없는 글자가 남았는지다.
+ * 둘 다 **거절이 아니라 안내의 근거**다 — 읽어낸 번호가 하나라도 있으면 그것들로 진행한다.
+ */
+function parsePageList(text, total) {
+  const pages = [];
+  const seen = new Set();
+  let dropped = false;
+
+  const rest = String(text ?? "")
+    .replace(/[\u2013\u2014]/g, "-")
+    .replace(PAGE_TOKEN, (match, from, to, one) => {
+      const start = Number(from ?? one);
+      const end = Number(to ?? one);
+      const low = Math.min(start, end);
+      const high = Math.max(start, end);
+      if (low < 1 || high > total) dropped = true;
+      // 도는 횟수는 total 을 넘지 않는다 — "1~99999" 를 적어도 여기서 멈춘다.
+      for (let page = Math.max(low, 1); page <= Math.min(high, total); page += 1) {
+        if (seen.has(page)) continue;
+        seen.add(page);
+        pages.push(page);
+      }
+      return "";
+    });
+
+  pages.sort((a, b) => a - b);
+  return { pages, dropped, junk: /\S/.test(rest.replace(/[,.;:·]/g, "")) };
+}
+
+/// 번호 목록을 폰과 같은 표기로 되돌린다: [1, 2, 3, 7] → "1~3, 7".
+function summarizePages(pages) {
+  const runs = [];
+  for (const page of pages) {
+    const last = runs[runs.length - 1];
+    if (last && page === last[1] + 1) last[1] = page;
+    else runs.push([page, page]);
+  }
+  return runs.map(([from, to]) => (from === to ? String(from) : `${from}~${to}`)).join(", ");
+}
+
+/// 지금 장이 부른 목록의 몇 번째인지. 목록이 없거나 목록 밖이면 -1.
+function qrOnlyAt(qr) {
+  if (!qr || !qr.only) return -1;
+  return qr.only.indexOf(qr.index + 1);
+}
+
+/// 부르기 칸을 보이고 감춘다. 한 장짜리에는 부를 것이 없다.
+function renderQrJump() {
+  const qr = state.qr;
+  const usable = Boolean(qr) && qr.total > 1;
+  show("pack-qr-jump", usable);
+  show("pack-qr-goto-clear", Boolean(qr && qr.only));
+  if (!usable) setText("pack-qr-goto-note", "");
+}
+
+/// 목록을 도는 중임을 적는다. 몇 바퀴째인지가 여기서 유일한 진행 표시다.
+function renderQrOnlyNote(extra = "") {
+  const qr = state.qr;
+  if (!qr || !qr.only) return;
+  setText(
+    "pack-qr-goto-note",
+    `부른 ${qr.only.length}장만 돌립니다 (${summarizePages(qr.only)}) · ${qr.lap}바퀴째. ` +
+      `폰이 다 모으면 '전체로 돌아가기' 를 누르세요.${extra}`,
+  );
+}
+
+/**
+ * 입력칸을 읽어 그 장(들)을 부른다.
+ *
+ * 한 장이면 **그냥 그 장에 선다** — 자동 넘김은 뜻이 없고, 폰이 읽을 때까지 가만히 있는 것이
+ * 맞다. 여러 장이면 그 목록만 되풀이해 돈다.
+ */
+function applyQrGoto() {
+  const qr = state.qr;
+  const input = el("pack-qr-goto");
+  if (!qr || !input) return;
+
+  const { pages, dropped, junk } = parsePageList(input.value, qr.total);
+  if (pages.length === 0) {
+    setText(
+      "pack-qr-goto-note",
+      junk || dropped
+        ? `1 ~ ${qr.total} 사이의 번호를 쉼표로 적어 주세요 (예: 3, 7, 12~15).`
+        : "",
+    );
+    return;
+  }
+
+  stopQrPlay();
+  const skipped = dropped ? ` 1~${qr.total} 밖의 번호는 건너뛰었습니다.` : "";
+
+  if (pages.length === 1) {
+    qr.only = null;
+    qr.lap = 0;
+    goToQrPage(pages[0] - 1);
+    // 이미 그 장을 보고 있었으면 `goToQrPage` 가 아무것도 하지 않는다. 그래도 번호 줄에서
+    // 지난 목록 표시를 지워야 하므로 직접 한 번 더 그린다.
+    showPackQrPage();
+    setText(
+      "pack-qr-goto-note",
+      `${pages[0]}번 장입니다. 폰이 읽을 때까지 그대로 두세요.${skipped}`,
+    );
+    return;
+  }
+
+  qr.only = pages;
+  qr.lap = 1;
+  goToQrPage(pages[0] - 1);
+  showPackQrPage();
+  renderQrOnlyNote(skipped);
+  // 목록을 넣었으면 바로 돈다. 여기서 한 번 더 누르게 하는 것은 아무 판단도 더해 주지 않는다.
+  startQrPlay();
+}
+
+/// 목록을 놓고 전체로 돌아온다. 보고 있던 장은 그대로 둔다 — 지금 화면이 갑자기 1번으로
+/// 튀면 폰이 그 장을 읽던 중일 수 있다.
+function clearQrOnly() {
+  const qr = state.qr;
+  stopQrPlay();
+  if (qr) {
+    qr.only = null;
+    qr.lap = 0;
+  }
+  const input = el("pack-qr-goto");
+  if (input) input.value = "";
+  setText("pack-qr-goto-note", "");
+  renderQrJump();
+  showPackQrPage();
 }
 
 /// 장을 옮긴다. 옮겼으면 참.
@@ -749,10 +955,18 @@ function stepPackQr(delta) {
   // 손으로 넘기기 시작했으면 자동 넘김은 비켜 준다. 둘이 동시에 장을 옮기면 어느 쪽도 못 쫓는다.
   stopQrPlay();
 
-  const last = qr.total - 1;
-  // 끝에서 되돌아 감지 않는다. 순서대로 찍는 중에 1장으로 돌아가 버리면 어디까지 했는지 잃고,
-  // '다음' 이 잠기는 것이 유일한 "다 찍었다" 신호이기도 하다.
-  if (!goToQrPage(Math.min(Math.max(qr.index + delta, 0), last))) return;
+  if (qr.only) {
+    // 목록을 부른 뒤에는 넘기기도 그 안에서만 움직인다. 여기서 전체를 오가면 방금 걸러 낸
+    // 장들을 다시 지나가게 되어 부른 뜻이 사라진다.
+    const at = qrOnlyAt(qr);
+    const next = at === -1 ? 0 : Math.min(Math.max(at + delta, 0), qr.only.length - 1);
+    if (!goToQrPage(qr.only[next] - 1)) return;
+  } else {
+    const last = qr.total - 1;
+    // 끝에서 되돌아 감지 않는다. 순서대로 찍는 중에 1장으로 돌아가 버리면 어디까지 했는지 잃고,
+    // '다음' 이 잠기는 것이 유일한 "다 찍었다" 신호이기도 하다.
+    if (!goToQrPage(Math.min(Math.max(qr.index + delta, 0), last))) return;
+  }
 
   // 방금 누른 버튼이 끝에서 잠기면 크로미움이 포커스를 body 로 떨어뜨린다. 키보드로 넘기던
   // 사람이 자리를 잃지 않도록 반대쪽 버튼으로 옮겨 준다.
@@ -779,6 +993,21 @@ function tickQrPlay() {
   const qr = state.qr;
   if (!qr || !qr.playing) return;
 
+  if (qr.only) {
+    // **부른 목록은 되풀이한다.** 전체를 한 바퀴에 멈추는 근거('다음' 이 잠기는 것이 다 찍었다는
+    // 신호)가 여기서는 성립하지 않는다 — 세 장짜리 목록의 한 바퀴는 1초라 신호가 되지 못하고,
+    // 애초에 이 목록은 폰이 "이것만 있으면 된다" 고 알려 준 것이다. 대신 바퀴 수를 적어 준다.
+    const at = qrOnlyAt(qr);
+    const next = at === -1 ? 0 : (at + 1) % qr.only.length;
+    if (next === 0 && at !== -1) {
+      qr.lap += 1;
+      renderQrOnlyNote();
+    }
+    goToQrPage(qr.only[next] - 1);
+    qr.timer = setTimeout(tickQrPlay, qr.dwellMs);
+    return;
+  }
+
   if (qr.index + 1 >= qr.total) {
     stopQrPlay();
     return;
@@ -793,8 +1022,13 @@ function startQrPlay() {
   const qr = state.qr;
   if (!qr || qr.playing || qr.total <= 1) return;
 
-  // 마지막 장에서 누르면 처음부터 다시 돈다 — 그게 '다시 재생' 이다.
-  if (qr.index + 1 >= qr.total) goToQrPage(0);
+  if (qr.only) {
+    // 목록 밖에 서 있으면 목록 안으로 먼저 들어간다.
+    if (qrOnlyAt(qr) === -1) goToQrPage(qr.only[0] - 1);
+  } else if (qr.index + 1 >= qr.total) {
+    // 마지막 장에서 누르면 처음부터 다시 돈다 — 그게 '다시 재생' 이다.
+    goToQrPage(0);
+  }
 
   qr.playing = true;
   qr.dwellMs = qrDwellFromUi();
@@ -825,6 +1059,9 @@ function clearPackQr() {
   stopQrStream();
   show("pack-qr-stream", false);
   state.qr = null;
+  const jump = el("pack-qr-goto");
+  if (jump) jump.value = "";
+  setText("pack-qr-goto-note", "");
   const section = el("pack-qr");
   if (section) section.dataset.state = "";
   show("pack-qr", false);
@@ -1078,6 +1315,14 @@ function wireEvents() {
   // 폰은 그동안 아무것도 읽지 못한다.
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) stopQrPlay();
+  });
+  el("pack-qr-goto-go")?.addEventListener("click", applyQrGoto);
+  el("pack-qr-goto-clear")?.addEventListener("click", clearQrOnly);
+  // 번호를 치고 엔터를 누르는 것이 가장 자연스럽다. 폼이 아니라서 직접 받는다.
+  el("pack-qr-goto")?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    applyQrGoto();
   });
   el("pack-qr-stream-start")?.addEventListener("click", () =>
     state.stream ? stopQrStream() : void startQrStream(),

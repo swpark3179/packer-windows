@@ -200,6 +200,8 @@ code {
   background: var(--panel);
   border: 1px solid var(--line);
   overflow: hidden;
+  /* 두 층을 겹쳐 그린다 (아래 .progress-lead). */
+  position: relative;
 }
 
 .progress-fill {
@@ -208,6 +210,27 @@ code {
   border-radius: 999px;
   background: linear-gradient(90deg, var(--accent), #2f6fd6);
   transition: width 120ms linear;
+  /* 위치를 준 형제(.progress-lead)보다 **뒤에** 놓여야 위에 그려진다. 문서 순서상 뒤에
+   * 있으므로, 이 줄 하나로 옅은 층이 진짜 진행을 덮지 않는다. */
+  position: relative;
+}
+
+/* 스트림 모드의 옅은 층 — **받은 프레임**이다.
+ *
+ * LT 부호의 복원은 마지막에 한꺼번에 일어난다. 그동안 앞의 층은 서 있지만 이 층은 계속
+ * 자라므로, "멈춘 것처럼 보이는" 구간에서 유일하게 움직이는 표시다. 어림이라서(필요한 양을
+ * 넉넉히 잡는다) 진짜 진행과 같은 색을 쓰지 않는다. */
+.progress-lead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 0;
+  border-radius: 999px;
+  /* --accent(#5b9cff)를 옅게. `color-mix` 를 쓰지 않는다 — 오래된 안드로이드 웹뷰에서는
+   * 선언 전체가 버려져 층이 통째로 보이지 않는다. */
+  background: rgba(91, 156, 255, 0.32);
+  transition: width 220ms linear;
 }
 
 /* 총량을 아직 모르는 구간에서는 막대를 훑어 지나가게 한다. */
@@ -237,7 +260,8 @@ code {
 /* 움직임을 줄여 달라고 한 사람에게는 흐르지 않는 막대를 준다. 데스크톱에는 없는 규칙인데,
    폰은 화면이 가까워 훑고 지나가는 그라디언트가 더 거슬린다. */
 @media (prefers-reduced-motion: reduce) {
-  .progress-fill {
+  .progress-fill,
+  .progress-lead {
     transition: none;
   }
   .progress-fill[data-indeterminate="true"] {
@@ -255,6 +279,14 @@ code {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 라벨 아래 한 줄 더 — 속도·남은 시간, 혹은 왜 프레임이 안 들어오는지.
+ * 이쪽은 문장이 될 수 있어서 줄바꿈을 막지 않는다. */
+.progress-note {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--muted);
 }
 
 /* ------------------------------------------------------------------ 버튼 */

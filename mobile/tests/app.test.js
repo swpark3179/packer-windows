@@ -209,7 +209,7 @@ describe("앱 배선", { skip: JSDOM ? false : "jsdom 이 없습니다 — npm i
     assert.equal(app.el("scan-list").children.length, 3);
     assert.equal(app.el("scan-list").children[1].dataset.got, "true");
     assert.equal(app.el("scan-list").children[0].dataset.got, "false");
-    assert.match(app.el("scan-total").textContent, /남은 순번 1, 3/);
+    assert.match(app.el("scan-total").textContent, /남은 순번 1, 3 \(2장\)/);
   });
 
   it("조각이 많으면 칩 대신 막대로 바꾼다", async () => {
@@ -225,7 +225,8 @@ describe("앱 배선", { skip: JSDOM ? false : "jsdom 이 없습니다 — npm i
     assert.equal(app.el("scan-list").hidden, true);
     assert.equal(app.el("scan-bar").hidden, false);
     assert.equal(app.el("scan-bar").getAttribute("aria-valuenow"), "3");
-    assert.match(app.el("scan-total").textContent, /장 남았습니다/);
+    // 많이 남아도 **옮겨 칠 수 있는 글자**로 말한다. 이어진 번호는 범위로 접는다.
+    assert.match(app.el("scan-total").textContent, /남은 순번 2~40 \(39장\)/);
 
     await app.scan(pieces[1]);
     assert.equal(app.el("scan-bar").getAttribute("aria-valuenow"), "5");
@@ -277,7 +278,78 @@ describe("앱 배선", { skip: JSDOM ? false : "jsdom 이 없습니다 — npm i
     assert.equal(app.el("scan-list").hidden, true);
     assert.equal(app.el("scan-bar").hidden, false);
     assert.match(app.el("scan-progress").textContent, /^\d+%$/);
-    assert.match(app.el("scan-total").textContent, /그대로 비추고 계세요/);
+    // 순서를 걱정하지 않아도 된다는 말은 이 모드에서 가장 자주 필요한 안내다.
+    assert.match(app.el("scan-status").textContent, /순서는 상관없습니다/);
+  });
+
+  it("스트림 진행을 퍼센트 하나로만 말하지 않는다", async () => {
+    // 픽스처는 1,000바이트 · 64바이트 블록 16개 (framesNeeded = 16 + 2 + 8 = 26).
+    const app = await boot();
+    await app.scanFrame(STREAM_FRAMES[0]);
+    await app.scanFrame(STREAM_FRAMES[1]);
+
+    assert.match(app.el("scan-progress").textContent, /^\d+%$/);
+    // 퍼센트의 실체 — 블록 몇 개가 풀렸는지. 1 오르는 것이 눈에 보여야 한다.
+    assert.match(app.el("scan-total").textContent, /^블록 \d+ \/ 16$/);
+
+    const label = app.el("scan-bar-label");
+    assert.equal(label.hidden, false);
+    // 받은 프레임과 필요한 양, 그리고 크기. 총량 대비 어디쯤인지가 여기 다 있다.
+    assert.match(label.textContent, /^프레임 2 \/ 약 26장 · \d+ B \/ 1000 B$/);
+  });
+
+  it("복원이 서 있는 동안에도 받은 프레임 층은 자란다", async () => {
+    // **이 성질이 없으면 화면은 멈춘 것과 구별되지 않는다.** LT 복원은 마지막에 몰아서
+    // 일어나므로, 그 전까지 움직이는 표시가 하나는 있어야 한다.
+    const app = await boot();
+    const width = (hook) => Number.parseFloat(app.el(hook).style.width) || 0;
+
+    let stalledButMoving = false;
+    let lastFill = 0;
+    let lastLead = 0;
+
+    for (const frame of STREAM_FRAMES) {
+      await app.scanFrame(frame);
+      if (app.state() === "complete") break;
+      const fill = width("scan-bar-fill");
+      const lead = width("scan-bar-lead");
+      assert.ok(lead >= lastLead, `받은 프레임 층이 줄었다: ${lastLead} → ${lead}`);
+      assert.ok(lead >= fill, `옅은 층이 진짜 진행보다 뒤처지면 덮여 보이지 않는다`);
+      if (fill === lastFill && lead > lastLead) stalledButMoving = true;
+      lastFill = fill;
+      lastLead = lead;
+    }
+
+    assert.ok(stalledButMoving, "퍼센트가 서 있는 동안 자라는 층이 없다");
+  });
+
+  it("프레임이 끊기면 그 사실을 말한다", async () => {
+    // 계기는 1초마다 돈다. 3초 넘게 새 프레임이 없으면 그때부터 말한다 (app.js 의 STALL_MS).
+    const app = await boot();
+    await app.scanFrame(STREAM_FRAMES[0]);
+    assert.equal(app.el("scan-bar-note").hidden, false);
+
+    await app.wait(4200);
+    assert.match(app.el("scan-bar-note").textContent, /초째 새 프레임이 없습니다/);
+
+    // 같은 번호만 되풀이해 들어오면 원인이 다르다 — 심볼은 읽히는데 PC 가 안 넘어가고 있다.
+    await app.scanFrame(STREAM_FRAMES[0]);
+    await app.wait(1200);
+    assert.match(app.el("scan-bar-note").textContent, /같은 프레임만 들어옵니다/);
+  });
+
+  it("몇 장 안 남으면 PC 에 넣을 번호를 알려 준다", async () => {
+    // 마지막 몇 장을 놓쳐 한 바퀴를 다시 도는 것이 조각 모드에서 가장 오래 걸리는 구간이다.
+    // 데스크톱의 '놓친 장 부르기' 가 이 글자를 그대로 받는다.
+    const app = await boot();
+    const pieces = makePieces(BODY, 3);
+
+    await app.scan(pieces[0]);
+    // 이어진 번호는 범위로 접는다 — PC 쪽 입력칸이 같은 표기를 받는다.
+    assert.match(app.el("scan-status").textContent, /PC 에 넣을 번호: 2~3$/);
+
+    await app.scan(pieces[1]);
+    assert.match(app.el("scan-status").textContent, /PC 에 넣을 번호: 3$/);
   });
 
   it("스트림 도중에 다른 묶음이 섞이면 짚어 준다", async () => {

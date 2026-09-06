@@ -160,6 +160,34 @@ export function missingIndices(collection) {
   return missing;
 }
 
+/**
+ * 순번 목록을 사람이 읽고 **PC 에 그대로 옮겨 적을 수 있는** 문자열로 줄인다.
+ *
+ *   [1, 2, 3, 7]  →  `{ text: "1~3, 7", more: 0 }`
+ *
+ * 이어진 번호를 범위로 접는 것은 자리를 아끼려는 것만이 아니다. 데스크톱의 '놓친 장 부르기'
+ * 입력칸이 이 표기를 그대로 받으므로(`../../src/main.js` 의 `parsePageList`), 폰 화면에 뜬
+ * 글자를 그대로 옮겨 치면 PC 가 그 장들만 돌려 준다. **두 표기가 어긋나면 그 길이 끊긴다.**
+ *
+ * @param indices 오름차순 순번
+ * @param groups 보여 줄 묶음의 최대 개수. 넘치면 `more` 에 남은 묶음 수를 담고 뒤를 자른다 —
+ *   카메라 위의 한 줄에 들어가야 하고, 그만큼 많이 남았으면 옮겨 적는 것보다 한 바퀴 더 도는
+ *   편이 빠르다.
+ */
+export function summarizeIndices(indices, groups = 4) {
+  const runs = [];
+  for (const index of indices) {
+    const last = runs[runs.length - 1];
+    if (last && index === last[1] + 1) last[1] = index;
+    else runs.push([index, index]);
+  }
+  const text = runs
+    .slice(0, groups)
+    .map(([from, to]) => (from === to ? String(from) : `${from}~${to}`))
+    .join(", ");
+  return { text, more: Math.max(0, runs.length - groups) };
+}
+
 /// 전체 장수를 알고, 그만큼 다 모였는지.
 export function isComplete(collection) {
   return collection.total !== null && collection.pieces.size === collection.total;

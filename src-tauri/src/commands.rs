@@ -422,7 +422,12 @@ pub struct StreamOpened {
     pub info: qrstream::StreamInfo,
     /// 프레임 하나를 그린 심볼의 한 변(모듈 수). 화면이 배율을 정하는 데 쓴다.
     pub png_modules: usize,
-    /// 블록 수에 5% 를 더한 값 — 대략 이만큼 보내면 폰이 다 푼다. 예상 시간을 적는 데 쓴다.
+    /// 블록 수에 8% 남짓을 더한 값 — 대략 이만큼 보내면 폰이 다 푼다.
+    ///
+    /// PC 는 예상 시간과 "한 바퀴의 몇 %" 를 이걸로 적고, **폰도 같은 식을 갖고 있다**
+    /// (`mobile/www/stream.js` 의 `framesNeeded`). 폰은 이 값을 받지 못하므로(프레임 헤더에
+    /// 없다) 스스로 계산하는데, 두 식이 어긋나면 같은 스트림을 두고 두 화면이 다른 진행을
+    /// 말하게 된다. 아래 계산을 고치면 그쪽도 함께 고쳐야 한다.
     pub frames_needed: usize,
 }
 
@@ -455,6 +460,7 @@ pub async fn qr_stream_open(app: AppHandle, path: String) -> Result<StreamOpened
         // 프레임 하나를 실제로 그려 화면이 쓸 배율을 알아 온다. 모든 프레임이 같은 크기다.
         let png_modules = qr::render_frame(&encoder.frame(0))?.png_modules;
         // LT 부호의 실측 오버헤드는 5~8% 다. 넉넉히 잡아 화면이 시간을 과소평가하지 않게 한다.
+        // **`mobile/www/stream.js` 의 `framesNeeded()` 와 같은 식이다.**
         let frames_needed = encoder.blocks() + encoder.blocks().div_ceil(12) + 8;
 
         let opened = StreamOpened {

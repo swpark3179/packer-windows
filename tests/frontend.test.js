@@ -684,6 +684,136 @@ describe("QR 코드 — 휴대폰으로 옮기기", () => {
     // nav 자체가 감춰지므로 버튼도 함께 사라진다.
     assert.equal(app.visible("pack-qr-nav"), false);
     assert.equal(app.hook("pack-qr-play").disabled, true);
+    // 부를 장도 없다.
+    assert.equal(app.visible("pack-qr-jump"), false);
+  });
+
+  it("놓친 장 번호를 넣으면 그 장이 바로 나온다", async () => {
+    // 마지막 한두 장 때문에 한 바퀴(128장이면 45초)를 다시 도는 것을 없애려고 있는 길이다.
+    const app = await boot({ pack: async () => ({ ...PACK_RESULT, ...qrPlan(16) }) });
+    await packOnce(app, "pw123456");
+
+    assert.equal(app.visible("pack-qr-jump"), true);
+    await app.type("pack-qr-goto", "7");
+    await app.click("pack-qr-goto-go");
+
+    assert.equal(app.text("pack-qr-index"), "7 / 16");
+    // 한 장이면 돌 이유가 없다 — 폰이 읽을 때까지 가만히 서 있는 것이 맞다.
+    assert.equal(app.text("pack-qr-play"), "자동 넘김");
+    assert.match(app.text("pack-qr-goto-note"), /7번 장입니다/);
+    assert.equal(app.visible("pack-qr-goto-clear"), false);
+
+    // 보고 있던 장을 다시 불러도 말은 해 준다 — 잘못 눌렀다고 오해하지 않도록.
+    await app.click("pack-qr-goto-go");
+    assert.equal(app.text("pack-qr-index"), "7 / 16");
+    assert.match(app.text("pack-qr-goto-note"), /7번 장입니다/);
+  });
+
+  it("목록을 돌다가 한 장을 부르면 목록을 놓는다", async () => {
+    const app = await boot({ pack: async () => ({ ...PACK_RESULT, ...qrPlan(16) }) });
+    await packOnce(app, "pw123456");
+
+    await app.type("pack-qr-goto", "3, 7");
+    await app.click("pack-qr-goto-go");
+    assert.equal(app.text("pack-qr-index"), "3 / 16 · 부른 장 1/2");
+
+    await app.type("pack-qr-goto", "9");
+    await app.click("pack-qr-goto-go");
+
+    assert.equal(app.text("pack-qr-index"), "9 / 16", "목록 표시가 남으면 안 된다");
+    assert.equal(app.text("pack-qr-play"), "자동 넘김", "한 장을 부르면 돌기를 멈춘다");
+    assert.equal(app.visible("pack-qr-goto-clear"), false);
+  });
+
+  it("여러 장을 넣으면 그 목록만 되풀이해 돈다", async () => {
+    const asked = [];
+    const app = await boot({
+      pack: async () => ({ ...PACK_RESULT, ...qrPlan(16) }),
+      qr_piece: async ({ index }) => {
+        asked.push(index);
+        return { ...qrPage(index), total: 16 };
+      },
+    });
+    await packOnce(app, "pw123456");
+
+    app.hook("pack-qr-speed").value = "300";
+    await app.type("pack-qr-goto", "3, 7");
+    // 여기서부터 받아 온 장만 센다. 그 앞의 것은 1번 장 둘레를 미리 받아 둔 것이다.
+    const before = asked.length;
+    await app.click("pack-qr-goto-go");
+
+    // 넣자마자 돈다. 여기서 한 번 더 누르게 하는 것은 아무 판단도 더해 주지 않는다.
+    assert.equal(app.text("pack-qr-play"), "멈춤");
+    assert.equal(app.text("pack-qr-index"), "3 / 16 · 부른 장 1/2");
+    assert.match(app.text("pack-qr-goto-note"), /부른 2장만 돌립니다 \(3, 7\)/);
+    assert.match(app.text("pack-qr-goto-note"), /1바퀴째/);
+
+    await app.wait(700);
+
+    // 전체 순회는 한 바퀴에 멈추지만 부른 목록은 되풀이한다 — 두 장짜리 한 바퀴는 신호가
+    // 되지 못하고, 이 목록은 폰이 "이것만 있으면 된다" 고 알려 준 것이다.
+    assert.equal(app.text("pack-qr-play"), "멈춤", "목록은 한 바퀴에 멈추지 않는다");
+    assert.match(app.text("pack-qr-goto-note"), /[2-9]바퀴째/);
+    assert.match(app.text("pack-qr-index"), /^(3|7) \/ 16 · 부른 장 [12]\/2$/);
+    // 부르지 않은 장은 미리 받지도 않는다. 곧 그릴 장이 체류 시간 안에 도착해야 한다.
+    // (3번은 1번 장 둘레를 미리 받을 때 이미 캐시에 들어가 다시 묻지 않을 수 있다.)
+    const outside = asked.slice(before).filter((page) => page !== 3 && page !== 7);
+    assert.deepEqual(outside, [], `부르지 않은 장을 받아 왔다: ${outside}`);
+
+    await app.click("pack-qr-goto-clear");
+    assert.equal(app.text("pack-qr-goto-note"), "");
+    assert.equal(app.value("pack-qr-goto"), "");
+    assert.match(app.text("pack-qr-index"), /^(3|7) \/ 16$/, "보던 장은 그대로 둔다");
+
+    // 목록을 놓았으면 넘기기는 다시 전체를 오간다.
+    const page = Number(app.text("pack-qr-index").split(" ")[0]);
+    await app.click("pack-qr-next");
+    assert.equal(app.text("pack-qr-index"), `${page + 1} / 16`);
+  });
+
+  it("범위 표기를 폰이 적어 준 그대로 받는다", async () => {
+    // 폰 화면의 "남은 순번 12~15" 를 그대로 옮겨 칠 수 있어야 한다 (mobile 의 summarizeIndices).
+    const app = await boot({ pack: async () => ({ ...PACK_RESULT, ...qrPlan(16) }) });
+    await packOnce(app, "pw123456");
+
+    await app.type("pack-qr-goto", "12~15");
+    await app.click("pack-qr-goto-go");
+    assert.equal(app.text("pack-qr-index"), "12 / 16 · 부른 장 1/4");
+
+    // 손이 먼저 가는 `-` 도 받는다.
+    await app.click("pack-qr-goto-clear");
+    await app.type("pack-qr-goto", "2-3");
+    await app.click("pack-qr-goto-go");
+    assert.equal(app.text("pack-qr-index"), "2 / 16 · 부른 장 1/2");
+  });
+
+  it("넣은 번호를 읽을 수 없으면 무엇을 적어야 하는지 말해 준다", async () => {
+    const app = await boot({ pack: async () => ({ ...PACK_RESULT, ...qrPlan(16) }) });
+    await packOnce(app, "pw123456");
+
+    await app.type("pack-qr-goto", "없는 번호");
+    await app.click("pack-qr-goto-go");
+    assert.match(app.text("pack-qr-goto-note"), /1 ~ 16 사이의 번호/);
+    assert.equal(app.text("pack-qr-index"), "1 / 16", "읽을 수 없으면 장을 옮기지 않는다");
+
+    // 범위 밖은 건너뛰되, 읽어낸 번호가 있으면 그것으로 진행한다.
+    await app.type("pack-qr-goto", "5, 99");
+    await app.click("pack-qr-goto-go");
+    assert.equal(app.text("pack-qr-index"), "5 / 16");
+    assert.match(app.text("pack-qr-goto-note"), /밖의 번호는 건너뛰었습니다/);
+  });
+
+  it("새로 묶으면 지난 결과의 부른 목록이 남지 않는다", async () => {
+    // 남아 있으면 새 묶음의 엉뚱한 장을 부른다.
+    const app = await boot({ pack: async () => ({ ...PACK_RESULT, ...qrPlan(16) }) });
+    await packOnce(app, "pw123456");
+    await app.type("pack-qr-goto", "3, 7");
+    await app.click("pack-qr-goto-go");
+
+    await packOnce(app, "pw123456");
+    assert.equal(app.value("pack-qr-goto"), "");
+    assert.equal(app.text("pack-qr-goto-note"), "");
+    assert.equal(app.text("pack-qr-index"), "1 / 16");
   });
 
   it("그림은 한 장씩 받아 온다", async () => {
@@ -837,8 +967,13 @@ describe("QR 코드 — 휴대폰으로 옮기기", () => {
     assert.match(note, /기본 카메라로 찍어 붙여넣을 수 없습니다/);
 
     await app.wait(800);
-    const sent = Number(app.text("pack-qr-index").replace(/[^\d]/g, ""));
+    // 보낸 장수만 세면 진행을 볼 수 없다. "한 바퀴" 대비로 적는다 — 그 양(frames_needed)은
+    // 폰도 같은 식으로 계산하므로 두 화면의 숫자가 같은 뜻을 갖는다.
+    const index = app.text("pack-qr-index");
+    assert.match(index, /^\d+ \/ 약 317 프레임$/, index);
+    const sent = Number(index.split(" ")[0]);
     assert.ok(sent >= 2, `${sent}장만 보냈다`);
+    assert.match(app.text("pack-qr-stream-note"), /한 바퀴의 \d+%/);
     assert.notEqual(app.attr("pack-qr-image", "src"), "data:image/png;base64,FRAME0");
   });
 
