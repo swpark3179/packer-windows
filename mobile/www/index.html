@@ -74,11 +74,41 @@
             합쳐진 텍스트는 <strong>아직 암호화된 상태</strong>입니다. PC 의 Packer
             <strong>풀기</strong> 탭에 붙여넣고 묶을 때 쓴 암호를 넣어야 파일이 돌아옵니다.
           </p>
+
+          <label class="field-label" for="pk-save-name">파일 이름</label>
+          <input
+            class="text-input"
+            id="pk-save-name"
+            data-pk="save-name"
+            type="text"
+            inputmode="text"
+            autocomplete="off"
+            autocapitalize="off"
+            autocorrect="off"
+            spellcheck="false"
+          />
+          <p class="note" data-pk="save-hint"></p>
+
           <p class="note" data-pk="result-note"></p>
+
+          <!--
+            진행 막대. 보통은 뜨지 않는다 — 16장이면 합쳐 쓰는 데 밀리초라서, 250ms 안에 끝나면
+            아예 만들지 않는다 (`export.js` 의 BUSY_DELAY_MS). 조각 상한이 올라가면 그때 실제로
+            돈다. 데스크톱 `src/index.html` 의 진행 막대와 같은 구조다.
+          -->
+          <div class="progress" data-pk="export-progress" hidden>
+            <div class="progress-track">
+              <div class="progress-fill" data-pk="export-progress-fill"></div>
+            </div>
+            <p class="progress-label tnum" data-pk="export-progress-label"></p>
+          </div>
         </div>
 
         <div class="intro-actions">
-          <button type="button" class="btn btn-primary" data-pk="scan-save">.txt 로 저장</button>
+          <button type="button" class="btn btn-primary" data-pk="scan-share" hidden>
+            다른 앱으로 보내기
+          </button>
+          <button type="button" class="btn btn-quiet" data-pk="scan-save">이 기기에 저장</button>
           <button type="button" class="btn btn-quiet" data-pk="scan-reset">다시 모으기</button>
         </div>
       </section>

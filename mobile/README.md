@@ -5,7 +5,8 @@
 일은 사람이 했다 — 기본 카메라로 한 장 찍고, 캡쳐하고, 복사하고, 붙여넣고, 16번.
 
 이 앱은 그 한 가지 일만 한다. 카메라를 켜 둔 채 PC 화면의 장을 넘기면 순번을 알아서 맞춰
-모으고, 다 모이면 순서 표시를 떼고 하나의 텍스트로 합쳐 `.txt` 로 저장한다.
+모으고, 다 모이면 순서 표시를 떼고 하나의 텍스트로 합쳐 `.txt` 로 저장하거나 바로 다른 앱으로
+보낸다 (아래 [저장 위치](#저장-위치)).
 
 **순서는 상관없다.** `#i/N` 에 순번이 들어 있으니 아무 장부터 찍어도 되고, 같은 장을 여러 번
 찍어도 조용히 무시한다.
@@ -27,7 +28,8 @@ QR 디코딩은 **네이티브 ML Kit**(`@capacitor-mlkit/barcode-scanning`)이 
 디코더는 이 프로젝트의 버전 40(177×177 모듈, 오류 정정 L) 심볼에 너무 약하다.
 
 ```
-www/collector.js   순수 로직 — 의존성 0, DOM·Capacitor 를 모른다. 앱의 실제 내용이 여기 다 있다.
+www/collector.js   조각 합치기 — 의존성 0, DOM·Capacitor 를 모른다. 앱의 실제 내용이 여기 다 있다.
+www/export.js      파일 이름 정리와 나눠 쓰기 — 의존성 0
 www/bridge.js      네이티브 호출과 와이어 값
 www/app.js         둘을 화면에 잇는 배선. data-pk 훅으로만 DOM 을 만진다.
 www/index.html     훅만 있는 마크업
@@ -101,6 +103,7 @@ cd ios/App && pod install     # Pods 가 Podfile 과 어긋났을 때만
 | `AndroidManifest.xml` | ML Kit `DEPENDENCIES` meta-data | 첫 스캔에서 모델을 기다린다 |
 | `Info.plist` | `NSCameraUsageDescription` | 카메라를 켜는 순간 앱이 죽는다 |
 | `Info.plist` | `UIFileSharingEnabled`, `LSSupportsOpeningDocumentsInPlace` | 저장한 `.txt` 를 '파일' 앱에서 꺼낼 수 없다 |
+| `res/xml/file_paths.xml` | FileProvider `<cache-path>` | 보내기가 `Failed to find configured root` 로 죽는다 — 저장은 되는데 보내기만 안 되는, 찾기 어려운 실패다 |
 | `Podfile` | `platform :ios, '15.5'` | GoogleMLKit 8.0.0 의 최소 요구를 못 맞춰 `pod install` 이 실패한다 |
 | `App.xcodeproj` | `IPHONEOS_DEPLOYMENT_TARGET = 15.5` | 앱이 자기보다 최소 버전이 높은 프레임워크를 링크해 15.0~15.4 기기에서 죽는다 |
 
@@ -128,6 +131,70 @@ cd ios/App && pod install     # Pods 가 Podfile 과 어긋났을 때만
    `src-tauri/src/qr.rs` 의 `MAX_MODULES` 를 125 로 내리면 조각이 1.5~2배로 늘어나는 대신 모든
    심볼이 굵어진다 (`qr.rs` 주석에 근거가 적혀 있다). 다만 16장 상한은 그대로라 QR 로 옮길 수
    있는 최대 크기가 줄어든다.
+
+## 저장 위치
+
+다 모으면 두 가지를 할 수 있다.
+
+- **다른 앱으로 보내기** (기본) — 캐시에 쓴 `.txt` 를 시스템 공유 시트로 넘긴다. **저장 경로를
+  사용자가 정하는 길이 이것이다.** iOS 는 시트의 '파일에 저장' 이 곧
+  `UIDocumentPickerViewController` 라 폴더를 직접 고를 수 있고, 안드로이드는 '내 파일'·드라이브·
+  메신저가 뜬다. 대신 **최종 위치는 앱이 알 수 없다** — 고른 앱이 정하기 때문이다. 화면에도
+  그렇게 적는다. 지어낸 경로를 보여 주는 것보다 낫다.
+- **이 기기에 저장** — 문서 폴더에 바로 쓰고 그 경로를 보여 준다.
+
+파일 이름은 고칠 수 있다. 규칙은 `www/export.js` 의 `safeFileName()` 에 있고, **PC 로 옮겨 가는
+파일**이라 폰이 아니라 윈도우 기준으로 막는다 (`src-tauri/src/safepath.rs` 와 같은 금지 글자와
+장치 이름). 고친 결과는 조용히 쓰지 않고 **입력칸에 되돌려 적는다** — 저장 버튼을 눌렀는데 다른
+이름으로 나가면 나중에 파일을 못 찾는다.
+
+### 왜 폴더를 내려가며 시도하나
+
+`Filesystem` 의 `DOCUMENTS` 는 안드로이드에서 **공개** Documents 폴더다 — 플러그인이
+`Environment.getExternalStoragePublicDirectory(DIRECTORY_DOCUMENTS)` 를 돌려준다. 이 목적지는
+`inExternalStorage` 라 API 30 미만에서 `WRITE_EXTERNAL_STORAGE` 를 확인하는데, **그 권한은
+플러그인 매니페스트에도(비어 있다) 우리 매니페스트에도 없다.** 그래서:
+
+| 안드로이드 | `DOCUMENTS` 쓰기 |
+| --- | --- |
+| 11+ (API 30+) | 된다. 권한 검사를 건너뛰고, 앱이 만든 파일이라 그냥 써진다 |
+| 7~10 (API 24~29) | **대화상자도 없이 즉시 거절된다** (`minSdk 24` 라 사정권 안이다) |
+| iOS | 앱 문서 폴더. `UIFileSharingEnabled` 덕에 '파일' 앱에서 보인다 |
+
+권한을 선언해서 고치지 않는다. 그러면 **저장할 때마다 권한 대화상자가 뜬다.** 대신
+`bridge.js` 의 `SAVE_ORDER` 가 `DOCUMENTS → EXTERNAL → CACHE` 로 내려가며 처음 성공하는 곳에
+쓴다. `EXTERNAL`(`getExternalFilesDir`)과 `CACHE` 는 `inExternalStorage` 가 아니라 어느
+버전에서도 아무것도 묻지 않는다. 안드로이드 11+ 와 iOS 는 늘 첫 줄에서 끝난다.
+
+아래로 내려갔다는 사실은 **화면에 적는다** — 그 폴더들은 앱을 지우면 함께 사라지므로, 사용자가
+보내기로 옮겨 둘 기회를 줘야 한다.
+
+## 진행 막대
+
+**보통은 뜨지 않는다. 그게 맞다.** 조각 상한이 16장이면 합친 텍스트가 약 46,000자고 합쳐 쓰는
+데 밀리초밖에 안 걸린다. 그 크기에 막대를 띄우는 것은 거짓말이다. 그래서 세 가지 규칙을 둔다.
+
+1. **지연 표시** — `BUSY_DELAY_MS`(250 ms) 안에 끝나면 막대를 아예 만들지 않는다.
+2. **최소 표시 시간** — 한 번 띄웠으면 `BUSY_HOLD_MS`(400 ms)는 남긴다. 번쩍이고 사라지면 더
+   산만하다.
+3. **나눠 쓰기** — 텍스트가 `CHUNK_THRESHOLD`(128 KiB)를 넘으면 첫 조각은 `writeFile`, 나머지는
+   `appendFile` 로 32 KiB 씩 쓰고 그때마다 진행률을 보고한다. 조각 사이에 한 프레임씩 양보하지
+   않으면 막대가 그려지지도 않는다. 중간에 실패하면 **쓰다 만 파일을 지운다** — 잘린 컨테이너가
+   PC 로 건너가면 한참 뒤 GCM 인증 실패로만 나타난다.
+
+`CHUNK_THRESHOLD` 는 오늘의 최대치보다 일부러 한참 위에 있다. `tests/export.test.js` 의 가드
+테스트가 그 관계를 못박아 두었으니, `MAX_PIECES` 를 올려서 그 테스트가 깨지면 그때가 막대가
+진짜로 필요해진 시점이다.
+
+**공유 시트에는 확정 진행률을 붙일 수 없다.** SAF `content://` URI 에는 이어 쓰기가 없고
+(플러그인이 `NotSupportedForContentScheme` 로 거절한다), iOS 의 문서 선택기는 이미 완성된
+파일을 복사하는 물건이다. 그래서 보내기는 "캐시에 막대를 보며 쓰고, 넘길 때는 막대를 거둔다".
+사용자가 앱을 고르는 동안 뒤에서 막대가 도는 것은 진행 중이라는 또 다른 거짓말이다.
+
+**스캔 화면에는 막대를 두지 않는다.** 칩은 막대가 지우는 정보를 담고 있다 — *어느* 장이
+빠졌는지. 사용자가 실제로 행동하는 근거가 그것이고(`남은 순번 1, 3`), `n / N` 은 이미 정확하다.
+게다가 카메라 위의 불투명한 판은 위의 투명 규칙과 정면으로 부딪친다. 조각 상한이 30장을 넘어
+칩이 화면에 안 들어가게 되면, 막대를 **더하는** 것이 아니라 칩을 **대체**하는 것이 답이다.
 
 ## 형식 계약
 
@@ -161,7 +228,8 @@ cd ios/App && pod install     # Pods 가 Podfile 과 어긋났을 때만
 | 뼈대 | `app` (`data-state=idle\|denied\|scanning\|complete\|unsupported`) |
 | 준비 | `intro` `perm-note` `perm-settings` `scan-start` `scan-error` |
 | 스캔 | `scan-overlay` `scan-progress` `scan-total` `scan-list` `chip-template` (안에 `[data-field=index]`, `data-got=true\|false`) `scan-status` (`data-tone=warn\|bad`) `scan-torch` `scan-stop` |
-| 결과 | `result` `result-summary` `result-note` `scan-save` `scan-reset` |
+| 결과 | `result` `result-summary` `result-note` `save-name` `save-hint` `scan-share` `scan-save` `scan-reset` |
+| 진행 막대 | `export-progress` `export-progress-fill` `export-progress-label` |
 
 `intro` · `result` · `scan-overlay` 는 JS 가 만지지 않는다. `app` 의 `data-state` 하나로 CSS 가
 전환한다.
@@ -183,6 +251,11 @@ npm test
 - `tests/collector.test.js` — 합치기 로직. **의존성이 없어서 `npm install` 없이도 돌아간다.**
   픽스처는 `armor::pieces()` 를 자바스크립트로 그대로 옮겨 만들므로 조각 경계가 실제와 어긋나지
   않는다.
+- `tests/export.test.js` — 파일 이름 정리와 나눠 쓰기. **의존성 없이 돌아간다.** 진행 막대가
+  오늘의 최대치에서 뜨지 않는다는 **가드 테스트**가 여기 있다.
+- `tests/bridge.test.js` — 저장·보내기. **의존성 없이 돌아간다** — `bridge.js` 는 DOM 을 만지지
+  않고 `globalThis.Capacitor` 만 보므로 창이 필요 없다. 나눠 쓴 조각이 원문을 글자 하나 잃지
+  않는지, 실패하면 쓰다 만 파일을 지우는지, 폴더 캐스케이드가 도는지를 못박는다.
 - `tests/app.test.js` — `index.html` 을 jsdom 에 올리고 `window.Capacitor` 를 가짜 브리지로
   바꿔치기해 배선을 확인한다 (데스크톱 `tests/frontend.test.js` 와 같은 방식). jsdom 이 없으면
   건너뛴다.
@@ -200,8 +273,22 @@ npm test
    갈라지고, 3~5장이 확인하기 좋다.
 2. 앱을 켜고 데스크톱 QR 뷰어의 '다음' 으로 장을 넘기며 비춘다. **일부러 순서를 뒤섞어** 본다.
 3. 상단 개수가 실제 장수와 같은지, 칩이 채워지는지, 마지막 장에서 자동으로 멈추는지 본다.
-4. 저장한 `.txt` 를 PC 로 옮겨 **풀기 탭에 붙여넣고 원본이 복원되는지** 확인한다. 형식이
+4. 파일 이름을 고쳐 본다. `a/b: c` 를 넣고 저장하면 입력칸이 `a_b_c.txt` 로 **눈앞에서**
+   고쳐져야 한다.
+5. **이 기기에 저장** — 경로가 화면에 나오는지. 안드로이드 11+ 는 '내 파일' 의 `Documents` 에,
+   iOS 는 '파일' 의 `내 iPhone → Packer Scanner` 에 있어야 한다. **안드로이드 9~10 기기가
+   있으면 꼭 해 본다** — 문서 폴더가 막혀 아래 폴더로 내려가고, 화면이 그 사실을 말해야 한다.
+   어느 경우에도 **권한 대화상자가 떠서는 안 된다.**
+6. **다른 앱으로 보내기** — 시트가 `.txt` 를 달고 뜨는지, 이름이 적은 그대로인지. iOS 는
+   '파일에 저장' 으로 폴더를 골라 보고, 안드로이드는 '내 파일' 이나 드라이브로 저장해 본다.
+   한 번은 **취소**해서 "보내기를 취소했습니다." 만 뜨고 아무 일도 없는지 본다.
+7. 저장한 `.txt` 를 PC 로 옮겨 **풀기 탭에 붙여넣고 원본이 복원되는지** 확인한다. 형식이
    맞았다는 최종 증거는 이것뿐이다.
+
+**진행 막대는 정상적인 사용으로는 볼 수 없다** — 일부러 그렇게 만들었다. 확인하려면
+`www/export.js` 의 `CHUNK_THRESHOLD` 를 잠깐 `8 * 1024` 로 내리고 `npm run sync` 한 뒤 저장해
+본다. 막대가 뜨고, 눈에 보이는 단계로 차오르고, 100 % 에서 잠깐 머물다 사라져야 하며, 그렇게
+저장한 파일도 풀기 탭에서 그대로 복원되어야 한다. **확인했으면 상수를 되돌린다.**
 
 ## 릴리스
 

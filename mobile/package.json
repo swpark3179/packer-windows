@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Packer 가 내보낸 QR 조각을 모아 하나의 텍스트로 합치는 휴대폰 앱",
   "scripts": {
-    "test": "node --test tests/collector.test.js tests/app.test.js tests/set-native-version.test.js tests/patch-native.test.js tests/set-ios-signing.test.js tests/upload-to-play.test.js",
+    "test": "node --test tests/collector.test.js tests/export.test.js tests/bridge.test.js tests/app.test.js tests/set-native-version.test.js tests/patch-native.test.js tests/set-ios-signing.test.js tests/upload-to-play.test.js",
     "sync": "cap sync && node scripts/patch-native.mjs",
     "patch-native": "node scripts/patch-native.mjs",
     "check:native": "node scripts/patch-native.mjs --check",
@@ -23,7 +23,8 @@
     "@capacitor/core": "^8.5.1",
     "@capacitor/filesystem": "^8.1.3",
     "@capacitor/haptics": "^8.0.0",
-    "@capacitor/ios": "^8.5.1"
+    "@capacitor/ios": "^8.5.1",
+    "@capacitor/share": "^8.0.1"
   },
   "devDependencies": {
     "@capacitor/cli": "^8.5.1",
