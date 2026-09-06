@@ -24,6 +24,9 @@ try {
 }
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+
+// 타이밍을 여기에 다시 적지 않는다. `export.js` 가 바뀌면 테스트가 함께 움직여야 한다.
+const { BUSY_DELAY_MS, BUSY_HOLD_MS } = await import("../www/export.js");
 const BEGIN = "-----BEGIN PACKER CONTAINER-----";
 const END = "-----END PACKER CONTAINER-----";
 
@@ -63,6 +66,8 @@ async function boot(options = {}) {
 
   const log = [];
   const written = [];
+  const appended = [];
+  const shared = [];
   const listeners = {};
 
   globalThis.Capacitor = {
@@ -84,13 +89,28 @@ async function boot(options = {}) {
       },
       Filesystem: {
         writeFile: async (given) => {
+          if ((options.failWrite ?? []).includes(given.directory)) {
+            throw new Error(`denied: ${given.directory}`);
+          }
+          if (options.slowWriteMs) await new Promise((r) => setTimeout(r, options.slowWriteMs));
           written.push(given);
-          return { uri: `file:///Documents/${given.path}` };
+          return { uri: `file:///${given.directory}/${given.path}` };
+        },
+        appendFile: async (given) => appended.push(given),
+        deleteFile: async (given) => log.push(["deleteFile", given]),
+      },
+      Share: {
+        canShare: async () => ({ value: options.share !== false }),
+        share: async (given) => {
+          if (options.shareError) throw new Error(options.shareError);
+          shared.push(given);
+          return { activityType: options.activityType ?? "" };
         },
       },
       Haptics: { impact: async () => log.push(["buzz"]), notification: async () => log.push(["buzz"]) },
       KeepAwake: { keepAwake: async () => {}, allowSleep: async () => {} },
     },
+    getPlatform: () => options.platform ?? "android",
   };
 
   instance += 1;
@@ -103,6 +123,15 @@ async function boot(options = {}) {
     dom,
     log,
     written,
+    appended,
+    shared,
+    settle,
+    /** 시간이 흐르게 둔다 — 진행 막대의 지연 표시를 확인할 때 쓴다. */
+    wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    /** 저장·보내기 버튼을 누르되 **끝날 때까지 기다리지 않는다.** */
+    press: (hook) => {
+      dom.window.document.querySelector(`[data-pk="${hook}"]`)?.click();
+    },
     el: (hook) => dom.window.document.querySelector(`[data-pk="${hook}"]`),
     state: () => dom.window.document.querySelector('[data-pk="app"]').dataset.state,
     /** QR 한 장을 인식한 것처럼 먹인다. */
@@ -235,7 +264,147 @@ describe("앱 배선", { skip: JSDOM ? false : "jsdom 이 없습니다 — npm i
     assert.equal(file.data, `${BEGIN}\n${BODY}\n${END}\n`);
     assert.ok(!file.data.includes("#"));
     // 어디에 저장됐는지 반드시 알려 준다.
-    assert.match(app.el("result-note").textContent, /^저장했습니다 — file:\/\/\/Documents\/packer-/);
+    assert.match(app.el("result-note").textContent, /^저장했습니다 — file:\/\/\/DOCUMENTS\/packer-/);
+    // 입력칸에 보이던 이름 그대로 나가야 한다.
+    assert.equal(app.el("save-name").value, file.path);
+  });
+
+  it("완료 화면에 기본 파일 이름이 미리 채워진다", async () => {
+    const app = await boot();
+    for (const piece of makePieces(BODY, 3)) await app.scan(piece);
+    assert.match(app.el("save-name").value, /^packer-\d{8}-\d{6}\.txt$/);
+  });
+
+  it("이름을 고치면 그 이름으로 나간다", async () => {
+    const app = await boot();
+    for (const piece of makePieces(BODY, 3)) await app.scan(piece);
+
+    app.el("save-name").value = "내 결과";
+    await app.click("scan-save");
+
+    assert.equal(app.written[0].path, "내_결과.txt");
+  });
+
+  it("쓸 수 없는 글자는 저장하기 전에 고쳐서 보여 준다", async () => {
+    // 조용히 고치면 나중에 파일을 못 찾는다. 입력칸에 되돌려 적는다.
+    const app = await boot();
+    for (const piece of makePieces(BODY, 3)) await app.scan(piece);
+
+    app.el("save-name").value = "a/b: c";
+    await app.click("scan-save");
+
+    assert.equal(app.el("save-name").value, "a_b_c.txt");
+    assert.equal(app.written[0].path, "a_b_c.txt");
+  });
+
+  it("문서 폴더에 못 쓰면 다음 폴더로 내려가고 그 사실을 말해 준다", async () => {
+    // 안드로이드 10 이하가 실제로 이 길로 온다.
+    const app = await boot({ failWrite: ["DOCUMENTS"] });
+    for (const piece of makePieces(BODY, 3)) await app.scan(piece);
+
+    await app.click("scan-save");
+
+    assert.equal(app.written[0].directory, "EXTERNAL");
+    assert.match(app.el("result-note").textContent, /앱을 지우면 함께 사라집니다/);
+  });
+
+  it("보내기는 캐시에 쓴 파일을 공유 시트로 넘긴다", async () => {
+    const app = await boot({ activityType: "com.sec.android.app.myfiles" });
+    for (const piece of makePieces(BODY, 3)) await app.scan(piece);
+
+    assert.equal(app.el("scan-share").hidden, false);
+    await app.click("scan-share");
+
+    assert.equal(app.written[0].directory, "CACHE");
+    assert.equal(app.shared.length, 1);
+    assert.deepEqual(app.shared[0].files, [`file:///CACHE/${app.written[0].path}`]);
+    assert.match(app.el("result-note").textContent, /^보냈습니다 \(com\.sec/);
+  });
+
+  it("앱을 고르는 동안에는 막대가 돌지 않는다", async () => {
+    // 시트 뒤에서 도는 막대는 "진행 중" 이라는 또 다른 거짓말이다.
+    const app = await boot({ slowWriteMs: BUSY_DELAY_MS + 150 });
+    for (const piece of makePieces(BODY, 3)) await app.scan(piece);
+
+    app.press("scan-share");
+    await app.wait(BUSY_DELAY_MS + 60);
+    assert.equal(app.el("export-progress").hidden, false, "쓰는 동안에는 떠 있어야 한다");
+
+    await app.wait(BUSY_DELAY_MS + BUSY_HOLD_MS + 300);
+    assert.equal(app.el("export-progress").hidden, true);
+    assert.equal(app.shared.length, 1);
+  });
+
+  it("보내기를 취소하면 취소했다고만 말한다", async () => {
+    const app = await boot({ shareError: "Share canceled" });
+    for (const piece of makePieces(BODY, 3)) await app.scan(piece);
+
+    await app.click("scan-share");
+
+    assert.equal(app.el("result-note").textContent, "보내기를 취소했습니다.");
+  });
+
+  it("공유를 못 쓰는 기기에서는 보내기 버튼을 감춘다", async () => {
+    // 뜻 없는 조작 도구는 잠그기보다 감춘다 (scan-torch 와 같은 규칙).
+    const app = await boot({ share: false });
+    for (const piece of makePieces(BODY, 3)) await app.scan(piece);
+    assert.equal(app.el("scan-share").hidden, true);
+  });
+
+  it("안내 문구는 플랫폼에 맞춘다", async () => {
+    const ios = await boot({ platform: "ios" });
+    for (const piece of makePieces(BODY, 3)) await ios.scan(piece);
+    assert.match(ios.el("save-hint").textContent, /파일에 저장/);
+
+    const android = await boot({ platform: "android" });
+    for (const piece of makePieces(BODY, 3)) await android.scan(piece);
+    assert.match(android.el("save-hint").textContent, /고른 앱이 정합니다/);
+  });
+
+  it("빨리 끝나는 저장에서는 진행 막대가 아예 보이지 않는다", async () => {
+    // 밀리초짜리 작업에 막대를 띄우는 것은 거짓말이다. 16장 규모에서는 늘 이쪽이어야 한다.
+    const app = await boot();
+    for (const piece of makePieces(BODY, 3)) await app.scan(piece);
+
+    await app.click("scan-save");
+    assert.equal(app.el("export-progress").hidden, true);
+
+    // 지연 표시 시간이 지나고 나서도 뒤늦게 뜨면 안 된다.
+    await app.wait(BUSY_DELAY_MS + 60);
+    assert.equal(app.el("export-progress").hidden, true);
+  });
+
+  it("오래 걸리는 저장에서는 막대가 뜨고, 다 되면 거둔다", async () => {
+    const app = await boot({ slowWriteMs: BUSY_DELAY_MS + 150 });
+    for (const piece of makePieces(BODY, 3)) await app.scan(piece);
+
+    app.press("scan-save");
+    await app.wait(BUSY_DELAY_MS + 60);
+
+    const bar = app.el("export-progress");
+    assert.equal(bar.hidden, false, "지연 시간이 지났으면 떠야 한다");
+    assert.equal(bar.getAttribute("role"), "progressbar");
+    // 총량을 아직 모르는 구간이다 — 훑고 지나가는 모양으로 둔다.
+    assert.equal(app.el("export-progress-fill").dataset.indeterminate, "true");
+
+    // 최소 표시 시간을 채운 뒤에 사라진다.
+    await app.wait(BUSY_DELAY_MS + BUSY_HOLD_MS + 300);
+    assert.equal(bar.hidden, true);
+    assert.match(app.el("result-note").textContent, /^저장했습니다/);
+  });
+
+  it("저장하는 동안에는 두 버튼을 함께 잠근다", async () => {
+    const app = await boot({ slowWriteMs: BUSY_DELAY_MS + 150 });
+    for (const piece of makePieces(BODY, 3)) await app.scan(piece);
+
+    app.press("scan-save");
+    await app.settle();
+    assert.equal(app.el("scan-save").disabled, true);
+    assert.equal(app.el("scan-share").disabled, true);
+
+    await app.wait(BUSY_DELAY_MS + BUSY_HOLD_MS + 300);
+    assert.equal(app.el("scan-save").disabled, false);
+    assert.equal(app.el("scan-share").disabled, false);
   });
 
   it("다시 모으기를 누르면 처음 상태로 돌아가 스캔을 재개한다", async () => {
