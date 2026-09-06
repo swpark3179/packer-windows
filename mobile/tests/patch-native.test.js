@@ -29,6 +29,22 @@ const MANIFEST = `<?xml version="1.0" encoding="utf-8"?>
 </manifest>
 `;
 
+/// Capacitor 8 안드로이드 템플릿의 `res/xml/file_paths.xml` 그대로.
+/// 공유 시트가 캐시의 파일을 넘기려면 `<cache-path>` 가 있어야 한다.
+const FILE_PATHS = `<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <external-path name="my_images" path="." />
+    <cache-path name="my_cache_images" path="." />
+</paths>
+`;
+
+/// 템플릿이 바뀌어 캐시 경로가 빠진 경우.
+const FILE_PATHS_WITHOUT_CACHE = `<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <external-path name="my_images" path="." />
+</paths>
+`;
+
 // `cap add ios --packagemanager cocoapods` 가 내놓는 Podfile.
 const podfileWith = (target) => `require_relative '../../node_modules/@capacitor/ios/scripts/pods_helpers'
 
@@ -86,7 +102,8 @@ const PLIST = `<?xml version="1.0" encoding="UTF-8"?>
  * 스크립트는 자기 위치에서 루트를 거꾸로 계산하므로(`scripts/` 의 부모), 스크립트 자체를
  * 임시 디렉터리로 복사해야 그 안의 android/ · ios/ 를 보게 된다.
  *
- * @param {{ manifest?: string, plist?: string, podfile?: string, pbxproj?: string, spm?: boolean }} files
+ * @param {{ manifest?: string, filePaths?: string, plist?: string, podfile?: string,
+ *          pbxproj?: string, spm?: boolean }} files
  */
 function makeProject(files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "patch-native-"));
@@ -99,11 +116,13 @@ function makeProject(files) {
   };
 
   const manifest = path.join(dir, "android", "app", "src", "main", "AndroidManifest.xml");
+  const filePaths = path.join(dir, "android", "app", "src", "main", "res", "xml", "file_paths.xml");
   const plist = path.join(dir, "ios", "App", "App", "Info.plist");
   const podfile = path.join(dir, "ios", "App", "Podfile");
   const pbxproj = path.join(dir, "ios", "App", "App.xcodeproj", "project.pbxproj");
 
   if (files.manifest !== undefined) write(manifest, files.manifest);
+  if (files.filePaths !== undefined) write(filePaths, files.filePaths);
   if (files.plist !== undefined) write(plist, files.plist);
   if (files.podfile !== undefined) write(podfile, files.podfile);
   if (files.pbxproj !== undefined) write(pbxproj, files.pbxproj);
@@ -116,6 +135,7 @@ function makeProject(files) {
         encoding: "utf8",
       }),
     manifest: () => fs.readFileSync(manifest, "utf8"),
+    filePaths: () => fs.readFileSync(filePaths, "utf8"),
     plist: () => fs.readFileSync(plist, "utf8"),
     podfile: () => fs.readFileSync(podfile, "utf8"),
     pbxproj: () => fs.readFileSync(pbxproj, "utf8"),
@@ -187,16 +207,62 @@ test("AndroidManifest 에 CAMERA 권한과 ML Kit meta-data 를 넣는다", () =
   assert.ok(manifest.indexOf("DEPENDENCIES") < manifest.indexOf("</application>"));
 });
 
-test("두 번 돌려도 결과가 같다", () => {
-  const project = makeProject({ manifest: MANIFEST, ...freshIOS() });
+test("템플릿에 이미 있는 공유용 cache-path 는 그대로 둔다", () => {
+  const project = makeProject({ manifest: MANIFEST, filePaths: FILE_PATHS });
+
+  const result = project.run();
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(project.filePaths(), FILE_PATHS, "손대지 않아야 한다");
+  assert.match(result.stdout, /공유용 FileProvider cache-path — 이미 있다/);
+});
+
+test("cache-path 가 빠져 있으면 넣는다", () => {
+  // 없으면 보내기가 `Failed to find configured root` 로 죽는다 — 저장은 되는데 보내기만
+  // 안 되는, 찾기 어려운 실패다.
+  const project = makeProject({ manifest: MANIFEST, filePaths: FILE_PATHS_WITHOUT_CACHE });
 
   assert.equal(project.run().status, 0);
-  const afterFirst = [project.manifest(), project.plist(), project.podfile(), project.pbxproj()];
+  const paths = project.filePaths();
+  assert.match(paths, /<cache-path[^>]*path="\."/);
+  assert.ok(paths.indexOf("<cache-path") < paths.indexOf("</paths>"), "paths 안에 들어가야 한다");
+  // 원래 있던 항목은 그대로다.
+  assert.match(paths, /<external-path name="my_images"/);
+});
+
+test("--check 는 빠진 cache-path 를 알리기만 하고 고치지 않는다", () => {
+  const project = makeProject({ manifest: MANIFEST, filePaths: FILE_PATHS_WITHOUT_CACHE });
+
+  const result = project.run("--check");
+  assert.equal(result.status, 1);
+  assert.equal(project.filePaths(), FILE_PATHS_WITHOUT_CACHE);
+});
+
+test("두 번 돌려도 결과가 같다", () => {
+  const project = makeProject({
+    manifest: MANIFEST,
+    filePaths: FILE_PATHS_WITHOUT_CACHE,
+    ...freshIOS(),
+  });
+
+  assert.equal(project.run().status, 0);
+  const afterFirst = [
+    project.manifest(),
+    project.filePaths(),
+    project.plist(),
+    project.podfile(),
+    project.pbxproj(),
+  ];
 
   const second = project.run();
   assert.equal(second.status, 0);
   assert.deepEqual(
-    [project.manifest(), project.plist(), project.podfile(), project.pbxproj()],
+    [
+      project.manifest(),
+      project.filePaths(),
+      project.plist(),
+      project.podfile(),
+      project.pbxproj(),
+    ],
     afterFirst,
   );
   assert.match(second.stdout, /모두 갖춰져 있다/);

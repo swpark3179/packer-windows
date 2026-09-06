@@ -18,19 +18,29 @@ import {
   barcodeText,
   buzz,
   cameraPermission,
+  canShare,
   hasScanner,
   isSupported,
   keepAwake,
   onBarcodes,
   onScanError,
   openSettings,
+  platform,
   requestCameraPermission,
   saveText,
   setTorch,
+  shareText,
   startScan,
   stopScan,
   torchAvailable,
 } from "./bridge.js";
+
+import {
+  BUSY_DELAY_MS,
+  BUSY_HOLD_MS,
+  defaultFileName,
+  safeFileName,
+} from "./export.js";
 
 // ---------------------------------------------------------------- 안내 문구
 
@@ -63,6 +73,10 @@ const state = {
   lastWarning: "",
   /// 앱이 백그라운드로 가서 카메라를 놓았을 때, 돌아오면 다시 시작할지.
   resume: false,
+  /// 저장·보내기가 도는 중인지. 두 버튼을 함께 잠근다.
+  exporting: false,
+  /// 진행 막대의 지연 표시 상태. `shownAt` 이 0이면 아직 띄우지 않았다.
+  busy: { timer: null, shownAt: 0, done: 0, total: 0, phase: "" },
 };
 
 // ---------------------------------------------------------------- DOM 훅
@@ -300,47 +314,209 @@ async function finish() {
     `${state.collection.total}장을 모두 읽어 ${joined.length.toLocaleString("ko-KR")}자로 합쳤습니다.`,
   );
   setText("result-note", "");
+  resetExportProgress();
+
+  const input = el("save-name");
+  if (input) input.value = defaultFileName();
+  setSaveHint();
+
   enable("scan-save", true);
+  enable("scan-share", true);
+  // 공유를 못 쓰는 기기에서는 감춘다 — 뜻 없는 조작 도구는 잠그기보다 감춘다 (scan-torch 와 같다).
+  show("scan-share", await canShare());
+
   void buzz("done");
+}
+
+// ---------------------------------------------------------------- 진행 막대
+
+const NUMBER = new Intl.NumberFormat("ko-KR");
+
+const PHASE_TEXT = {
+  save: "저장하는 중",
+  share: "보낼 파일을 쓰는 중",
+};
+
+/**
+ * 진행 막대를 그린다. 데스크톱 `src/main.js` 의 `renderProgress()` 와 같은 규칙이다.
+ *
+ * 바이트가 아니라 **글자 수**로 말한다. 우리는 글자 수를 정확히 알고, 결과 요약도 이미
+ * "…자로 합쳤습니다" 라고 말하고 있어서 단위가 어긋나지 않는다.
+ */
+function renderExportProgress({ done, total, phase }) {
+  const fill = el("export-progress-fill");
+  const bar = el("export-progress");
+  const label = el("export-progress-label");
+  const name = PHASE_TEXT[phase] ?? "내보내는 중";
+
+  if (bar) {
+    bar.setAttribute("role", "progressbar");
+    bar.setAttribute("aria-valuemin", "0");
+    bar.setAttribute("aria-valuemax", "100");
+  }
+
+  if (total > 0) {
+    const percent = Math.min(100, Math.round((done / total) * 100));
+    if (fill) {
+      fill.style.width = `${percent}%`;
+      delete fill.dataset.indeterminate;
+    }
+    bar?.setAttribute("aria-valuenow", String(percent));
+    setText(
+      "export-progress-label",
+      `${name} ${percent}% · ${NUMBER.format(done)} / ${NUMBER.format(total)}자`,
+    );
+  } else {
+    if (fill) {
+      fill.style.width = "100%";
+      fill.dataset.indeterminate = "true";
+    }
+    bar?.removeAttribute("aria-valuenow");
+    setText("export-progress-label", `${name}…`);
+  }
+  if (label) label.hidden = false;
+  show("export-progress", true);
+}
+
+function resetExportProgress() {
+  const { busy } = state;
+  if (busy.timer !== null) {
+    clearTimeout(busy.timer);
+    busy.timer = null;
+  }
+  busy.shownAt = 0;
+  busy.done = 0;
+  busy.total = 0;
+  busy.phase = "";
+
+  const fill = el("export-progress-fill");
+  if (fill) {
+    fill.style.width = "0";
+    delete fill.dataset.indeterminate;
+  }
+  setText("export-progress-label", "");
+  show("export-progress", false);
+}
+
+/// 막대를 **바로 띄우지 않는다.** 250ms 안에 끝나는 저장에서는 아무것도 보이지 않아야 한다.
+function startBusy(phase) {
+  const { busy } = state;
+  busy.phase = phase;
+  busy.done = 0;
+  busy.total = 0;
+  busy.shownAt = 0;
+  busy.timer = setTimeout(() => {
+    busy.timer = null;
+    busy.shownAt = Date.now();
+    renderExportProgress(busy);
+  }, BUSY_DELAY_MS);
+}
+
+/// 진행 상황을 기록한다. 아직 막대를 안 띄웠으면 숫자만 담아 둔다.
+function tickBusy(done, total) {
+  const { busy } = state;
+  busy.done = done;
+  busy.total = total;
+  if (busy.shownAt !== 0) renderExportProgress(busy);
+}
+
+/// 막대를 거둔다. 한 번 띄웠다면 최소 표시 시간을 채우고 나서 — 번쩍이고 사라지면 더 산만하다.
+async function stopBusy() {
+  const { busy } = state;
+  if (busy.timer !== null) {
+    clearTimeout(busy.timer);
+    busy.timer = null;
+  }
+  if (busy.shownAt === 0) {
+    resetExportProgress();
+    return;
+  }
+  const left = BUSY_HOLD_MS - (Date.now() - busy.shownAt);
+  if (left > 0) await new Promise((resolve) => setTimeout(resolve, left));
+  resetExportProgress();
 }
 
 // ---------------------------------------------------------------- 내보내기
 
-function stamp() {
-  const now = new Date();
-  const pad = (value) => String(value).padStart(2, "0");
-  return [
-    now.getFullYear(),
-    pad(now.getMonth() + 1),
-    pad(now.getDate()),
-    "-",
-    pad(now.getHours()),
-    pad(now.getMinutes()),
-    pad(now.getSeconds()),
-  ].join("");
+/// 저장한 폴더별 안내. 첫 줄에서 끝나지 못했다는 건 사용자가 알아야 하는 사실이다.
+const WHERE_NOTE = {
+  EXTERNAL: "\n이 폴더는 앱을 지우면 함께 사라집니다. '다른 앱으로 보내기' 로 옮겨 두세요.",
+  CACHE: "\n임시 폴더입니다 — 기기가 공간을 정리하면 사라집니다. 지금 '다른 앱으로 보내기' 로 옮겨 주세요.",
+};
+
+/// `file:///...` 를 사람이 읽을 수 있게. 못 풀면 원문 그대로 둔다.
+function readablePath(uri, fallback) {
+  if (!uri) return fallback;
+  try {
+    return decodeURIComponent(uri);
+  } catch {
+    return uri;
+  }
 }
 
-async function save() {
-  if (state.joined === null) return;
+/// 입력칸의 이름을 규칙에 맞게 고치고, **고친 결과를 입력칸에 되돌려 적는다.**
+function currentFileName() {
+  const input = el("save-name");
+  const name = safeFileName(input?.value ?? "");
+  if (input && input.value !== name) input.value = name;
+  return name;
+}
 
+function setSaveHint() {
+  const where =
+    platform() === "ios"
+      ? "'파일에 저장' 을 고르면 폴더를 직접 정할 수 있습니다."
+      : "저장 위치는 고른 앱이 정합니다.";
+  setText("save-hint", `다른 앱으로 보내면 ${where}`);
+}
+
+/**
+ * 합친 텍스트를 내보낸다.
+ *
+ * `"share"` 는 캐시에 쓴 뒤 시스템 시트로 넘긴다 — **저장 경로를 사용자가 정하는 길이 이것이다.**
+ * `"save"` 는 이 기기의 문서 폴더에 바로 쓴다 (`bridge.js` 의 `SAVE_ORDER` 참고).
+ */
+async function runExport(mode) {
+  if (state.joined === null || state.exporting) return;
+
+  state.exporting = true;
   enable("scan-save", false);
-  setText("result-note", "저장 중…");
+  enable("scan-share", false);
+
+  const name = currentFileName();
+  setText("result-note", "");
+  startBusy(mode);
+
   try {
-    const name = `packer-${stamp()}.txt`;
-    const uri = await saveText(name, state.joined);
+    if (mode === "share") {
+      // 시트가 뜨기 **전에** 막대를 거둔다. 사용자가 앱을 고르는 동안 뒤에서 막대가 도는 것은
+      // 진행 중이라는 거짓말이다. 그 시점은 `shareText` 만 알므로 콜백으로 받는다.
+      const result = await shareText(name, state.joined, tickBusy, async () => {
+        await stopBusy();
+        setText("result-note", "앱을 고르는 중…");
+      });
+      if (!result.shared) {
+        setText("result-note", "보내기를 취소했습니다.");
+      } else {
+        const via = result.activityType ? ` (${result.activityType})` : "";
+        setText("result-note", `보냈습니다${via} — 저장 위치는 고른 앱이 정합니다.`);
+      }
+      return;
+    }
+
+    const { uri, directory } = await saveText(name, state.joined, tickBusy);
+    await stopBusy();
     // 저장 위치를 그대로 보여 준다. 플랫폼마다 실제 폴더가 달라서, 저장은 됐는데 어디 있는지
     // 모르는 상황이 가장 흔한 불만이다.
-    let where = name;
-    try {
-      where = uri ? decodeURIComponent(uri) : name;
-    } catch {
-      where = uri || name;
-    }
-    setText("result-note", `저장했습니다 — ${where}`);
+    setText("result-note", `저장했습니다 — ${readablePath(uri, name)}${WHERE_NOTE[directory] ?? ""}`);
   } catch (error) {
-    setText("result-note", `저장하지 못했습니다: ${reason(error)}`);
+    await stopBusy();
+    const what = mode === "share" ? "보내지" : "저장하지";
+    setText("result-note", `${what} 못했습니다: ${reason(error)}`);
   } finally {
+    state.exporting = false;
     enable("scan-save", true);
+    enable("scan-share", true);
   }
 }
 
@@ -348,6 +524,8 @@ async function reset() {
   state.collection = createCollection();
   state.joined = null;
   state.lastWarning = "";
+  resetExportProgress();
+  setText("result-note", "");
   render();
   await beginScan();
 }
@@ -375,7 +553,8 @@ function wire() {
     });
   });
   on("scan-torch", "click", () => void toggleTorch());
-  on("scan-save", "click", () => void save());
+  on("scan-save", "click", () => void runExport("save"));
+  on("scan-share", "click", () => void runExport("share"));
   on("scan-reset", "click", () => void reset());
   on("perm-settings", "click", () => void openSettings());
 

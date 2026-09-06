@@ -154,6 +154,29 @@ if (!fs.existsSync(manifest)) {
   );
 }
 
+// 공유 시트는 파일을 FileProvider 로만 넘긴다 (`SharePlugin.java` 의 `getUriForFile`). 우리는
+// 캐시에 쓴 `.txt` 를 넘기므로 `<cache-path>` 가 선언돼 있어야 한다. 없으면 보내는 순간
+//
+//   IllegalArgumentException: Failed to find configured root that contains /data/.../cache/...
+//
+// 로 죽는다 — 빌드도 되고 앱도 켜지고 저장도 되는데 보내기만 안 되는, 찾기 어려운 실패다.
+// Capacitor 8 템플릿에는 들어 있지만 `android/` 는 생성물이라 템플릿이 바뀌면 조용히 사라진다.
+const filePaths = path.join(root, "android", "app", "src", "main", "res", "xml", "file_paths.xml");
+
+if (fs.existsSync(filePaths)) {
+  console.log(`android (${rel(filePaths)})`);
+  ensure(
+    filePaths,
+    "공유용 FileProvider cache-path",
+    "<cache-path",
+    (content) =>
+      content.replace(
+        /(\n?(\s*)<\/paths>)/,
+        `\n$2    <cache-path name="packer_cache" path="." />$1`,
+      ),
+  );
+}
+
 // ---------------------------------------------------------------- iOS
 
 const plist = path.join(root, "ios", "App", "App", "Info.plist");
