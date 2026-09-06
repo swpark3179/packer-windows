@@ -168,6 +168,37 @@
             <button type="button" class="btn btn-quiet" data-pk="pack-qr-stream-start">
               스트림으로 보내기
             </button>
+
+            <!--
+              스트림 전용 속도. 조각 모드의 슬라이더(pack-qr-speed)는 .qr-nav 안에 있어서 이
+              모드에서는 아예 뜨지 않는다 — 끝이 없는 스트림에 '이전·다음' 이 없기 때문이다.
+              그래서 여기 하나를 따로 둔다.
+            -->
+            <div class="qr-stream-tune">
+              <label class="qr-speed">
+                <span class="sr-only">프레임 넘김 속도</span>
+                <input
+                  type="range"
+                  data-pk="pack-qr-stream-speed"
+                  min="300"
+                  max="1500"
+                  step="50"
+                  value="350"
+                />
+                <span class="qr-speed-label tnum" data-pk="pack-qr-stream-speed-label">350ms</span>
+              </label>
+              <!--
+                빠른 구간은 **켜야 열린다.** 스트림은 한 프레임을 놓쳐도 다음 프레임이 대신하므로
+                조각 모드보다 훨씬 빨리 넘겨도 되지만, 초당 3회를 넘겨 바뀌는 고대비 그림은
+                WCAG 2.3.1 이 경고하는 구간이다. 그 선을 넘는 것은 사람이 알고 넘어야 한다.
+              -->
+              <label class="qr-fast">
+                <input type="checkbox" data-pk="pack-qr-stream-fast" />
+                <span>빠르게 보내기</span>
+              </label>
+            </div>
+            <p class="qr-note qr-jump-note tnum" data-pk="pack-qr-stream-fast-note"></p>
+
             <p class="qr-note tnum" data-pk="pack-qr-stream-note"></p>
           </div>
         </div>

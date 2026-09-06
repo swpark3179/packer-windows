@@ -11,11 +11,14 @@
 //             pack-key-strength, pack-submit, pack-progress, pack-progress-fill,
 //             pack-progress-label, pack-status, pack-reveal
 //   결과 텍스트 pack-output, pack-output-text, pack-output-copy, pack-output-note
-//   결과 QR    pack-qr (data-state=single|split|toobig), pack-qr-image, pack-qr-note,
+//   결과 QR    pack-qr (data-state=single|split|toobig|stream), pack-qr-image, pack-qr-note,
 //             pack-qr-nav, pack-qr-prev, pack-qr-next, pack-qr-index,
 //             pack-qr-play, pack-qr-speed, pack-qr-speed-label,
 //             pack-qr-jump, pack-qr-goto, pack-qr-goto-go, pack-qr-goto-clear,
 //             pack-qr-goto-note
+//   스트림     pack-qr-stream, pack-qr-stream-start, pack-qr-stream-note,
+//             pack-qr-stream-speed, pack-qr-stream-speed-label,
+//             pack-qr-stream-fast, pack-qr-stream-fast-note
 //   풀기      unpack-dropzone, unpack-pick, unpack-file, unpack-file-name,
 //             unpack-file-meta, unpack-text, unpack-text-clear, unpack-source-note,
 //             unpack-key, unpack-key-toggle, unpack-key-hint, unpack-dest,
@@ -49,7 +52,11 @@ const state = {
   /// `only` 는 '놓친 장 부르기' 로 불러낸 번호 목록이다 (없으면 null). 목록이 있으면 넘기기와
   /// 자동 넘김이 **그 장들만** 오간다.
   qr: null,
-  /// 스트림 모드로 흘려 보내는 중. `{ seq, timer, info, sent }` (아니면 null)
+  /// 스트림 모드로 흘려 보내는 중 (아니면 null).
+  /// `{ path, seq, sent, timer, info, ready, filling, deadline }`
+  ///
+  /// `seq` 는 **다음에 만들** 프레임 번호이고 `ready` 는 이미 만들어 둔 프레임 줄이다 —
+  /// 그리는 순간에 IPC 를 기다리지 않아야 슬라이더에 적힌 간격이 실제 간격이 된다.
   stream: null,
   /// 풀어낼 대상. `{ kind: "file" | "text", info, text }`
   source: null,
@@ -520,6 +527,10 @@ function clearPackOutput() {
 /// 있어서, 접근성 쪽을 지키는 데 성능 비용이 들지 않는다.
 const QR_DWELL_DEFAULT_MS = 350;
 
+/// 슬라이더의 기본 하한(ms). `index.html` 의 `min` 과 같은 값이어야 한다 — 스트림의
+/// '빠르게 보내기' 를 껐을 때 여기로 되돌린다.
+const QR_DWELL_MIN_MS = 300;
+
 /// 미리 받아 둘 장 수. 체류 시간 안에 IPC 왕복 + PNG 인코딩이 끝나야 그림이 끊기지 않는다.
 const QR_PREFETCH = 3;
 
@@ -579,6 +590,52 @@ function renderPackQr(result) {
 
 // ------------------------------------------------------------ 스트림 모드
 
+/// 스트림이 앞서 만들어 두는 프레임 수.
+///
+/// 조각 모드의 [`QR_PREFETCH`] 와 같은 이유지만 여기서는 **정확도**의 문제이기도 하다. 예전에는
+/// 프레임을 그리는 자리에서 `qr_stream_frame` 을 기다렸다가 그 뒤에 체류 시간을 셌다. 그러면
+/// 실제 간격이 `체류 시간 + 만드는 시간` 이라 슬라이더에 적힌 것보다 늘 느렸고, 체류 시간을
+/// 줄일수록 그 오차가 차지하는 비율이 커졌다 — 350ms 에서 10% 남짓이던 것이 150ms 에서는
+/// 25% 가 된다. 빠른 구간을 열어 두려면 이 항부터 없애야 한다.
+const STREAM_PREFETCH = 3;
+
+/// '빠르게 보내기' 를 켰을 때 열리는 하한(ms). 기본 하한은 `index.html` 의 슬라이더가 정한다.
+///
+/// **스트림에서는 놓친 프레임의 값이 다르다.** 조각 모드에서 한 장을 놓치면 그 장이 다시 올
+/// 때까지 한 바퀴를 기다려야 하지만(쿠폰 수집가 문제), 파운틴 부호에서는 다음 프레임이 그대로
+/// 대신한다. 그래서 목표가 '한 프레임의 인식률' 에서 '초당 실제로 들어가는 바이트' 로 바뀌고,
+/// 조금 놓치더라도 자주 넘기는 편이 이긴다.
+///
+/// 그렇다고 0 으로 갈 수 있는 것은 아니다. 두 벽이 남는다.
+///
+/// 하나, **폰이 초당 푸는 심볼 수**에 천장이 있다. ML Kit 의 디코드(125모듈 심볼에 40~120ms)
+/// 위에 카메라 노출·초점이 얹혀 실제로는 초당 8~12장 언저리다. 그보다 빨리 넘기면 남는 프레임은
+/// 그냥 버려진다 — 이득이 0 이 되는 것이 아니라, 아래 이유로 **마이너스**가 된다.
+///
+/// 둘, **찢어진 프레임**이다. 폰의 롤링 셔터는 한 장을 위에서 아래로 15~30ms 에 걸쳐 읽고,
+/// 그 사이에 화면이 넘어가면 위아래가 다른 심볼인 그림이 찍혀 아무것도 읽히지 않는다. 체류
+/// 시간이 D 일 때 못 쓰게 되는 비율이 대략 (읽는 시간)/D 이므로, D 를 줄이면 넘기는 횟수는
+/// 선형으로 늘지만 성공률은 그만큼 깎인다. 150ms 언저리가 그 둘이 아직 남는 장사인 자리다 —
+/// 더 내리면 기기에 따라 총량이 오히려 준다.
+///
+/// 150ms 는 초당 6.7회다. 초당 3회를 넘겨 바뀌는 고대비 그림은 WCAG 2.3.1 이 경고하는
+/// 구간이므로 **기본값으로 두지 않고 켜야 열리게** 했다. 기본값 350ms 는 초당 2.9회로 그 선
+/// 아래에 있다.
+const QR_DWELL_FAST_MIN_MS = 150;
+
+/// 껐다 켰을 때 이어 갈 자리. `{ path, seq, sent }`
+///
+/// **프레임 번호를 0 으로 되돌리면 안 된다.** 폰은 번호로 중복을 가리는데
+/// (`mobile/www/stream.js` 의 `seen`), 이미 3,000장을 모아 둔 폰에게 0번부터 다시 보내면
+/// 3,000장이 전부 중복으로 버려진다. 화면은 멀쩡히 돌고 폰은 한 장도 받지 못하는데, 폰의 계기는
+/// 그 상태를 "PC 쪽 스트림이 멈춰 있는지 봐 주세요" 라고 **거꾸로** 읽는다 (새 프레임 없이
+/// 중복만 느는 것은 원래 PC 가 멈췄다는 뜻이라서다). 속도를 바꾸려고 껐다 켜는 것만으로 그
+/// 상태에 빠지므로, 같은 컨테이너면 번호를 이어 붙인다.
+///
+/// 이것이 스트림에서 '되감기' 에 해당하는 유일한 조작이다. 앞으로 이어 가는 것만 뜻이 있고,
+/// 뒤로 가는 것은 폰이 이미 본 번호를 다시 보내는 일이라 언제나 손해다.
+let streamResume = { path: "", seq: 0, sent: 0 };
+
 /**
  * 파운틴 부호로 끝없이 흘려 보낸다.
  *
@@ -598,51 +655,134 @@ async function startQrStream() {
     return;
   }
 
-  state.stream = { seq: 0, timer: null, info: opened, sent: 0 };
+  const path = state.packed.dest;
+  const resumed = streamResume.path === path && streamResume.seq > 0;
+  const stream = {
+    path,
+    seq: resumed ? streamResume.seq : 0,
+    sent: resumed ? streamResume.sent : 0,
+    timer: null,
+    info: opened,
+    /// 미리 만들어 둔 프레임 줄. `{ seq, url, modules }`
+    ready: [],
+    filling: false,
+    /// 다음 프레임을 그릴 시각(`performance.now()` 기준). 만드는 시간이 간격에 얹히지 않도록
+    /// 시각으로 잡는다 — 매번 `setTimeout(dwell)` 로 재면 그 시간만큼 계속 밀린다.
+    deadline: 0,
+  };
+  state.stream = stream;
   const section = el("pack-qr");
   if (section) section.dataset.state = "stream";
   show("pack-qr-nav", false);
   show("pack-qr-image", true);
 
-  const minutes = Math.max(1, Math.round((opened.frames_needed * qrDwellFromUi()) / 60000));
+  const dwell = qrStreamDwell();
+  const minutes = Math.max(1, Math.round((opened.frames_needed * dwell) / 60000));
+  // 이어서 보내는 것은 이 판이 끝날 때까지 변하지 않는 사실이라 **프레임마다 바뀌는 줄이 아니라**
+  // 결과 안내에 적는다. 아래 `pack-qr-stream-note` 는 첫 프레임에서 곧바로 덮인다.
+  const resumeLine = resumed
+    ? `\n지난번 다음 번호(${stream.seq.toLocaleString("ko-KR")})부터 이어서 보냅니다 — ` +
+      `폰이 모아 둔 것을 그대로 살립니다.`
+    : "";
   setText(
     "pack-qr-note",
     `${qrBytes(opened.total_bytes)} · 프레임 약 ${opened.frames_needed.toLocaleString("ko-KR")}장, ` +
       `대략 ${minutes}분 걸립니다.\n` +
       `이 QR 은 기본 카메라로 찍어 붙여넣을 수 없습니다 — 휴대폰의 '조각 모으기' 앱이 ` +
       `필요합니다. 순서는 상관없고 놓친 프레임도 되찾을 필요가 없습니다. 다 모이면 폰이 ` +
-      `알아서 멈춥니다.`,
+      `알아서 멈춥니다.${resumeLine}`,
   );
   setText("pack-qr-stream-note", "");
-  await tickQrStream();
+  setText("pack-qr-stream-start", "그만 보내기");
+
+  // 첫 장은 기다렸다 그린다 — 누르자마자 흰 판이 뜨면 고장으로 보인다. 딱 한 장만 기다린다:
+  // 나머지 두 장은 첫 장이 화면에 서 있는 동안 만들면 늦지 않는다.
+  await fillQrStream(1);
+  if (state.stream !== stream) return;
+  tickQrStream();
 }
 
-async function tickQrStream() {
+/**
+ * 프레임 줄을 [`STREAM_PREFETCH`] 만큼 채운다.
+ *
+ * 한 번에 하나씩 받는다. `qr_stream_frame` 은 Rust 쪽에서 뮤텍스 하나를 잡으므로 병렬로 불러도
+ * 줄을 서고, 순서가 뒤섞이면 줄에 넣을 자리를 다시 정해야 한다.
+ */
+async function fillQrStream(want = STREAM_PREFETCH) {
+  const stream = state.stream;
+  if (!stream || stream.filling) return;
+  stream.filling = true;
+  try {
+    while (stream.ready.length < want) {
+      const seq = stream.seq;
+      let frame;
+      try {
+        frame = await invoke("qr_stream_frame", { seq });
+      } catch {
+        // 결과가 바뀌었거나 스트림이 닫혔다. 조용히 멈춘다.
+        if (state.stream === stream) stopQrStream();
+        return;
+      }
+      if (state.stream !== stream) return;
+      stream.seq = seq + 1;
+      const url = `data:image/png;base64,${frame.png_base64}`;
+      stream.ready.push({ seq, url, modules: Number(frame.png_modules) || 0 });
+      // 그리는 순간에 디코드가 걸리면 화면이 넘어가는 시점이 흔들린다. 미리 풀어 둔다 —
+      // 같은 data URL 이라 웹뷰가 디코드한 비트맵을 그대로 쓴다. (jsdom 에는 없다.)
+      warmImage(url);
+    }
+  } finally {
+    stream.filling = false;
+  }
+}
+
+/// PNG 을 미리 디코드해 둔다. 실패해도 잃을 것이 없으므로 기다리지 않는다.
+function warmImage(url) {
+  if (typeof Image !== "function") return;
+  try {
+    const image = new Image();
+    image.src = url;
+    // `decode` 가 없는 환경도 있고(테스트의 jsdom), 있어도 거절할 수 있다. 둘 다 그냥 넘긴다 —
+    // 미리 못 풀었으면 그릴 때 풀면 된다.
+    const decoded = image.decode?.();
+    if (decoded && typeof decoded.catch === "function") decoded.catch(() => {});
+  } catch {
+    // 디코드를 미리 못 했을 뿐이다.
+  }
+}
+
+/**
+ * 만들어 둔 프레임 하나를 그리고 다음 시각을 잡는다.
+ *
+ * **밀린 것을 몰아 넘기지 않는다.** 시각으로 재는 스케줄러는 보통 늦은 만큼 따라잡지만, 여기서
+ * 따라잡기는 프레임 두 장을 거의 동시에 지나가게 하는 일이라 폰이 둘 다 놓친다. 늦었으면 그
+ * 자리에서 시계를 다시 맞춘다.
+ */
+function tickQrStream() {
   const stream = state.stream;
   if (!stream) return;
 
-  let frame;
-  try {
-    frame = await invoke("qr_stream_frame", { seq: stream.seq });
-  } catch {
-    // 결과가 바뀌었거나 스트림이 닫혔다. 조용히 멈춘다.
-    stopQrStream();
+  const frame = stream.ready.shift();
+  if (!frame) {
+    // 만드는 쪽이 못 따라왔다. 지금 그릴 것이 없으니 도착하는 대로 이어 간다 — 여기서 빈 화면을
+    // 그리면 폰이 방금 읽던 심볼까지 잃는다.
+    void fillQrStream();
+    stream.deadline = 0;
+    stream.timer = setTimeout(tickQrStream, 16);
     return;
   }
-  if (state.stream !== stream) return;
 
   const image = el("pack-qr-image");
   if (image) {
-    image.src = `data:image/png;base64,${frame.png_base64}`;
-    const modules = Number(frame.png_modules) || 0;
-    if (modules > 0) {
-      image.style.width = `${modules * Math.max(3, Math.min(10, Math.floor(560 / modules)))}px`;
+    image.src = frame.url;
+    if (frame.modules > 0) {
+      image.style.width = `${frame.modules * Math.max(3, Math.min(10, Math.floor(560 / frame.modules)))}px`;
     }
     image.alt = "묶은 결과를 흘려 보내는 QR 코드";
   }
 
-  stream.seq += 1;
   stream.sent += 1;
+  markStreamResume(stream);
 
   // **보낸 장수만 세면 진행을 볼 수 없다.** 끝이 없는 스트림이라도 "대략 이만큼 보내면 폰이
   // 다 푼다" 는 양(`frames_needed`)은 알고 있으므로, 그 대비로 적는다. 폰도 같은 식으로
@@ -657,7 +797,27 @@ async function tickQrStream() {
   setText("pack-qr-stream-note", streamNote(stream.sent, needed));
   setText("pack-qr-stream-start", "그만 보내기");
 
-  stream.timer = setTimeout(() => void tickQrStream(), qrDwellFromUi());
+  void fillQrStream();
+
+  const dwell = qrStreamDwell();
+  const now = perfNow();
+  stream.deadline = stream.deadline === 0 ? now + dwell : stream.deadline + dwell;
+  if (stream.deadline < now) stream.deadline = now + dwell;
+  stream.timer = setTimeout(tickQrStream, Math.max(0, stream.deadline - now));
+}
+
+/// 이어 갈 자리를 적어 둔다. **아직 그리지 않은 프레임의 번호까지 태우지 않는다** — 미리
+/// 만들어 둔 것은 폰에게 한 번도 보이지 않은 번호라, 다음에 그대로 내보내면 된다.
+function markStreamResume(stream) {
+  const next = stream.ready.length > 0 ? stream.ready[0].seq : stream.seq;
+  streamResume = { path: stream.path, seq: next, sent: stream.sent };
+}
+
+/// `performance.now()` 가 없는 환경(구형 웹뷰, 테스트)에서도 같은 뜻으로 흐르는 시계.
+function perfNow() {
+  return typeof performance === "object" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
 }
 
 /**
@@ -683,6 +843,7 @@ function stopQrStream() {
   const stream = state.stream;
   if (!stream) return;
   if (stream.timer !== null) clearTimeout(stream.timer);
+  markStreamResume(stream);
   state.stream = null;
   // 컨테이너 바이트를 붙잡고 있을 이유가 없어졌다. 곧바로 놓는다.
   void invoke("qr_stream_close").catch(() => {});
@@ -693,6 +854,46 @@ function stopQrStream() {
   const section = el("pack-qr");
   if (section) section.dataset.state = "toobig";
   show("pack-qr-image", false);
+}
+
+/// 스트림의 체류 시간. 전용 슬라이더가 있으면 그 값을, 없으면 조각 모드의 것을 따른다.
+function qrStreamDwell() {
+  const value = Number(el("pack-qr-stream-speed")?.value);
+  return Number.isFinite(value) && value > 0 ? value : qrDwellFromUi();
+}
+
+/**
+ * '빠르게 보내기' 를 켜고 끈다. 슬라이더의 **하한만** 바꾼다.
+ *
+ * 켜도 저절로 빨라지지 않는다 — 열어 준 구간으로 사람이 직접 내려야 한다. 켜는 순간 값까지
+ * 끌어내리면 화면이 갑자기 초당 6회로 깜빡이게 되는데, 그건 이 토글이 켜야 열리게 되어 있는
+ * 이유 그 자체다.
+ */
+function setStreamFast(on) {
+  const slider = el("pack-qr-stream-speed");
+  if (!slider) return;
+  slider.min = String(on ? QR_DWELL_FAST_MIN_MS : QR_DWELL_MIN_MS);
+  // 끌 때는 열어 뒀던 구간에 서 있을 수 있다. 되돌려 놓지 않으면 토글이 거짓말이 된다.
+  if (!on && Number(slider.value) < QR_DWELL_MIN_MS) slider.value = String(QR_DWELL_MIN_MS);
+  renderStreamSpeed();
+  // 무엇을 열었는지, 무엇이 위험한지, 그리고 **빨라지지 않을 수도 있다**는 것까지 적는다.
+  // 마지막 줄이 특히 중요하다: 폰이 못 따라오면 더 빨리 넘길수록 총량이 줄어드는데, 그 사실은
+  // PC 화면에 나타나지 않는다(PC 는 보낸 장수만 세고 있다). 확인은 폰에서만 되므로 어디를
+  // 봐야 하는지 짚어 준다.
+  setText(
+    "pack-qr-stream-fast-note",
+    on
+      ? `${QR_DWELL_FAST_MIN_MS}ms 까지 열었습니다. 스트림은 놓친 프레임을 다음 프레임이 ` +
+        `대신하므로 조각 모드보다 빨리 넘겨도 됩니다. 다만 화면이 초당 3회를 넘겨 바뀌는 것은 ` +
+        `빛에 민감한 사람에게 위험할 수 있습니다. 그리고 폰이 못 따라오면 오히려 느려집니다 — ` +
+        `폰에 뜨는 '초당 n장' 이 늘지 않으면 도로 올려 주세요.`
+      : "",
+  );
+}
+
+/// 슬라이더 옆의 숫자. 도는 중에 바꿔도 다음 프레임부터 바로 먹는다.
+function renderStreamSpeed() {
+  setText("pack-qr-stream-speed-label", `${qrStreamDwell()}ms`);
 }
 
 /// 슬라이더가 있으면 그 값을, 없으면 기본값을.
@@ -1057,6 +1258,9 @@ function renderQrPlayButton() {
 function clearPackQr() {
   stopQrPlay();
   stopQrStream();
+  // 결과가 바뀌면 이어 갈 자리도 뜻을 잃는다. 같은 경로에 다시 묶으면 지문이 달라서 폰이
+  // 어차피 '다른 묶음' 으로 물리치는데, 그 자리를 이어 가면 화면만 새 묶음인 척하게 된다.
+  streamResume = { path: "", seq: 0, sent: 0 };
   show("pack-qr-stream", false);
   state.qr = null;
   const jump = el("pack-qr-goto");
@@ -1327,6 +1531,11 @@ function wireEvents() {
   el("pack-qr-stream-start")?.addEventListener("click", () =>
     state.stream ? stopQrStream() : void startQrStream(),
   );
+  // 속도는 흘려 보내는 중에 바꿔도 다음 프레임부터 바로 먹는다 (시각으로 재는 스케줄러라서).
+  el("pack-qr-stream-speed")?.addEventListener("input", renderStreamSpeed);
+  el("pack-qr-stream-fast")?.addEventListener("change", (event) =>
+    setStreamFast(Boolean(event.target?.checked)),
+  );
 
   el("unpack-pick")?.addEventListener("click", async () => {
     const picked = await invoke("pick_container");
@@ -1374,6 +1583,8 @@ async function main() {
 
   renderList();
   renderSource();
+  // 슬라이더 값과 옆의 숫자를 처음부터 맞춰 둔다. 마크업의 기본값을 고쳐도 따라온다.
+  renderStreamSpeed();
   clearPackOutput();
   resetProgress("pack");
   resetProgress("unpack");
