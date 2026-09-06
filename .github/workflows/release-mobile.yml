@@ -3,9 +3,16 @@ name: Release (모바일)
 # 데스크톱 릴리스(release.yml)와 완전히 분리된 트랙이다. 태그 접두사가 `mobile-v` 라서 서로의
 # 버전을 끌어올리지 않고, 한쪽만 고쳐도 다른 쪽 버전이 따라 오르지 않는다.
 #
-# 결과물은 두 갈래다 — 안드로이드는 서명된 APK 를 GitHub 릴리스에 붙이고, iOS 는 IPA 를
-# TestFlight 에 올린다. IPA 는 릴리스에 붙이지 않는다: TestFlight·ad-hoc 밖에서는 설치할 수
-# 없어서 받는 사람만 헷갈린다. 필요하면 워크플로 아티팩트로 내려받으면 된다.
+# 결과물은 세 갈래다.
+#
+#  - 안드로이드 **APK** — GitHub 릴리스에 붙인다. 스토어를 거치지 않고 바로 설치하는 용도다.
+#  - 안드로이드 **AAB** — Google Play 에 올린다. Play 는 2021년부터 새 앱을 APK 로 받지 않는다.
+#  - iOS **IPA** — TestFlight 에 올린다.
+#
+# AAB 와 IPA 는 릴리스에 붙이지 않는다: AAB 는 그 자체로 설치되는 파일이 아니고(Play 가 이걸로
+# 기기별 APK 를 만든다), IPA 는 TestFlight·ad-hoc 밖에서는 설치할 수 없다 — 받는 사람만 헷갈린다.
+# 필요하면 워크플로 아티팩트로 내려받으면 된다 (첫 Play 업로드는 손으로 해야 하는데, 그때 올릴
+# 파일이 바로 이 `android-aab` 아티팩트다).
 #
 # 준비해야 하는 secret 목록과 만드는 방법은 `mobile/RELEASE.md` 에 있다.
 
@@ -30,6 +37,22 @@ on:
           - android+ios
           - android
           - ios
+      play_track:
+        description: "AAB 를 올릴 Play 트랙 (none 이면 Play 에 올리지 않는다)"
+        required: true
+        type: choice
+        default: internal
+        options:
+          - none
+          - internal
+          - alpha
+          - beta
+          - production
+      upload_to_play:
+        description: "Play 에 실제로 반영한다 (끄면 올려 보고 검증만 한 뒤 되돌린다)"
+        required: true
+        type: boolean
+        default: true
       upload_to_testflight:
         description: "TestFlight 에 실제로 올린다 (끄면 서명·업로드 자격만 검증한다)"
         required: true
@@ -103,6 +126,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BUMP: ${{ inputs.bump }}
           PLATFORMS: ${{ inputs.platforms }}
+          PLAY_TRACK: ${{ inputs.play_track }}
           BUILD_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
@@ -179,11 +203,12 @@ jobs:
             echo "| 새 버전 | \`$next\` (태그 \`$tag\`) |"
             echo "| 빌드 번호 | \`$BUILD_NUMBER\` |"
             echo "| 플랫폼 | \`$PLATFORMS\` |"
+            echo "| Play 트랙 | \`$PLAY_TRACK\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ------------------------------------------------------------------ 안드로이드
   android:
-    name: 안드로이드 APK
+    name: 안드로이드 APK · AAB
     needs: prepare
     if: contains(inputs.platforms, 'android')
     runs-on: ubuntu-latest
@@ -233,15 +258,24 @@ jobs:
           BUILD_NUMBER: ${{ needs.prepare.outputs.build_number }}
         run: node scripts/set-native-version.mjs --version "$VERSION" --build "$BUILD_NUMBER"
 
-      - name: 릴리스 APK 빌드
+      # APK 와 AAB 를 한 번에 만든다. 둘은 같은 컴파일 결과를 포장만 달리한 것이라, 한 호출로
+      # 묶으면 Gradle 이 작업을 공유해서 따로 두 번 도는 것보다 훨씬 빠르다.
+      #
+      #  - APK — GitHub 릴리스에 붙여 바로 설치하게 한다.
+      #  - AAB — Play 에 올린다. Play 는 2021년 8월부터 새 앱을 APK 로 받지 않는다.
+      - name: 릴리스 APK · AAB 빌드
         working-directory: mobile/android
-        run: ./gradlew --no-daemon --stacktrace assembleRelease
+        run: ./gradlew --no-daemon --stacktrace assembleRelease bundleRelease
 
-      # Capacitor 템플릿에는 signingConfig 가 없어서 Gradle 이 서명되지 않은 APK 를 내놓는다.
-      # 생성물인 build.gradle 에 signingConfig 를 끼워 넣는 것보다 apksigner 로 뒤에 서명하는 편이
-      # 템플릿 변화에 덜 깨진다.
-      - name: APK 서명
-        id: apk
+      # Capacitor 템플릿에는 signingConfig 가 없어서 Gradle 이 서명되지 않은 산출물을 내놓는다.
+      # 생성물인 build.gradle 에 signingConfig 를 끼워 넣는 것보다 뒤에 서명하는 편이 템플릿
+      # 변화에 덜 깨진다.
+      #
+      # 서명 도구가 둘로 갈리는 것에 주의한다 — **apksigner 는 AAB 를 서명하지 못한다.** APK 는
+      # APK Signature Scheme(v2/v3)라 apksigner 가 필요하고, AAB 는 JAR 서명이라 jarsigner 를
+      # 쓴다. 키스토어와 별칭은 같은 것을 쓴다 (Play 에서 이 키는 '업로드 키' 가 된다).
+      - name: APK · AAB 서명
+        id: sign
         working-directory: mobile/android
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
@@ -274,18 +308,21 @@ jobs:
           [ -n "$tools" ] || fail "$sdk/build-tools 에서 build-tools 를 찾지 못했습니다."
           echo "build-tools $tools 로 서명합니다."
 
+          out_dir="$RUNNER_TEMP/release-artifacts"
+          mkdir -p "$out_dir"
+
           # 산출물 이름은 AGP 판본에 따라 달라진다. 경로를 박아 두지 않고 찾아서 개수를 확인한다.
           shopt -s nullglob
+
+          # ---------------------------------------------------------------- APK
           apks=(app/build/outputs/apk/release/*.apk)
           if [ "${#apks[@]}" -ne 1 ]; then
             fail "릴리스 APK 를 정확히 하나 찾지 못했습니다 (${#apks[@]}개): ${apks[*]:-없음}"
           fi
           echo "빌드된 APK: ${apks[0]}"
 
-          out_dir="$RUNNER_TEMP/release-artifacts"
-          mkdir -p "$out_dir"
-          name="$BINARY_NAME-v$VERSION-android.apk"
-          signed="$out_dir/$name"
+          apk_name="$BINARY_NAME-v$VERSION-android.apk"
+          apk="$out_dir/$apk_name"
 
           "$sdk/build-tools/$tools/zipalign" -p -f 4 "${apks[0]}" "$RUNNER_TEMP/aligned.apk"
           "$sdk/build-tools/$tools/apksigner" sign \
@@ -293,20 +330,56 @@ jobs:
             --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
             --ks-key-alias "$ANDROID_KEY_ALIAS" \
             --key-pass env:KEY_PASSWORD \
-            --out "$signed" \
+            --out "$apk" \
             "$RUNNER_TEMP/aligned.apk"
 
           # 서명이 실제로 붙었는지, 어느 인증서로 붙었는지 로그에 남긴다.
-          "$sdk/build-tools/$tools/apksigner" verify --print-certs "$signed"
+          "$sdk/build-tools/$tools/apksigner" verify --print-certs "$apk"
 
-          sha="$(sha256sum "$signed" | cut -d' ' -f1)"
-          size_mb="$(awk "BEGIN { printf \"%.1f\", $(stat -c%s "$signed") / 1048576 }")"
+          # ---------------------------------------------------------------- AAB
+          aabs=(app/build/outputs/bundle/release/*.aab)
+          if [ "${#aabs[@]}" -ne 1 ]; then
+            fail "릴리스 AAB 를 정확히 하나 찾지 못했습니다 (${#aabs[@]}개): ${aabs[*]:-없음}"
+          fi
+          echo "빌드된 AAB: ${aabs[0]}"
+
+          aab_name="$BINARY_NAME-v$VERSION-android.aab"
+          aab="$out_dir/$aab_name"
+
+          # AAB 는 zipalign 하지 않는다 — 정렬이 필요한 것은 기기에 설치되는 APK 쪽이고, 그
+          # APK 는 Play 가 이 번들에서 만들어 낸다.
+          jarsigner -keystore "$keystore" \
+            -storepass:env ANDROID_KEYSTORE_PASSWORD \
+            -keypass:env KEY_PASSWORD \
+            -digestalg SHA-256 -sigalg SHA256withRSA \
+            -signedjar "$aab" "${aabs[0]}" "$ANDROID_KEY_ALIAS"
+
+          # `jarsigner -verify` 는 서명이 아예 없어도 0 으로 끝난다 (그냥 "jar is unsigned" 라고
+          # 찍는다). 그래서 종료 코드가 아니라 출력을 보고 판단한다. 파이프로 잇지 않고 파일에
+          # 받아 두는 이유: `grep -q` 는 첫 줄을 찾자마자 끝나서 앞 명령에 SIGPIPE 를 보내고,
+          # `set -o pipefail` 이 그것을 실패로 읽는다 (서명은 멀쩡한데 스텝이 죽는다).
+          verify_log="$RUNNER_TEMP/aab-verify.txt"
+          jarsigner -verify "$aab" > "$verify_log"
+          cat "$verify_log"
+          grep -q 'jar verified' "$verify_log" || fail "AAB 에 서명이 붙지 않았습니다. 위 jarsigner 출력을 확인하세요."
+
+          # Play 는 업로드 키의 지문으로 번들을 알아본다. 키가 어긋나면 Play 가 "다른 키로
+          # 서명됐다" 며 기대하는 지문을 오류에 함께 보여 주는데, 그때 견줄 값이 이 출력이다.
+          keytool -printcert -jarfile "$aab" | sed -n '/Certificate fingerprints/,+2p'
+
+          # ---------------------------------------------------------------- 요약
+          apk_sha="$(sha256sum "$apk" | cut -d' ' -f1)"
+          apk_size="$(awk "BEGIN { printf \"%.1f\", $(stat -c%s "$apk") / 1048576 }")"
+          aab_size="$(awk "BEGIN { printf \"%.1f\", $(stat -c%s "$aab") / 1048576 }")"
 
           {
-            echo "path=$signed"
-            echo "name=$name"
-            echo "sha256=$sha"
-            echo "size_mb=$size_mb"
+            echo "path=$apk"
+            echo "name=$apk_name"
+            echo "sha256=$apk_sha"
+            echo "size_mb=$apk_size"
+            echo "aab_path=$aab"
+            echo "aab_name=$aab_name"
+            echo "aab_size_mb=$aab_size"
           } >> "$GITHUB_OUTPUT"
 
           {
@@ -314,18 +387,126 @@ jobs:
             echo ''
             echo '| 항목 | 값 |'
             echo '| --- | --- |'
-            echo "| APK | \`$name\` |"
-            echo "| 크기 | $size_mb MB |"
-            echo "| SHA256 | \`$sha\` |"
+            echo "| APK (릴리스에 붙는다) | \`$apk_name\` · $apk_size MB |"
+            echo "| APK SHA256 | \`$apk_sha\` |"
+            echo "| AAB (Play 에 올린다) | \`$aab_name\` · $aab_size MB |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: APK 아티팩트 업로드
         uses: actions/upload-artifact@v7
         with:
           name: android-apk
-          path: ${{ steps.apk.outputs.path }}
+          path: ${{ steps.sign.outputs.path }}
           if-no-files-found: error
           retention-days: 30
+
+      # AAB 는 릴리스에 붙이지 않는다 (설치할 수 없다). 다만 **첫 Play 업로드는 손으로 해야
+      # 하므로**, 그때 Play Console 에 끌어다 놓을 파일을 여기서 받을 수 있어야 한다.
+      - name: AAB 아티팩트 업로드
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-aab
+          path: ${{ steps.sign.outputs.aab_path }}
+          if-no-files-found: error
+          retention-days: 30
+
+  # ------------------------------------------------------------------ Google Play
+  #
+  # 안드로이드 잡과 나누어 둔 이유는 두 가지다.
+  #
+  #  - 업로드만 실패했을 때 **다시 빌드하지 않고** 이 잡만 재실행할 수 있다 (아티팩트에서
+  #    같은 AAB 를 내려받는다). 서명이 아니라 Play 쪽 설정 때문에 막히는 경우가 대부분이라
+  #    이게 실제로 자주 쓰인다.
+  #  - Play 자격 증명이 빌드 잡에 흘러들지 않는다.
+  play:
+    name: Google Play 업로드
+    needs: [prepare, android]
+    if: ${{ inputs.play_track != 'none' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: mobile
+
+    steps:
+      - name: 체크아웃
+        uses: actions/checkout@v7
+
+      # 업로드 스크립트는 의존성이 없다 (Node 기본 모듈만 쓴다). 그래서 `npm ci` 를 하지 않는다.
+      - name: Node 준비
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: AAB 내려받기
+        uses: actions/download-artifact@v8
+        with:
+          name: android-aab
+          path: ${{ runner.temp }}/aab
+
+      # upload_to_play 를 끄면 번들을 올린 뒤 편집을 커밋하지 않고 되돌린다(`edits.validate`).
+      # 자격 증명·권한·패키지 이름 문제를 전부 잡으면서 Play 쪽에는 아무것도 남기지 않는다 —
+      # 처음 설정할 때 이 모드로 돌리는 것이 좋다.
+      - name: Play 업로드
+        env:
+          PLAY_SERVICE_ACCOUNT_JSON_BASE64: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON_BASE64 }}
+          PLAY_TRACK: ${{ inputs.play_track }}
+          UPLOAD: ${{ inputs.upload_to_play }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD_NUMBER: ${{ needs.prepare.outputs.build_number }}
+          NOTES_LANGUAGE: ${{ vars.PLAY_RELEASE_NOTES_LANGUAGE }}
+        run: |
+          set -euo pipefail
+
+          fail() { echo "::error::$1"; exit 1; }
+
+          if [ -z "$PLAY_SERVICE_ACCOUNT_JSON_BASE64" ]; then
+            fail "secret PLAY_SERVICE_ACCOUNT_JSON_BASE64 이 비어 있습니다. 아직 Play 를 붙이지 않았다면 play_track 을 'none' 으로 두고 실행하세요. 준비 절차는 mobile/RELEASE.md 에 있습니다."
+          fi
+
+          shopt -s nullglob
+          aabs=("$RUNNER_TEMP"/aab/*.aab)
+          if [ "${#aabs[@]}" -ne 1 ]; then
+            fail "내려받은 AAB 를 정확히 하나 찾지 못했습니다 (${#aabs[@]}개): ${aabs[*]:-없음}"
+          fi
+
+          # 키는 파일로 떨어뜨리지 않고 환경 변수로만 넘긴다 — 러너 디스크에 남기지 않는다.
+          PLAY_SERVICE_ACCOUNT_JSON="$(printf '%s' "$PLAY_SERVICE_ACCOUNT_JSON_BASE64" | tr -d '[:space:]' | openssl base64 -d -A)"
+          export PLAY_SERVICE_ACCOUNT_JSON
+
+          args=(
+            --aab "${aabs[0]}"
+            --package "$APP_ID"
+            --track "$PLAY_TRACK"
+            --version "$VERSION"
+            --build "$BUILD_NUMBER"
+          )
+          # 릴리스 노트 언어는 **스토어 등록 정보에 있는 언어**여야 한다. 없는 언어를 보내면 Play 가
+          # 편집 전체를 거절하므로, 변수를 넣지 않았으면 노트 없이 올린다.
+          if [ -n "${NOTES_LANGUAGE:-}" ]; then
+            args+=(--notes-language "$NOTES_LANGUAGE")
+          fi
+          if [ "$UPLOAD" != "true" ]; then
+            args+=(--validate-only)
+            done_text="검증만 했습니다 (upload_to_play 가 꺼져 있습니다). 실제로 올리려면 켜고 다시 실행하세요."
+          else
+            done_text="Play 트랙 \`$PLAY_TRACK\` 에 올렸습니다. Play Console 에서 처리가 끝나기까지 몇 분 걸립니다."
+          fi
+
+          node scripts/upload-to-play.mjs "${args[@]}"
+
+          {
+            echo '## Google Play'
+            echo ''
+            echo '| 항목 | 값 |'
+            echo '| --- | --- |'
+            echo "| AAB | \`$(basename "${aabs[0]}")\` |"
+            echo "| 트랙 | \`$PLAY_TRACK\` |"
+            echo "| 버전 | \`$VERSION\` (versionCode \`$BUILD_NUMBER\`) |"
+            echo ''
+            echo "$done_text"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ------------------------------------------------------------------ iOS
   ios:
@@ -689,11 +870,15 @@ jobs:
   # ------------------------------------------------------------------ 릴리스
   release:
     name: GitHub 릴리스
-    needs: [prepare, android, ios]
+    needs: [prepare, android, play, ios]
     # 안드로이드가 성공했을 때만 릴리스를 만든다. iOS 만 돌린 실행에는 붙일 APK 가 없고, 그 실행의
     # 결과물은 TestFlight 빌드 자체다 — 빈 릴리스를 만들어 태그만 소모하지 않는다.
     # 건너뛴 잡의 result 는 'skipped' 라서 `!= 'failure'` 를 통과한다.
-    if: ${{ !cancelled() && needs.android.result == 'success' && needs.ios.result != 'failure' }}
+    #
+    # Play 업로드가 실패했을 때도 릴리스를 만들지 않는다 — 태그를 소모하지 않고 두면 'Re-run
+    # failed jobs' 로 이 실행을 그대로 이어서 고칠 수 있다 (AAB 는 아티팩트에 남아 있으니 다시
+    # 빌드하지 않는다). 릴리스를 먼저 만들어 버리면 그 길이 막힌다.
+    if: ${{ !cancelled() && needs.android.result == 'success' && needs.play.result != 'failure' && needs.ios.result != 'failure' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -721,6 +906,9 @@ jobs:
           PREVIOUS_TAG: ${{ needs.prepare.outputs.previous_tag }}
           BUILD_NUMBER: ${{ needs.prepare.outputs.build_number }}
           IOS_RESULT: ${{ needs.ios.result }}
+          PLAY_RESULT: ${{ needs.play.result }}
+          PLAY_TRACK: ${{ inputs.play_track }}
+          PLAY_UPLOADED: ${{ inputs.upload_to_play }}
         run: |
           set -euo pipefail
 
@@ -755,6 +943,15 @@ jobs:
             echo "- \`$apk_name\` — 안드로이드(arm64·armeabi 포함) 설치 파일 · $apk_size MB"
             echo "  - SHA256: \`$apk_sha\`"
             echo '  - 스토어를 거치지 않으므로 기기에서 "출처를 알 수 없는 앱" 설치를 한 번 허용해야 합니다.'
+            if [ "$PLAY_RESULT" = "success" ] && [ "$PLAY_UPLOADED" = "true" ]; then
+              echo "- Google Play **$PLAY_TRACK** 트랙에도 올렸습니다 (versionCode \`$BUILD_NUMBER\`)."
+              echo '  - Play 는 앱을 자기 키로 다시 서명하므로, **위 APK 와 Play 에서 받은 앱은 서로 덮어쓰지 못합니다.**'
+              echo '    한쪽에서 다른 쪽으로 옮길 때는 지웠다가 설치해야 합니다.'
+            elif [ "$PLAY_RESULT" = "success" ]; then
+              echo "- Google Play 는 검증만 했습니다 (\`$PLAY_TRACK\` 트랙에 반영되지 않았습니다)."
+            elif [ "$PLAY_RESULT" != "skipped" ]; then
+              echo "- Google Play 업로드는 이번 실행에서 하지 않았습니다 (\`$PLAY_RESULT\`)."
+            fi
             if [ "$IOS_RESULT" = "success" ]; then
               echo "- iOS 는 **TestFlight** 로 배포했습니다 (빌드 \`$BUILD_NUMBER\`). IPA 는 TestFlight 밖에서"
               echo '  설치할 수 없어서 릴리스에 붙이지 않습니다 — 필요하면 이 실행의 워크플로 아티팩트에서 받으세요.'
