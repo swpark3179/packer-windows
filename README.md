@@ -57,6 +57,7 @@ tests/frontend.test.js  프론트엔드 테스트
 src-tauri/src/
   commands.rs           Tauri 명령 + 파이프라인 조립 + 진행률
   armor.rs              Base64 텍스트 껍데기 (복사·붙여넣기 가능한 형태)
+  qr.rs                 QR 나눔 계획과 조각 그림 (한 장씩 그린다)
   container.rs          컨테이너 헤더와 청크 프레이밍
   crypto.rs             Argon2id 키 유도 + AES-256-GCM
   archive.rs            트리 순회, 매니페스트 직렬화, 복원
@@ -109,7 +110,7 @@ src-tauri/src/
 초기 버전이 만든 원시 바이너리 컨테이너도 계속 읽을 수 있다. 입력 앞 8바이트가 매직과 같으면
 armor 를 거치지 않는다. 새로 묶을 때는 항상 텍스트로만 쓴다.
 
-### QR 코드 (한 장 2,953바이트 · 최대 16장)
+### QR 코드 (최대 128장 · 컨테이너 약 132 KiB)
 
 묶은 텍스트를 QR 코드로도 띄운다. 휴대폰 기본 카메라로 비추면 텍스트가 그대로 보이고, 복사해서
 다른 기기의 풀기 탭에 붙여넣으면 파일이 돌아온다. 케이블도 메신저도 계정도 필요 없다.
@@ -145,20 +146,49 @@ QUFBQkJCQ0ND...
 이유는 `armor.rs` 모듈 문서에 적어 두었다. 요지는 두 가지다: `#` 은 손상의 산물이 아니고, 바이트
 손실을 실제로 막는 것은 armor 의 글자 검사가 아니라 청크마다 붙는 GCM 태그와 헤더의 KCV 다.
 
-**16장이 상한이다.** QR 규격의 Structured Append 한계와 같은 값이고, 실측으로 armor 본문 약
-46,000자까지 담긴다. 그보다 커지면 `qr` 이 `null` 로 오고 화면이 크기와 한도를 적어 준다. 장수를
-더 늘리는 것은 기술적으로 가능하지만 순서대로 스캔해 이어 붙이는 일 자체가 현실적이지 않다.
+**128장이 상한이다.** 실측으로 armor 본문 약 182,000자 = **컨테이너 약 132 KiB** 까지 담긴다.
+그보다 커지면 `qr_plan` 이 `null` 로 오고 화면이 크기와 한도를 적어 준다.
 
-**한 번에 한 장만 크게 보여 준다.** 버전 40 은 177×177모듈(여백 포함 185)이라 16장을 타일로
-늘어놓으면 한 장이 185px 남짓, 모듈 하나가 1픽셀까지 줄어 휴대폰이 읽지 못한다. 그래서 큰 그림
-한 장에 `3 / 16` 번호와 이전·다음만 둔다. 양끝에서 되돌아 감지 않는 것도 의도다 — '다음' 이
-잠기는 것이 "다 찍었다" 는 유일한 신호이고, 아무 장이나 먼저 찍을 수 없어 순서가 어긋나지 않는다.
+한때 16장이었다. QR 규격의 Structured Append 한계와 같은 값이었지만 실은 그 규격을 쓰지 않고
+있었고 — 폰의 기본 카메라가 모르기 때문이다 — 진짜 이유는 **사람이 '다음' 을 16번 눌러야
+한다**는 것이었다. 뷰어가 스스로 장을 넘기게 된 지금 그 비용은 초 단위 대기뿐이다.
+
+**뷰어가 스스로 넘긴다.** '자동 넘김' 을 누르면 프레임당 350ms(300~1500ms 조절)로 장을 넘기고
+**한 바퀴 돌면 마지막 장에서 멈춘다.** 무한히 돌지 않는 이유는 아래 신호를 지키기 위해서다.
+하한을 300ms 아래로 두지 않는 이유는 둘이다 — ML Kit 이 심볼 하나를 안정적으로 잡는 데 드는
+시간(디코드 40~120ms 위에 카메라 노출·초점이 얹힌다), 그리고 화면을 채운 고대비 그림이 초당
+3회를 넘겨 바뀌는 것에 대한 WCAG 2.3.1 경고. 두 하한이 거의 같은 자리에 있어서 접근성을
+지키는 데 성능 비용이 들지 않는다.
+
+**한 번에 한 장만 크게 보여 준다.** 128장을 타일로 늘어놓으면 한 장이 모듈 하나당 1픽셀까지
+줄어 휴대폰이 읽지 못한다. 그래서 큰 그림 한 장에 `3 / 128` 번호와 자동 넘김·속도·이전·다음만
+둔다. 손으로 넘길 때 양끝에서 되돌아 감지 않는 것도 의도다 — '다음' 이 잠기는 것이 "다 찍었다"
+는 유일한 신호다.
+
+**그림은 한 장씩 그린다.** 심볼 하나가 base64 로 약 6 KiB 라, 128장을 한 응답에 실으면 곧
+메가바이트가 되고 직렬화·파싱만으로 웹뷰가 몇 초씩 멈춘다. 묶기 응답에는 나눔의 요약
+(`qr_plan`: 장수·모듈 수·ECC 등급)과 **첫 장만** 싣고, 나머지는 뷰어가 넘길 때마다 `qr_piece`
+명령으로 받아 간다 (앞의 3장을 미리 받아 두어 자동 넘김의 체류 시간 안에 도착하게 한다).
+
+**모듈을 굵게 유지한다.** `qr.rs` 의 `MAX_MODULES` 를 125로 두어 버전 25 언저리에서 끊는다.
+버전 40(177모듈)은 555px 로 띄워도 모듈 하나가 3.1px, 96 DPI 기준 0.79mm 라 초점이 맞아도
+폰이 놓치는 일이 잦았다 — `mobile/README.md` 가 인식률로 호소하던 것이 그 조건이다. 조각이
+1.5~2배로 늘지만, 뷰어가 스스로 넘기므로 그 대가는 초 단위 대기뿐이다.
+
+여기에는 되먹임이 하나 있다. `encode_uniform` 은 **담을 수 있는 가장 튼튼한 ECC 등급**을 쓰고
+`plan` 은 **가장 적은 조각 수**를 고르므로, 조각을 아끼면 자동으로 약한 등급(L)으로 몰린다.
+조각이 싸지면 그 압력이 사라져 심볼이 저절로 튼튼해진다.
 
 PNG 은 **1모듈 = 1픽셀**로 만들고 여백(quiet zone) 4모듈을 그림 안에 포함한다. 확대는 화면 쪽에서
-정수 배율로만 한다(모듈당 최소 3px, 버전 40 이면 555px) — 배율에 소수점이 붙으면 모듈 폭이
-3px/4px 로 들쭉날쭉해져 초점이 맞아도 인식되지 않는다. 여백을 CSS 패딩에만 두면 안 된다: 패딩은
-12px 고정인데 모듈은 3~10px 로 변해 배율이 높을 때 4모듈을 채우지 못하고, 화면을 캡처해 잘라내면
-함께 사라진다.
+정수 배율로만 한다(모듈당 최소 3px) — 배율에 소수점이 붙으면 모듈 폭이 3px/4px 로 들쭉날쭉해져
+초점이 맞아도 인식되지 않는다. 여백을 CSS 패딩에만 두면 안 된다: 패딩은 12px 고정인데 모듈은
+3~10px 로 변해 배율이 높을 때 4모듈을 채우지 못하고, 화면을 캡처해 잘라내면 함께 사라진다.
+
+**조각 수 상한은 모바일과 짝지어져 있지 않다.** 예전에는 `collector.js` 가 같은 상수를 들고
+있다가 그보다 많은 조각을 전부 거절했다. 그래서 데스크톱 상수를 올리는 순간 구버전 앱이
+신버전 QR 을 100% 거부했고 — 화면에는 "순번이 올바르지 않습니다" 만 떴다 — 상수를 올리는 일이
+앱 스토어 배포를 기다려야 하는 작업이 됐다. 지금 앱은 순번이 말이 되기만 하면 몇 장이든 받는다.
+실제 방어는 구조 검사와 `chunkLength` 충돌 검사가 하고 있어서 잃은 것이 없다.
 
 조각 텍스트에는 ASCII 만 넣는다. 바이트 모드 QR 에는 믿을 수 있는 문자셋 선언이 없어 디코더마다
 ISO-8859-1 이나 UTF-8 로 제각기 짐작하는데, 우리 payload 는 전부 ASCII 라 어느 해석으로 읽어도
@@ -203,7 +233,7 @@ ISO-8859-1 이나 UTF-8 로 제각기 짐작하는데, 우리 payload 는 전부
 | 탭 | `tab[data-tab=pack\|unpack]`, `panel[data-tab=pack\|unpack]` |
 | 묶기 | `pack-dropzone` `pack-list` `pack-empty` `pack-summary` `pack-clear` `pack-add-files` `pack-add-folders` `pack-key` `pack-key-toggle` `pack-key-strength` `pack-submit` `pack-progress` `pack-progress-fill` `pack-progress-label` `pack-status` `pack-reveal` |
 | 결과 텍스트 | `pack-output` `pack-output-text` `pack-output-copy` `pack-output-note` |
-| 결과 QR | `pack-qr` (`data-state=single\|split\|toobig`) `pack-qr-image` `pack-qr-note` `pack-qr-nav` `pack-qr-prev` `pack-qr-next` `pack-qr-index` |
+| 결과 QR | `pack-qr` (`data-state=single\|split\|toobig`) `pack-qr-image` `pack-qr-note` `pack-qr-nav` `pack-qr-prev` `pack-qr-next` `pack-qr-index` `pack-qr-play` `pack-qr-speed` `pack-qr-speed-label` |
 | 풀기 | `unpack-dropzone` `unpack-pick` `unpack-file` `unpack-file-name` `unpack-file-meta` `unpack-text` `unpack-text-clear` `unpack-source-note` `unpack-key` `unpack-key-toggle` `unpack-key-hint` `unpack-dest` `unpack-dest-pick` `unpack-submit` `unpack-progress` `unpack-progress-fill` `unpack-progress-label` `unpack-status` `unpack-reveal` |
 | 목록 행 | `row-template` (안에 `[data-field=name]` `[data-field=meta]` `[data-pk=row-remove]`) |
 

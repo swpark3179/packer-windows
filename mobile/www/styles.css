@@ -188,6 +188,12 @@ code {
   margin: 18px 0 0;
 }
 
+/* 스캔 오버레이 위에서는 카메라를 덮지 않도록 자기 판만 깐다 (위의 투명 규칙 참고). */
+.scan-bar {
+  margin: 0;
+  padding: 12px 14px;
+}
+
 .progress-track {
   height: 8px;
   border-radius: 999px;
@@ -293,6 +299,7 @@ code {
 /* 카메라 위 글자는 배경 없이는 읽히지 않는다. 화면 전체를 덮지 않도록 요소마다 판을 깐다. */
 .scan-head,
 .status,
+.scan-bar,
 .chips {
   background: rgba(10, 12, 17, 0.72);
   border-radius: 12px;

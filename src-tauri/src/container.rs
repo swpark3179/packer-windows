@@ -466,13 +466,19 @@ mod tests {
         let mut junk = vec![0u8; HEADER_LEN];
         junk[0..4].copy_from_slice(b"PK\x03\x04"); // zip
         let mut cur = Cursor::new(junk);
-        assert!(matches!(open_header(&mut cur, "pw"), Err(Error::NotContainer)));
+        assert!(matches!(
+            open_header(&mut cur, "pw"),
+            Err(Error::NotContainer)
+        ));
     }
 
     #[test]
     fn rejects_too_short_files() {
         let mut cur = Cursor::new(b"FSXPACK1".to_vec());
-        assert!(matches!(open_header(&mut cur, "pw"), Err(Error::NotContainer)));
+        assert!(matches!(
+            open_header(&mut cur, "pw"),
+            Err(Error::NotContainer)
+        ));
     }
 
     #[test]
@@ -524,7 +530,10 @@ mod tests {
     #[test]
     fn wrong_key_is_distinguished_from_corruption() {
         let sealed = seal(b"secret", "correct-horse");
-        assert!(matches!(unseal(&sealed, "wrong-horse"), Err(Error::WrongKey)));
+        assert!(matches!(
+            unseal(&sealed, "wrong-horse"),
+            Err(Error::WrongKey)
+        ));
     }
 
     #[test]

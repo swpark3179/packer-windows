@@ -136,13 +136,51 @@ function warn(text, tone) {
   setStatus(text, tone);
 }
 
+/// 칩으로 보여 줄 수 있는 최대 장수.
+///
+/// 칩은 막대가 지우는 정보를 담고 있다 — **어느** 장이 빠졌는지. 그래서 들어가는 한 칩이 낫다.
+/// 하지만 데스크톱 조각 상한이 128장까지 올라갔고, 그만큼을 폰 화면에 늘어놓으면 카메라를
+/// 덮어 버린다. 그때는 칩을 **더하는** 것이 아니라 **막대로 바꾼다** — 빠진 순번은 바로 위의
+/// `scan-total` 이 계속 말해 준다.
+const CHIP_LIMIT = 24;
+
+/// 칩이 화면에 안 들어갈 때 대신 쓰는 막대. 결과 화면의 것과 같은 컴포넌트다.
+function renderScanBar() {
+  const { collection } = state;
+  const total = collection.total;
+  if (total === null) return;
+
+  const percent = Math.round((collection.pieces.size / total) * 100);
+  const fill = el("scan-bar-fill");
+  if (fill) fill.style.width = `${percent}%`;
+
+  const bar = el("scan-bar");
+  if (bar) {
+    bar.setAttribute("role", "progressbar");
+    bar.setAttribute("aria-valuemin", "0");
+    bar.setAttribute("aria-valuemax", "100");
+    bar.setAttribute("aria-valuenow", String(percent));
+  }
+}
+
 function renderChips() {
   const list = el("scan-list");
+  const total = state.collection.total;
+  const asChips = total !== null && total <= CHIP_LIMIT;
+
+  // 칩과 막대는 같은 자리를 놓고 서로 배타적이다.
+  show("scan-list", asChips);
+  show("scan-bar", total !== null && !asChips);
+
+  if (!asChips) {
+    if (list) list.replaceChildren();
+    renderScanBar();
+    return;
+  }
   if (!list) return;
 
   const template = el("chip-template");
-  const total = state.collection.total;
-  if (!template || total === null) {
+  if (!template) {
     list.replaceChildren();
     return;
   }

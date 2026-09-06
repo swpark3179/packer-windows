@@ -92,6 +92,29 @@
           <div class="output-head">
             <span class="field-label">QR 코드 (휴대폰으로 스캔)</span>
             <div class="qr-nav" data-pk="pack-qr-nav" role="group" aria-label="QR 코드 넘기기" hidden>
+              <!--
+                자동 넘김. 한 바퀴 돌고 마지막 장에서 멈춘다 — '다음' 이 잠기는 것이 "다 찍었다"
+                는 유일한 신호라서, 무한히 돌면 그 신호가 사라진다.
+              -->
+              <button type="button" class="btn btn-quiet" data-pk="pack-qr-play" aria-pressed="false">
+                자동 넘김
+              </button>
+              <label class="qr-speed">
+                <span class="sr-only">넘김 속도</span>
+                <!--
+                  하한 300ms: ML Kit 이 심볼 하나를 안정적으로 잡는 시간이자, 화면을 채운
+                  고대비 그림이 초당 3회를 넘겨 바뀌지 않게 하는 선이다 (WCAG 2.3.1).
+                -->
+                <input
+                  type="range"
+                  data-pk="pack-qr-speed"
+                  min="300"
+                  max="1500"
+                  step="50"
+                  value="350"
+                />
+                <span class="qr-speed-label tnum" data-pk="pack-qr-speed-label">350ms</span>
+              </label>
               <button type="button" class="btn btn-quiet" data-pk="pack-qr-prev">이전</button>
               <span
                 class="qr-index tnum"

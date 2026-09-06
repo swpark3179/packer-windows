@@ -157,7 +157,13 @@ impl ChunkCipher {
         let nonce = nonce_for(&self.nonce_prefix, self.index);
         let out = self
             .cipher
-            .encrypt(&nonce, Payload { msg: plaintext, aad })
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
             .map_err(|_| Error::Internal("암호화에 실패했습니다.".into()))?;
         self.index += 1;
         Ok(out)

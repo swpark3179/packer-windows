@@ -16,8 +16,16 @@
 export const BEGIN_MARKER = "-----BEGIN PACKER CONTAINER-----";
 export const END_MARKER = "-----END PACKER CONTAINER-----";
 
-/// 조각 수 상한. `qr.rs` 의 `MAX_PIECES` 와 같은 값이다 (QR 규격의 Structured Append 한계).
-export const MAX_PIECES = 16;
+/// 순번이 말이 되는지만 본다. **데스크톱의 조각 수 상한을 여기 옮겨 적지 않는다.**
+///
+/// 예전에는 `qr.rs` 의 `MAX_PIECES` 를 그대로 적어 두고 그보다 많은 조각을 거절했다. 그 결과
+/// 데스크톱 상수를 올리는 순간 **구버전 앱이 신버전 QR 을 100% 거부**했고 — 화면에는 "순번이
+/// 올바르지 않습니다" 만 떴다 — 상수를 올리는 일이 앱 스토어 배포를 기다려야 하는 작업이 됐다.
+///
+/// 상한을 없애도 방어가 약해지지 않는다. 실제로 잘못된 조각을 잡아내는 것은 구조 검사(시작·끝
+/// 표시가 붙은 자리)와 `chunkLength` 충돌 검사이고, 그 둘은 그대로 있다. 터무니없이 큰 순번은
+/// 화면의 진행 표시가 먼저 말해 준다.
+const SANE_TOTAL = 100_000;
 
 /// armor 본문에 쓰이는 글자. `armor.rs` 의 `is_body_byte()` 와 같다.
 ///
@@ -71,7 +79,7 @@ export function parsePiece(text) {
     return { ok: false, reason: mark || hasBegin || hasEnd ? "damaged" : "not-packer" };
   }
 
-  if (index < 1 || total < 1 || index > total || total > MAX_PIECES) {
+  if (index < 1 || total < 1 || index > total || total > SANE_TOTAL) {
     return { ok: false, reason: "range" };
   }
 

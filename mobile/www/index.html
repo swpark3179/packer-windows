@@ -55,6 +55,14 @@
 
         <ul class="chips" data-pk="scan-list" aria-label="조각 순번"></ul>
 
+        <!--
+          조각이 많아 칩이 화면에 안 들어갈 때 칩 **대신** 나온다 (app.js 의 CHIP_LIMIT).
+          어느 장이 빠졌는지는 위의 scan-total 이 계속 말해 준다.
+        -->
+        <div class="progress scan-bar" data-pk="scan-bar" hidden>
+          <div class="progress-track"><div class="progress-fill" data-pk="scan-bar-fill"></div></div>
+        </div>
+
         <div class="reticle" aria-hidden="true"></div>
 
         <p class="status" data-pk="scan-status" aria-live="polite"></p>

@@ -325,7 +325,8 @@ export async function buzz(kind) {
   }
 }
 
-/// 스캔하는 동안 화면이 꺼지지 않게 한다. 16장을 넘기다 화면이 꺼지면 흐름이 끊긴다.
+/// 스캔하는 동안 화면이 꺼지지 않게 한다. 자동 넘김이 한 바퀴 도는 동안 화면이 꺼지면
+/// 흐름이 끊긴다 — 128장이면 45초쯤 폰을 들고만 있게 된다.
 export async function keepAwake(on) {
   const api = plugin("KeepAwake");
   if (!api) return;

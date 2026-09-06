@@ -292,8 +292,14 @@ fn read_piece_mark(bytes: &[u8]) -> Option<(usize, usize, usize)> {
     }
     let total_end = digits(index_end + 1)?;
 
-    let index = std::str::from_utf8(&bytes[1..index_end]).ok()?.parse().ok()?;
-    let total = std::str::from_utf8(&bytes[index_end + 1..total_end]).ok()?.parse().ok()?;
+    let index = std::str::from_utf8(&bytes[1..index_end])
+        .ok()?
+        .parse()
+        .ok()?;
+    let total = std::str::from_utf8(&bytes[index_end + 1..total_end])
+        .ok()?
+        .parse()
+        .ok()?;
     Some((index, total, total_end))
 }
 
@@ -382,11 +388,7 @@ pub fn compact(text: &str) -> Result<String> {
 /// Base64 4자 묶음은 쪼개지 않으므로, 실제로 나온 조각 수가 요청보다 적을 수 있다. `/N` 에는
 /// 항상 실제 조각 수를 적는다.
 pub fn pieces(body: &str, parts: usize) -> Vec<String> {
-    let per = body
-        .len()
-        .div_ceil(parts.max(1))
-        .next_multiple_of(4)
-        .max(4);
+    let per = body.len().div_ceil(parts.max(1)).next_multiple_of(4).max(4);
     // 빈 본문(0바이트 페이로드)도 조각 하나로는 나와야 한다.
     let slices: Vec<&[u8]> = if body.is_empty() {
         vec![b""]
@@ -571,7 +573,10 @@ mod tests {
 
     #[test]
     fn rejects_text_without_a_begin_marker() {
-        assert!(matches!(dearmor("그냥 평범한 메모입니다.\n"), Err(Error::NotContainer)));
+        assert!(matches!(
+            dearmor("그냥 평범한 메모입니다.\n"),
+            Err(Error::NotContainer)
+        ));
         assert!(matches!(dearmor(""), Err(Error::NotContainer)));
     }
 
@@ -615,15 +620,24 @@ mod tests {
         assert_eq!(lines.len(), 3, "{lines:?}");
         assert_eq!(lines[0], BEGIN_MARKER);
         assert_eq!(lines[2], END_MARKER);
-        assert!(one_line.len() < text.len(), "줄바꿈을 없앴으면 더 짧아야 한다");
+        assert!(
+            one_line.len() < text.len(),
+            "줄바꿈을 없앴으면 더 짧아야 한다"
+        );
         assert_eq!(dearmor(&one_line).unwrap(), payload);
     }
 
     #[test]
     fn compact_rejects_text_that_is_not_ours() {
-        assert!(matches!(compact("그냥 평범한 메모입니다.\n"), Err(Error::NotContainer)));
+        assert!(matches!(
+            compact("그냥 평범한 메모입니다.\n"),
+            Err(Error::NotContainer)
+        ));
         let text = armor(&vec![1u8; 300]);
-        assert!(matches!(compact(&text[..text.len() / 2]), Err(Error::ArmorDamaged)));
+        assert!(matches!(
+            compact(&text[..text.len() / 2]),
+            Err(Error::ArmorDamaged)
+        ));
         let dirty = format!("{BEGIN_MARKER}\r\nAAAA한글AAAA\r\n{END_MARKER}\r\n");
         assert!(matches!(compact(&dirty), Err(Error::ArmorDamaged)));
     }
@@ -663,7 +677,10 @@ mod tests {
         // 표시 뒤의 줄바꿈까지 사라진 더 나쁜 경우 (`...AbCd#2/3RkZG...`).
         let mut squashed = trimmed.clone();
         for i in 1..=3 {
-            squashed = squashed.replace(&format!("{PIECE_MARK}{i}/3\n"), &format!("{PIECE_MARK}{i}/3"));
+            squashed = squashed.replace(
+                &format!("{PIECE_MARK}{i}/3\n"),
+                &format!("{PIECE_MARK}{i}/3"),
+            );
         }
         assert_eq!(dearmor(&squashed).unwrap(), payload);
     }
@@ -720,7 +737,10 @@ mod tests {
 
         match verify_pieces(&cut.join("")) {
             Err(Error::PieceOrder(found)) => {
-                assert!(found.contains("#3/4 #2/4"), "찾은 순서를 그대로 보여 줘야 한다: {found}");
+                assert!(
+                    found.contains("#3/4 #2/4"),
+                    "찾은 순서를 그대로 보여 줘야 한다: {found}"
+                );
             }
             other => panic!("순서가 뒤바뀐 걸 못 잡았다: {other:?}"),
         }
@@ -731,7 +751,10 @@ mod tests {
         let body = body_of(&armor(&vec![5u8; 3000])).unwrap();
         let mut cut = pieces(&body, 4);
         cut.remove(2);
-        assert!(matches!(verify_pieces(&cut.join("")), Err(Error::PieceOrder(_))));
+        assert!(matches!(
+            verify_pieces(&cut.join("")),
+            Err(Error::PieceOrder(_))
+        ));
     }
 
     #[test]
@@ -753,14 +776,25 @@ mod tests {
             .map(|p| p.trim_end_matches('\n'))
             .collect();
 
-        assert!(verify_pieces(&squashed).is_ok(), "정상 붙여넣기를 오류로 봤다");
+        assert!(
+            verify_pieces(&squashed).is_ok(),
+            "정상 붙여넣기를 오류로 봤다"
+        );
         assert_eq!(dearmor(&squashed).unwrap(), payload);
     }
 
     #[test]
     fn still_rejects_other_stray_characters() {
         // 예외는 `#숫자/숫자` 하나뿐이다.
-        for junk in ["AAAA%AAAA", "AAAA@AAAA", "AAAA한글AAAA", "AAAA*AAAA", "AAAA#AAAA", "AAAA#1AAAA", "AAAA#/2AAAA"] {
+        for junk in [
+            "AAAA%AAAA",
+            "AAAA@AAAA",
+            "AAAA한글AAAA",
+            "AAAA*AAAA",
+            "AAAA#AAAA",
+            "AAAA#1AAAA",
+            "AAAA#/2AAAA",
+        ] {
             let text = format!("{BEGIN_MARKER}\r\n{junk}\r\n{END_MARKER}\r\n");
             assert!(
                 matches!(dearmor(&text), Err(Error::ArmorDamaged)),

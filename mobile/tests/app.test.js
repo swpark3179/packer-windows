@@ -195,6 +195,32 @@ describe("앱 배선", { skip: JSDOM ? false : "jsdom 이 없습니다 — npm i
     assert.match(app.el("scan-total").textContent, /남은 순번 1, 3/);
   });
 
+  it("조각이 많으면 칩 대신 막대로 바꾼다", async () => {
+    // 128장을 폰 화면에 늘어놓으면 카메라를 덮는다. 칩을 **더하는** 게 아니라 **바꾼다** —
+    // 어느 장이 빠졌는지는 scan-total 이 계속 말해 준다.
+    const app = await boot();
+    const body = "ABCD".repeat(40); // 160자 → 40조각
+    const pieces = makePieces(body, 40);
+    assert.ok(pieces.length > 24, `${pieces.length}장`);
+
+    await app.scan(pieces[0]);
+
+    assert.equal(app.el("scan-list").hidden, true);
+    assert.equal(app.el("scan-bar").hidden, false);
+    assert.equal(app.el("scan-bar").getAttribute("aria-valuenow"), "3");
+    assert.match(app.el("scan-total").textContent, /장 남았습니다/);
+
+    await app.scan(pieces[1]);
+    assert.equal(app.el("scan-bar").getAttribute("aria-valuenow"), "5");
+  });
+
+  it("조각이 적으면 칩을 그대로 쓴다", async () => {
+    const app = await boot();
+    await app.scan(makePieces(BODY, 3)[0]);
+    assert.equal(app.el("scan-list").hidden, false);
+    assert.equal(app.el("scan-bar").hidden, true);
+  });
+
   it("같은 장을 계속 비춰도 화면이 흔들리지 않는다", async () => {
     const app = await boot();
     const pieces = makePieces(BODY, 3);

@@ -12,7 +12,8 @@
 //             pack-progress-label, pack-status, pack-reveal
 //   결과 텍스트 pack-output, pack-output-text, pack-output-copy, pack-output-note
 //   결과 QR    pack-qr (data-state=single|split|toobig), pack-qr-image, pack-qr-note,
-//             pack-qr-nav, pack-qr-prev, pack-qr-next, pack-qr-index
+//             pack-qr-nav, pack-qr-prev, pack-qr-next, pack-qr-index,
+//             pack-qr-play, pack-qr-speed, pack-qr-speed-label
 //   풀기      unpack-dropzone, unpack-pick, unpack-file, unpack-file-name,
 //             unpack-file-meta, unpack-text, unpack-text-clear, unpack-source-note,
 //             unpack-key, unpack-key-toggle, unpack-key-hint, unpack-dest,
@@ -419,8 +420,11 @@ function refreshButtons() {
   const qr = state.qr;
   const qrPrev = el("pack-qr-prev");
   const qrNext = el("pack-qr-next");
+  const qrPlay = el("pack-qr-play");
   if (qrPrev) qrPrev.disabled = state.busy || !qr || qr.index === 0;
-  if (qrNext) qrNext.disabled = state.busy || !qr || qr.index >= qr.images.length - 1;
+  if (qrNext) qrNext.disabled = state.busy || !qr || qr.index >= qr.total - 1;
+  // 재생은 끝 장에서도 열어 둔다 — 거기서 누르면 처음부터 다시 돈다.
+  if (qrPlay) qrPlay.disabled = state.busy || !qr || qr.total <= 1;
 
   for (const hook of [
     "pack-add-files",
@@ -493,19 +497,48 @@ function clearPackOutput() {
 
 // ---------------------------------------------------------------- 결과 QR
 
-/// 결과 텍스트를 QR 코드 그림으로도 보여 준다.
+/// 자동 넘김의 기본 체류 시간(ms). 슬라이더의 범위는 `index.html` 이 정한다.
 ///
-/// 한 장에 담기지 않으면 여러 장으로 나눠 준다. 앱이 다시 이어 붙여 주지는 않는다 — 사용자가
-/// 순서대로 스캔해 이어 붙인다. 그래서 뷰어는 한 번에 한 장만 크게 보여 준다: 작은 타일로
-/// 늘어놓으면 모듈이 1px 까지 줄어들어 휴대폰이 읽지 못하고, 아무 장이나 먼저 찍게 되어 순서가
-/// 어긋난다.
+/// 300ms 아래로 내리지 않는 이유가 둘이다. 하나, ML Kit 이 심볼 하나를 안정적으로 잡으려면
+/// 디코드(40~120ms) 위에 카메라 노출·초점이 얹힌다. 둘, 화면을 가득 채운 고대비 그림이 초당
+/// 3회를 넘겨 바뀌는 것은 WCAG 2.3.1 이 경고하는 구간에 들어간다. 두 하한이 거의 같은 자리에
+/// 있어서, 접근성 쪽을 지키는 데 성능 비용이 들지 않는다.
+const QR_DWELL_DEFAULT_MS = 350;
+
+/// 미리 받아 둘 장 수. 체류 시간 안에 IPC 왕복 + PNG 인코딩이 끝나야 그림이 끊기지 않는다.
+const QR_PREFETCH = 3;
+
+/**
+ * 결과 텍스트를 QR 코드 그림으로도 보여 준다.
+ *
+ * 그림은 **한 장씩 받아 온다** (`qr_piece`). 조각 상한이 128장이라 한꺼번에 실어 보내면 응답이
+ * 메가바이트가 되는데, 뷰어는 어차피 한 번에 한 장만 보여 준다. 첫 장은 묶기 응답에 함께
+ * 실려 오므로 결과가 뜨는 순간 바로 그릴 수 있다.
+ */
 function renderPackQr(result) {
-  const images = Array.isArray(result.qr) && result.qr.length > 0 ? result.qr : null;
-  state.qr = images ? { images, index: 0 } : null;
+  const info = result.qr_plan;
+  stopQrPlay();
+
+  state.qr = info
+    ? {
+        total: Number(info.total) || 0,
+        pngModules: Number(info.png_modules) || 0,
+        index: 0,
+        /// 받아 둔 그림. 조각 번호(1부터) → { png_base64, text_bytes }.
+        cache: new Map(),
+        playing: false,
+        timer: null,
+        dwellMs: qrDwellFromUi(),
+      }
+    : null;
+
+  if (state.qr && result.qr_first) {
+    state.qr.cache.set(1, result.qr_first);
+  }
 
   const section = el("pack-qr");
   if (section) {
-    section.dataset.state = !images ? "toobig" : images.length > 1 ? "split" : "single";
+    section.dataset.state = !state.qr ? "toobig" : state.qr.total > 1 ? "split" : "single";
   }
 
   show("pack-qr", true);
@@ -513,6 +546,44 @@ function renderPackQr(result) {
   // 바뀌면 읽던 자리를 잃는다.
   setText("pack-qr-note", qrNote(result, state.qr));
   showPackQrPage();
+  void prefetchQr();
+}
+
+/// 슬라이더가 있으면 그 값을, 없으면 기본값을.
+function qrDwellFromUi() {
+  const slider = el("pack-qr-speed");
+  const value = Number(slider?.value);
+  return Number.isFinite(value) && value > 0 ? value : QR_DWELL_DEFAULT_MS;
+}
+
+/// 한 장을 받아 캐시에 넣는다. 이미 있으면 그대로 돌려준다.
+async function fetchQrPiece(index) {
+  const qr = state.qr;
+  if (!qr || index < 1 || index > qr.total) return null;
+
+  const seen = qr.cache.get(index);
+  if (seen) return seen;
+
+  try {
+    const image = await invoke("qr_piece", { index });
+    // 받아 오는 사이에 결과가 바뀌었을 수 있다. 그때 캐시에 넣으면 다른 묶음의 그림이 섞인다.
+    if (state.qr !== qr) return null;
+    qr.cache.set(index, image);
+    return image;
+  } catch {
+    // 그림 한 장을 못 받은 것뿐이다. 묶기는 이미 성공했고 텍스트도 화면에 있다.
+    return null;
+  }
+}
+
+/// 지금 장의 앞뒤 몇 장을 미리 받아 둔다.
+async function prefetchQr() {
+  const qr = state.qr;
+  if (!qr) return;
+  for (let ahead = 0; ahead <= QR_PREFETCH; ahead += 1) {
+    await fetchQrPiece(qr.index + 1 + ahead);
+    if (state.qr !== qr) return;
+  }
 }
 
 /// 지금 보고 있는 장을 그림·설명·번호·넘기기에 반영한다.
@@ -533,17 +604,19 @@ function showPackQrPage() {
     return;
   }
 
-  const total = qr.images.length;
-  const page = qr.images[qr.index];
+  const total = qr.total;
+  const page = qr.cache.get(qr.index + 1);
 
   if (image) {
-    image.src = `data:image/png;base64,${page.png_base64}`;
+    if (page) {
+      image.src = `data:image/png;base64,${page.png_base64}`;
+    }
     // PNG 은 1모듈 = 1픽셀이다. 정수 배율로만 키운다 — 배율에 소수점이 붙으면 모듈 폭이
     // 3px/4px 로 들쭉날쭉해져 휴대폰이 초점을 맞춰도 인식하지 못한다.
     //
-    // 모듈당 최소 3px 을 보장한다. 버전 40(여백 포함 185모듈)이 555px 이 되어 96 DPI 에서
-    // 모듈 하나가 0.79mm 다. 그보다 작으면 폰이 화면에서 읽어내지 못한다.
-    const modules = Number(page.png_modules) || 0;
+    // 모듈당 최소 3px 을 보장한다. 조각들은 모두 같은 규격이라 이 값은 장을 넘겨도 변하지
+    // 않는다 — 그래서 그림을 아직 못 받았어도 자리는 먼저 잡아 둘 수 있다.
+    const modules = qr.pngModules;
     if (modules > 0) {
       image.style.width = `${modules * Math.max(3, Math.min(10, Math.floor(560 / modules)))}px`;
     } else {
@@ -554,7 +627,7 @@ function showPackQrPage() {
         ? `묶은 결과 텍스트를 담은 QR 코드 ${total}장 중 ${qr.index + 1}번째`
         : "묶은 결과 텍스트를 담은 QR 코드";
   }
-  show("pack-qr-image", true);
+  show("pack-qr-image", Boolean(page));
 
   // 한 장이면 넘길 곳이 영원히 없다. 뜻이 없는 조작 도구는 잠그기보다 감춘다 — 잠가 두면
   // 더 있을 것처럼 보인다. (pack-key-strength, pack-progress, pack-reveal 과 같은 규칙)
@@ -563,15 +636,26 @@ function showPackQrPage() {
   refreshButtons();
 }
 
-function stepPackQr(delta) {
-  if (!state.qr) return;
-  const last = state.qr.images.length - 1;
-  // 끝에서 되돌아 감지 않는다. 16장을 순서대로 찍는 중에 1장으로 돌아가 버리면 어디까지
-  // 했는지 잃고, '다음' 이 잠기는 것이 유일한 "다 찍었다" 신호이기도 하다.
-  const next = Math.min(Math.max(state.qr.index + delta, 0), last);
-  if (next === state.qr.index) return;
-  state.qr.index = next;
+/// 장을 옮긴다. 옮겼으면 참.
+function goToQrPage(next) {
+  const qr = state.qr;
+  if (!qr || next === qr.index || next < 0 || next >= qr.total) return false;
+  qr.index = next;
   showPackQrPage();
+  void prefetchQr();
+  return true;
+}
+
+function stepPackQr(delta) {
+  const qr = state.qr;
+  if (!qr) return;
+  // 손으로 넘기기 시작했으면 자동 넘김은 비켜 준다. 둘이 동시에 장을 옮기면 어느 쪽도 못 쫓는다.
+  stopQrPlay();
+
+  const last = qr.total - 1;
+  // 끝에서 되돌아 감지 않는다. 순서대로 찍는 중에 1장으로 돌아가 버리면 어디까지 했는지 잃고,
+  // '다음' 이 잠기는 것이 유일한 "다 찍었다" 신호이기도 하다.
+  if (!goToQrPage(Math.min(Math.max(qr.index + delta, 0), last))) return;
 
   // 방금 누른 버튼이 끝에서 잠기면 크로미움이 포커스를 body 로 떨어뜨린다. 키보드로 넘기던
   // 사람이 자리를 잃지 않도록 반대쪽 버튼으로 옮겨 준다.
@@ -582,12 +666,71 @@ function stepPackQr(delta) {
   else if (active === back && back?.disabled) forward?.focus();
 }
 
+// ------------------------------------------------------------ 자동 넘김
+
+/**
+ * 장을 스스로 넘긴다. **한 바퀴 돌고 마지막 장에서 멈춘다.**
+ *
+ * 되감지 않는 이유는 손으로 넘길 때와 같다: '다음' 이 잠기는 것이 "다 찍었다" 는 유일한
+ * 신호다. 무한히 돌면 그 신호가 사라진다. 한 바퀴에 다 못 읽었으면 폰이 어느 장이 빠졌는지
+ * 알려 주므로, 다시 누르면 된다.
+ *
+ * `setInterval` 이 아니라 `setTimeout` 재귀인 이유는 두 가지다. 프레임이 밀려도 간격이
+ * 누적되지 않고, 속도를 바꾸면 다음 장부터 바로 반영된다.
+ */
+function tickQrPlay() {
+  const qr = state.qr;
+  if (!qr || !qr.playing) return;
+
+  if (qr.index + 1 >= qr.total) {
+    stopQrPlay();
+    return;
+  }
+  // `stepPackQr` 를 쓰지 않는다. 그쪽은 끝에서 포커스를 옮기는데, 타이머가 포커스를 훔치면
+  // 키보드로 화면을 쓰던 사람이 자리를 잃는다.
+  goToQrPage(qr.index + 1);
+  qr.timer = setTimeout(tickQrPlay, qr.dwellMs);
+}
+
+function startQrPlay() {
+  const qr = state.qr;
+  if (!qr || qr.playing || qr.total <= 1) return;
+
+  // 마지막 장에서 누르면 처음부터 다시 돈다 — 그게 '다시 재생' 이다.
+  if (qr.index + 1 >= qr.total) goToQrPage(0);
+
+  qr.playing = true;
+  qr.dwellMs = qrDwellFromUi();
+  qr.timer = setTimeout(tickQrPlay, qr.dwellMs);
+  renderQrPlayButton();
+}
+
+function stopQrPlay() {
+  const qr = state.qr;
+  if (!qr) return;
+  if (qr.timer !== null) {
+    clearTimeout(qr.timer);
+    qr.timer = null;
+  }
+  qr.playing = false;
+  renderQrPlayButton();
+}
+
+function renderQrPlayButton() {
+  const qr = state.qr;
+  setText("pack-qr-play", qr?.playing ? "멈춤" : "자동 넘김");
+  const button = el("pack-qr-play");
+  if (button) button.setAttribute("aria-pressed", qr?.playing ? "true" : "false");
+}
+
 function clearPackQr() {
+  stopQrPlay();
   state.qr = null;
   const section = el("pack-qr");
   if (section) section.dataset.state = "";
   show("pack-qr", false);
   setText("pack-qr-note", "");
+  renderQrPlayButton();
   showPackQrPage();
 }
 
@@ -607,19 +750,22 @@ function qrNote(result, qr) {
     );
   }
 
-  const total = qr.images.length;
+  const total = qr.total;
   if (total === 1) {
+    const bytes = qr.cache.get(1)?.text_bytes;
+    const size = bytes ? `${qrBytes(bytes)} · ` : "";
     return (
-      `${qrBytes(qr.images[0].text_bytes)} · 휴대폰 기본 카메라로 비추면 이 텍스트가 그대로 ` +
-      `보입니다. 거기서 복사해 풀기 탭에 붙여넣으면 그대로 풀립니다.`
+      `${size}휴대폰 기본 카메라로 비추면 이 텍스트가 그대로 보입니다. 거기서 복사해 ` +
+      `풀기 탭에 붙여넣으면 그대로 풀립니다.`
     );
   }
   return (
     `${qrBytes(result.container_bytes)} · QR 코드 한 장에 담기지 않아 ${total}장으로 나눴습니다.\n` +
-    `#1 부터 순서대로 스캔해 메모장에 차례로 이어 붙이고, 그 전체를 풀기 탭에 붙여넣으면 ` +
-    `풀립니다.\n` +
-    `각 장 안에 #1/${total} 부터 #${total}/${total} 까지 순서 표시가 들어 있으니 붙여넣은 뒤 ` +
-    `순서를 확인해 주세요 — 표시 줄은 지우지 않아도 됩니다.`
+    `'자동 넘김' 을 누르고 휴대폰의 '조각 모으기' 앱으로 비추면 알아서 모읍니다 — 순서는 ` +
+    `상관없고, 한 바퀴 돌면 멈춥니다. 남은 장이 있으면 다시 누르세요.\n` +
+    `기본 카메라로 한 장씩 찍어 손으로 이어 붙일 수도 있습니다. 각 장 안에 #1/${total} 부터 ` +
+    `#${total}/${total} 까지 순서 표시가 들어 있으니 붙여넣은 뒤 순서를 확인해 주세요 — ` +
+    `표시 줄은 지우지 않아도 됩니다.`
   );
 }
 
@@ -820,6 +966,20 @@ function wireEvents() {
   el("pack-output-copy")?.addEventListener("click", copyPackOutput);
   el("pack-qr-prev")?.addEventListener("click", () => stepPackQr(-1));
   el("pack-qr-next")?.addEventListener("click", () => stepPackQr(1));
+  el("pack-qr-play")?.addEventListener("click", () =>
+    state.qr?.playing ? stopQrPlay() : startQrPlay(),
+  );
+  // 속도는 도는 중에 바꿔도 다음 장부터 바로 먹는다 (setTimeout 재귀라서).
+  el("pack-qr-speed")?.addEventListener("input", () => {
+    const dwell = qrDwellFromUi();
+    if (state.qr) state.qr.dwellMs = dwell;
+    setText("pack-qr-speed-label", `${dwell}ms`);
+  });
+  // 창이 가려지면 멈춘다. 안 보이는 화면에서 장이 넘어가면 돌아왔을 때 어디인지 알 수 없고,
+  // 폰은 그동안 아무것도 읽지 못한다.
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stopQrPlay();
+  });
 
   el("unpack-pick")?.addEventListener("click", async () => {
     const picked = await invoke("pick_container");

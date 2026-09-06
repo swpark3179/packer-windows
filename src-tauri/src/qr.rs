@@ -25,7 +25,7 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use qrcode::{Color, EcLevel, QrCode};
+use qrcode::{types::Version, Color, EcLevel, QrCode};
 use serde::Serialize;
 
 use crate::armor;
@@ -40,18 +40,29 @@ use crate::error::{Error, Result};
 /// 이 표를 그대로 믿으면 담을 수 있는 것을 못 담는다.
 pub const MAX_SYMBOL_BYTES: usize = 2953;
 
-/// 조각 수 상한. QR 규격의 Structured Append 상한과 같은 16으로 둔다.
+/// 조각 수 상한.
 ///
-/// 이보다 많으면 순서대로 찍어 이어 붙이는 일 자체가 현실적이지 않다. 기술적 한계가 아니라
-/// 사람의 한계라서, 안내 문구도 그렇게 말한다.
-pub const MAX_PIECES: usize = 16;
+/// 한때 16이었다. QR 규격의 Structured Append 상한과 같은 값이었지만 실은 그 규격을 쓰지 않고
+/// 있었고 — 폰의 기본 카메라가 모르기 때문이다 — 진짜 이유는 **사람이 '다음' 을 16번 눌러야
+/// 한다**는 것이었다. 뷰어가 스스로 장을 넘기게 된 지금 그 비용은 초 단위 대기뿐이다.
+///
+/// 128장은 실측으로 본문 약 182,000자 = **컨테이너 약 132 KiB** 다. 자동 넘김을 프레임당
+/// 350 ms 로 두면 한 바퀴가 45초다.
+///
+/// 이 값을 올릴 때 `commands::QR_SOURCE_LIMIT` 를 함께 올리지 않으면 **아무 일도 일어나지
+/// 않는다** — 그쪽이 `plan()` 을 부르기 전에 먼저 자른다.
+pub const MAX_PIECES: usize = 128;
 
-/// 한 심볼의 모듈 수 상한. 버전 40 이 177 이므로 기본값은 사실상 제한 없음이다.
+/// 한 심볼의 모듈 수 상한. 버전 40 이 177, 버전 25 가 117 이다.
 ///
 /// **이 값이 이 기능의 실제 성공률을 쥐고 있다.** 화면에 555px 로 띄우면 버전 40(177모듈)은
-/// 모듈 하나가 3.1px, 96 DPI 기준 0.79mm 다. 실기기에서 버전 40 이 잘 안 읽히면 이 값만 125 로
-/// 내리면 된다 — 조각이 1.5~2배로 늘어나는 대신 모든 심볼이 굵어진다.
-const MAX_MODULES: usize = 177;
+/// 모듈 하나가 3.1px, 96 DPI 기준 0.79mm 다. 그 크기에서는 초점이 맞아도 폰이 놓치는 일이
+/// 잦았다 — `mobile/README.md` 가 인식률로 호소하던 것이 이 조건이다.
+///
+/// 125 로 내리면 조각이 1.5~2배로 늘어나는 대신 모든 심볼이 굵어진다. 예전에는 그 대가가
+/// 비쌌다(16장 상한 안에서 담을 수 있는 크기가 줄었다). 상한을 64로 올리고 뷰어가 스스로
+/// 넘기게 된 지금은 조각이 몇 장 더 느는 것이 초 단위 비용일 뿐이라, 굵은 쪽을 고른다.
+const MAX_MODULES: usize = 125;
 
 /// 규격이 요구하는 조용한 여백(modules). 이게 없으면 어떤 디코더도 심볼을 찾지 못한다.
 ///
@@ -82,42 +93,129 @@ pub struct QrImage {
     pub text_bytes: usize,
 }
 
+/// 나눔이 정해진 상태. 그림은 아직 그리지 않았다.
+///
+/// 그림을 미리 다 그리지 않는 이유는 크기다. 심볼 하나가 base64 로 약 6 KiB 라, 64장을 한
+/// 응답에 실으면 372 KiB 이고 조각 상한을 더 올리면 곧 메가바이트가 된다. 그 정도가 되면
+/// 직렬화·파싱만으로 웹뷰 메인 스레드가 몇 초씩 멈춘다. 대신 [`Self::image`] 로 한 장씩
+/// 꺼내 간다 — 뷰어는 어차피 한 번에 한 장만 보여 준다.
+pub struct QrPlan {
+    texts: Vec<String>,
+    version: Version,
+    level: EcLevel,
+    /// 여백까지 포함한 한 변의 모듈 수. 모든 조각이 같다.
+    png_modules: usize,
+}
+
+/// 나눔의 요약. 응답에 실어 보내는 것은 그림이 아니라 이것이다.
+#[derive(Debug, Serialize, Clone)]
+pub struct QrPlanInfo {
+    pub total: usize,
+    pub png_modules: usize,
+    pub ec_level: String,
+}
+
+impl QrPlan {
+    pub fn total(&self) -> usize {
+        self.texts.len()
+    }
+
+    pub fn info(&self) -> QrPlanInfo {
+        QrPlanInfo {
+            total: self.total(),
+            png_modules: self.png_modules,
+            ec_level: level_name(self.level).to_string(),
+        }
+    }
+
+    /// `index` 는 1부터 센다. 범위를 벗어나면 [`Error::Internal`].
+    pub fn image(&self, index: usize) -> Result<QrImage> {
+        let text = self
+            .texts
+            .get(index.wrapping_sub(1))
+            .ok_or_else(|| Error::Internal(format!("{index}번 QR 조각이 없습니다")))?;
+
+        // 계획을 세울 때 이미 같은 버전·등급으로 인코딩해 봤으므로 여기서 실패할 일은 없다.
+        // 그래도 unwrap 하지 않는다 — 이 경로는 사용자 입력을 타고 다시 들어온다.
+        let code = QrCode::with_version(text.as_bytes(), self.version, self.level)
+            .map_err(|e| png_failed(&e.to_string()))?;
+
+        Ok(QrImage {
+            index,
+            total: self.total(),
+            png_base64: BASE64.encode(to_png(&code)?),
+            png_modules: self.png_modules,
+            ec_level: level_name(self.level).to_string(),
+            text_bytes: text.len(),
+        })
+    }
+}
+
 // ---------------------------------------------------------------- 만들기
 
-/// armor 텍스트를 QR 조각들로 만든다.
+/// armor 텍스트를 몇 조각으로 어떻게 나눌지 정한다.
 ///
 /// 조각 수가 [`MAX_PIECES`] 를 넘거나 어떤 나눔으로도 [`MAX_MODULES`] 안에 못 들어가면
 /// `Ok(None)` 이다. 실패가 아니라 "QR 로 옮길 만한 크기가 아니다" 라는 뜻이다.
-pub fn render(armored: &str) -> Result<Option<Vec<QrImage>>> {
+pub fn plan(armored: &str) -> Result<Option<QrPlan>> {
     let body = armor::body_of(armored)?;
 
     // 한 심볼에 들어가면 그것으로 끝이다. 용량 표를 믿지 않고 실제로 인코딩해 본다.
     let whole = armor::wrap_single_line(&body);
-    if let Some(codes) = encode_uniform(std::slice::from_ref(&whole)) {
-        return images(&codes, std::slice::from_ref(&whole)).map(Some);
+    if let Some(plan) = encode_uniform(vec![whole]) {
+        return Ok(Some(plan));
     }
 
-    // 값싼 하한에서 시작해 조각 수를 하나씩 올린다. 실패하는 시도는 Reed-Solomon 을 돌기 전에
-    // DataTooLong 으로 빠지므로 사실상 공짜다.
+    // 조각 수를 **이분 탐색**한다. 많이 나눌수록 조각이 짧아지므로 "들어가는가" 는 조각 수에
+    // 대해 단조롭다 — 한 번 들어가기 시작하면 그보다 많이 나눠도 들어간다. 예전에는 하한부터
+    // 하나씩 올렸는데, 상한이 16일 때는 몇 번이면 끝나서 공짜였다. 128장에서는 실패하는 큰
+    // 입력마다 수십 번씩 본문 전체를 다시 자르게 되어 값이 붙는다.
+    //
+    // 단조성 가정은 `binary_search_agrees_with_a_linear_scan` 테스트가 지킨다.
     let low = body.len().div_ceil(MAX_SYMBOL_BYTES).max(2);
-    for parts in low..=MAX_PIECES {
-        let cut = armor::pieces(&body, parts);
-        // 4자 정렬 때문에 요청보다 적게 나올 수 있다. 그 개수는 이미 지나온 값이다.
-        if cut.len() != parts {
-            continue;
-        }
-        if let Some(codes) = encode_uniform(&cut) {
-            return images(&codes, &cut).map(Some);
+    if low > MAX_PIECES {
+        return Ok(None);
+    }
+
+    let mut best = None;
+    let (mut lo, mut hi) = (low, MAX_PIECES);
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        match try_parts(&body, mid) {
+            // 들어갔다. 더 적게 나눌 수 있는지 아래를 계속 본다 — 조각이 적을수록 사용자가
+            // 기다리는 시간이 짧다.
+            Some(plan) => {
+                best = Some(plan);
+                if mid == low {
+                    break;
+                }
+                hi = mid - 1;
+            }
+            None => lo = mid + 1,
         }
     }
-    Ok(None)
+    Ok(best)
 }
 
-/// 조각들을 모두 같은 버전·등급으로 인코딩한다. 하나라도 안 들어가면 `None`.
+/// `parts` 조각으로 나눠 같은 규격에 담아 본다.
+///
+/// **실제로 나온 조각 수가 요청보다 적어도 그대로 받는다.** `armor::pieces()` 는 Base64 4자
+/// 묶음을 쪼개지 않으려고 조각 길이를 4의 배수로 올림하므로, 요청한 수가 그대로 나오지 않는
+/// 값이 많다 (본문 2,000자에 65조각을 요청하면 63조각이 나온다). 예전 선형 훑기는 그런 값을
+/// 건너뛰었다 — 어차피 다음 값에서 만나기 때문이다. 이분 탐색에서 같은 짓을 하면 **단조성이
+/// 깨진다**: 되는 조각 수 사이사이에 "안 됨" 이 뚫려 버려 탐색이 답을 넘겨 버린다.
+///
+/// 나온 개수를 그대로 받으면 조각 길이(`per`)가 `parts` 에 대해 단조 감소하므로 "들어가는가"
+/// 도 단조가 된다. `armor::pieces()` 는 요청보다 **많이** 만들지는 않으므로 상한도 지켜진다.
+fn try_parts(body: &str, parts: usize) -> Option<QrPlan> {
+    encode_uniform(armor::pieces(body, parts))
+}
+
+/// 조각들을 모두 같은 버전·등급으로 인코딩할 수 있는지 본다. 하나라도 안 들어가면 `None`.
 ///
 /// 가장 긴 조각으로 규격을 정한다. 등급을 H 부터 훑는 것은 두 가지를 동시에 한다: 담을 수 있는
 /// 가장 튼튼한 등급을 고르고, 모듈 수가 상한을 넘으면 더 낮은 등급(= 더 작은 버전)으로 내려간다.
-fn encode_uniform(pieces: &[String]) -> Option<Vec<QrCode>> {
+fn encode_uniform(pieces: Vec<String>) -> Option<QrPlan> {
     let longest = pieces.iter().max_by_key(|piece| piece.len())?;
     for level in LEVELS {
         // DataTooLong 이면 다음 등급으로. 이 판정이 용량 표를 대신한다.
@@ -128,34 +226,22 @@ fn encode_uniform(pieces: &[String]) -> Option<Vec<QrCode>> {
             continue;
         }
         let version = probe.version();
-        let coded: Option<Vec<QrCode>> = pieces
+        // 가장 긴 조각이 들어갔다고 나머지도 들어간다고 단정하지 않는다 — 짧은 조각이 다른
+        // 인코딩 모드로 접히면서 오히려 더 커지는 경우가 규격상 가능하다.
+        if !pieces
             .iter()
-            .map(|piece| QrCode::with_version(piece.as_bytes(), version, level).ok())
-            .collect();
-        if coded.is_some() {
-            return coded;
+            .all(|piece| QrCode::with_version(piece.as_bytes(), version, level).is_ok())
+        {
+            continue;
         }
+        return Some(QrPlan {
+            texts: pieces,
+            version,
+            level,
+            png_modules: probe.width() + 2 * QUIET_MODULES,
+        });
     }
     None
-}
-
-fn images(codes: &[QrCode], texts: &[String]) -> Result<Vec<QrImage>> {
-    let total = codes.len();
-    codes
-        .iter()
-        .zip(texts)
-        .enumerate()
-        .map(|(at, (code, text))| {
-            Ok(QrImage {
-                index: at + 1,
-                total,
-                png_base64: BASE64.encode(to_png(code)?),
-                png_modules: code.width() + 2 * QUIET_MODULES,
-                ec_level: level_name(code.error_correction_level()).to_string(),
-                text_bytes: text.len(),
-            })
-        })
-        .collect()
 }
 
 /// 모듈 격자를 1비트 회색조 PNG 로 그린다. 1모듈 = 1픽셀.
@@ -238,6 +324,16 @@ mod tests {
         armor::wrap_single_line(&body)
     }
 
+    /// 예전 `render()` 처럼 모든 조각을 그려서 돌려준다. 그림을 다 봐야 하는 테스트용이다.
+    fn render_all(armored: &str) -> Option<Vec<QrImage>> {
+        let plan = plan(armored).unwrap()?;
+        Some(
+            (1..=plan.total())
+                .map(|index| plan.image(index).unwrap())
+                .collect(),
+        )
+    }
+
     /// PNG 을 8비트 회색조 픽셀로 되읽는다. 0 = 검정, 255 = 흰색.
     fn decode_png(png_base64: &str) -> (usize, Vec<u8>) {
         let bytes = BASE64.decode(png_base64).unwrap();
@@ -253,7 +349,7 @@ mod tests {
 
     #[test]
     fn small_text_becomes_one_symbol_at_the_strongest_level() {
-        let images = render(&armored(40)).unwrap().unwrap();
+        let images = render_all(&armored(40)).unwrap();
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].index, 1);
         assert_eq!(images[0].total, 1);
@@ -263,7 +359,7 @@ mod tests {
 
     #[test]
     fn long_text_is_split_into_numbered_pieces_of_equal_size() {
-        let images = render(&armored(10_000)).unwrap().unwrap();
+        let images = render_all(&armored(10_000)).unwrap();
         assert!(images.len() > 1, "나뉘어야 한다: {}", images.len());
         assert!(images.len() <= MAX_PIECES);
 
@@ -277,8 +373,23 @@ mod tests {
     }
 
     #[test]
+    fn every_symbol_stays_under_the_module_cap() {
+        // 이 상한이 인식률을 쥐고 있다. 어떤 크기에서도 넘지 않아야 한다.
+        for len in [40usize, 3_000, 10_000, 100_000] {
+            let Some(plan) = plan(&armored(len)).unwrap() else {
+                continue;
+            };
+            assert!(
+                plan.png_modules <= MAX_MODULES + 2 * QUIET_MODULES,
+                "len={len} 에서 {}모듈",
+                plan.png_modules
+            );
+        }
+    }
+
+    #[test]
     fn png_is_a_1bit_grayscale_image_with_a_quiet_zone() {
-        let images = render(&armored(200)).unwrap().unwrap();
+        let images = render_all(&armored(200)).unwrap();
         let image = &images[0];
 
         let bytes = BASE64.decode(&image.png_base64).unwrap();
@@ -299,7 +410,11 @@ mod tests {
                     || x >= side - QUIET_MODULES
                     || y >= side - QUIET_MODULES;
                 if in_quiet {
-                    assert_eq!(pixels[y * side + x], 255, "여백이 흰색이 아니다: ({x}, {y})");
+                    assert_eq!(
+                        pixels[y * side + x],
+                        255,
+                        "여백이 흰색이 아니다: ({x}, {y})"
+                    );
                 }
             }
         }
@@ -309,44 +424,108 @@ mod tests {
 
     #[test]
     fn splitting_starts_where_one_symbol_runs_out() {
-        // 실측: 본문 2,900자까지는 한 장(버전 40, ECC L), 그보다 크면 나뉜다.
-        // 나뉘면 조각이 짧아져 오히려 더 튼튼한 등급을 쓸 여유가 생긴다.
-        let one = render(&armored(2_900)).unwrap().unwrap();
+        // MAX_MODULES 를 125 로 두었으므로 한 심볼의 상한은 버전 40 이 아니라 버전 25 쪽이다.
+        // 실측: 본문 1,000자까지는 한 장, 그보다 크면 나뉜다.
+        let one = render_all(&armored(1_000)).unwrap();
         assert_eq!(one.len(), 1);
-        assert_eq!(one[0].ec_level, "L");
 
-        let two = render(&armored(3_000)).unwrap().unwrap();
-        assert_eq!(two.len(), 2);
-        assert_eq!(two[0].ec_level, "Q");
+        let more = render_all(&armored(3_000)).unwrap();
+        assert!(more.len() > 1, "{}장", more.len());
+        // 나뉘면 조각이 짧아져 오히려 더 튼튼한 등급을 쓸 여유가 생긴다.
+        assert_ne!(more[0].ec_level, "L");
+    }
+
+    /// 이분 탐색이 옳으려면 "조각 수가 늘면 들어간다" 가 단조여야 한다. 그 가정을 여기서
+    /// 실제로 확인한다 — 어긋나면 `plan()` 이 조용히 더 많은 조각을 고르거나 아예 못 찾는다.
+    #[test]
+    fn binary_search_agrees_with_a_linear_scan() {
+        // 훑기는 조각 수에 제곱으로 비싸다(조각 수마다 그만큼 인코딩한다). 작은 본문 몇 개면
+        // 단조성이 깨지는 모양 — 되는 값 사이에 구멍 —— 은 충분히 드러난다. 실제로 이 테스트가
+        // 처음 잡아낸 것도 본문 2,000자에서였다.
+        for len in [40usize, 1_000, 2_000, 5_000] {
+            let text = armored(len);
+            let body = armor::body_of(&text).unwrap();
+
+            // 한 심볼에 들어가면 탐색을 타지 않는다.
+            if encode_uniform(vec![armor::wrap_single_line(&body)]).is_some() {
+                assert_eq!(plan(&text).unwrap().unwrap().total(), 1, "len={len}");
+                continue;
+            }
+
+            // 조각 수를 하나씩 훑어 "되는지" 를 적는다. 훑기는 조각 수에 제곱으로 비싸므로
+            // (조각 수마다 그만큼 인코딩한다) 답이 나오는 언저리만 본다 — 정렬 때문에 생기는
+            // 구멍은 거기 몰려 있고, 실제로 이 테스트가 처음 잡아낸 것도 그 구간이었다.
+            let low = body.len().div_ceil(MAX_SYMBOL_BYTES).max(2);
+            let high = (low + 24).min(MAX_PIECES);
+            let fits: Vec<Option<usize>> = (low..=high)
+                .map(|parts| try_parts(&body, parts).map(|p| p.total()))
+                .collect();
+
+            // 단조성: 한 번 되기 시작하면 그 위로 구멍이 없어야 한다. 이분 탐색이 옳을 조건이다.
+            let first = fits.iter().position(Option::is_some);
+            if let Some(first) = first {
+                let hole = fits[first..].iter().position(Option::is_none);
+                assert!(
+                    hole.is_none(),
+                    "len={len}: {}장부터 되는데 {}장에서 구멍이 났다",
+                    low + first,
+                    low + first + hole.unwrap()
+                );
+            }
+
+            // 그리고 이분 탐색은 훑기가 찾은 **가장 적은 조각 수**를 그대로 내야 한다.
+            let fewest = fits.iter().flatten().copied().min();
+            let found = plan(&text).unwrap().map(|p| p.total());
+            assert_eq!(
+                found, fewest,
+                "len={len} 에서 이분 탐색이 더 나쁜 답을 냈다"
+            );
+        }
     }
 
     #[test]
     fn refuses_text_that_needs_too_many_pieces() {
-        // 실측: 16조각이면 본문 46,000자쯤이 한계다. 그 위로는 QR 을 내주지 않는다.
-        let most = render(&armored(46_000)).unwrap().unwrap();
-        assert_eq!(most.len(), MAX_PIECES);
+        // 실측: 128조각에 본문 약 182,000자(컨테이너 약 132 KiB)까지 담긴다.
+        let most = plan(&armored(180_000)).unwrap().unwrap();
+        assert!(most.total() <= MAX_PIECES, "{}장", most.total());
+        assert!(
+            most.total() > MAX_PIECES / 2,
+            "{}장 — 한계 근처여야 한다",
+            most.total()
+        );
 
-        assert!(render(&armored(60_000)).unwrap().is_none());
+        assert!(plan(&armored(400_000)).unwrap().is_none());
     }
 
     #[test]
-    fn the_whole_gallery_stays_small_enough_to_ship_over_ipc() {
-        // QR 모듈 패턴은 이미 오류정정 부호라 deflate 가 거의 줄이지 못한다. 그림 한 장이
-        // 대략 모듈수²/8 바이트고, 최악(16장 × 버전 40)이 실측 93 KiB 다. 같은 응답에 이미
-        // 실려 가는 preview(최대 2 MiB) 옆에서는 무시할 만하다. 배율을 손대면 이 값이 조용히
-        // 터질 수 있어 못박아 둔다.
-        let images = render(&armored(46_000)).unwrap().unwrap();
-        assert_eq!(images.len(), MAX_PIECES);
-        let total: usize = images.iter().map(|i| i.png_base64.len()).sum();
+    fn the_plan_response_stays_tiny_no_matter_how_many_pieces() {
+        // 예전에는 조각 그림을 전부 한 응답에 실었다. 64장이면 372 KiB 이고 상한을 더 올리면
+        // 곧 메가바이트가 된다. 이제 응답에 나가는 것은 요약뿐이고, 그림은 한 장씩 꺼내 간다.
+        let plan = plan(&armored(180_000)).unwrap().unwrap();
+        let info = serde_json::to_string(&plan.info()).unwrap();
+        assert!(info.len() < 128, "{info}");
+
+        // 한 장씩 꺼내면 그 한 장은 여전히 작다.
+        let one = plan.image(1).unwrap();
         assert!(
-            total < 160 * 1024,
-            "{}장 합쳐 {total} 바이트 — 너무 크다",
-            images.len()
+            one.png_base64.len() < 16 * 1024,
+            "{} 바이트",
+            one.png_base64.len()
         );
     }
 
     #[test]
+    fn asking_for_a_piece_that_is_not_there_is_an_error() {
+        let plan = plan(&armored(40)).unwrap().unwrap();
+        assert_eq!(plan.total(), 1);
+        assert!(plan.image(1).is_ok());
+        // 1부터 센다. 0도 2도 없다.
+        assert!(plan.image(0).is_err());
+        assert!(plan.image(2).is_err());
+    }
+
+    #[test]
     fn rejects_text_that_is_not_a_container() {
-        assert!(matches!(render("그냥 메모"), Err(Error::NotContainer)));
+        assert!(matches!(plan("그냥 메모"), Err(Error::NotContainer)));
     }
 }

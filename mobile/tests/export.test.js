@@ -8,7 +8,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { MAX_PIECES } from "../www/collector.js";
 import {
   BUSY_DELAY_MS,
   BUSY_HOLD_MS,
@@ -129,16 +128,18 @@ describe("shouldChunk", () => {
   /**
    * **가드 테스트.**
    *
-   * 조각 상한이 16장인 동안에는 합친 텍스트가 아무리 커도 나눠 쓰기 경로를 타지 않는다 —
-   * 그래서 진행 막대도 뜨지 않는다. 그게 옳다: 밀리초짜리 작업에 막대를 띄우는 것은 거짓말이다.
+   * `qr.rs` 의 조각 상한은 128장이고, 조각 하나에 들어가는 armor 본문이 실측 약 1,430자라
+   * 합친 텍스트는 최대 약 183,000자다. 그 크기는 나눠 쓰기 경로를 **탄다** — 브리지 한 번에
+   * 넘기기에 크고, 실제로 몇 초가 걸린다.
    *
-   * `MAX_PIECES` 를 올려서 이 테스트가 깨지면, 그때가 진행 막대가 진짜로 필요해진 시점이다.
-   * `CHUNK_THRESHOLD` 를 그대로 두고 이 단언만 뒤집으면 된다.
+   * 반대로 예전 상한(16장 ≈ 46,000자)에서는 밀리초라 막대를 띄우는 것이 거짓말이었다. 두
+   * 경계를 함께 못박아 둔다. 상한을 다시 움직이면 여기가 먼저 깨져서, 막대를 띄우는 것이
+   * 여전히 정직한지 다시 보게 한다.
    */
-  it("지금 조각 상한에서는 진행 막대가 뜰 일이 없다", () => {
-    // 조각 하나에 들어가는 armor 본문은 실측 약 2,920자다 (`qr.rs` 의 골든 테스트).
-    const biggest = MAX_PIECES * 2_920 + 2 * 32 + 2;
-    assert.equal(shouldChunk("x".repeat(biggest)), false, `${biggest}자`);
+  it("옛 상한(16장)에서는 막대가 뜰 일이 없고, 지금 상한(128장)에서는 뜬다", () => {
+    const joined = (pieces, perPiece) => "x".repeat(pieces * perPiece + 2 * 32 + 2);
+    assert.equal(shouldChunk(joined(16, 2_920)), false, "밀리초짜리 작업에 막대는 거짓말이다");
+    assert.equal(shouldChunk(joined(128, 1_430)), true, "이 크기는 실제로 몇 초가 걸린다");
   });
 });
 
