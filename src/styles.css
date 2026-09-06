@@ -620,6 +620,13 @@ body[data-busy="true"] {
   gap: 6px;
 }
 
+.qr-stream {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
 .qr-nav {
   display: flex;
   align-items: center;

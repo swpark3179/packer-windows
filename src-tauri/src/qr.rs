@@ -244,6 +244,57 @@ fn encode_uniform(pieces: Vec<String>) -> Option<QrPlan> {
     None
 }
 
+// ---------------------------------------------------------------- 스트림 프레임
+
+/// 스트림 모드([`crate::qrstream`]) 프레임 하나를 담은 심볼.
+#[derive(Debug, Serialize)]
+pub struct QrFrame {
+    pub png_base64: String,
+    pub png_modules: usize,
+}
+
+/// 스트림 프레임 payload 로 쓸 수 있는 최대 바이트 수.
+///
+/// [`MAX_MODULES`] 안에 들어가는 가장 큰 바이트 모드 심볼을 실제로 인코딩해 찾는다. 용량 표를
+/// 믿지 않는 이유는 조각 모드와 같다 — 표를 그대로 쓰면 담을 수 있는 것을 못 담는다.
+///
+/// 조각 모드와 달리 등급을 훑지 않고 **L 로 고정**한다. 스트림은 프레임을 놓쳐도 다음 바퀴에
+/// 잡으면 그만이라, 심볼 하나의 오류 정정을 두껍게 하는 것보다 한 프레임에 더 많이 담아
+/// 전체 시간을 줄이는 편이 낫다.
+pub fn stream_capacity() -> usize {
+    // 0xAA 는 영숫자 모드로 접히지 않으므로 순수 바이트 모드 용량이 나온다.
+    let fits = |len: usize| {
+        QrCode::with_error_correction_level(vec![0xAAu8; len], EcLevel::L)
+            .map(|code| code.width() <= MAX_MODULES)
+            .unwrap_or(false)
+    };
+
+    let (mut lo, mut hi) = (1usize, MAX_SYMBOL_BYTES);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
+/// 바이트열 하나를 심볼로 그린다. 스트림 프레임 전용이다.
+///
+/// 조각 모드와 달리 텍스트가 아니라 **원시 바이너리**를 담는다. Base64 를 씌우지 않아 33% 를
+/// 더 담을 수 있고, 폰은 `barcode.bytes` 로 그대로 받는다 (`bridge.js` 의 `barcodeBytes`).
+/// 어차피 사람이 읽을 수 있는 내용이 아니므로 ASCII 로 둘 이유가 없다.
+pub fn render_frame(bytes: &[u8]) -> Result<QrFrame> {
+    let code = QrCode::with_error_correction_level(bytes, EcLevel::L)
+        .map_err(|e| png_failed(&e.to_string()))?;
+    Ok(QrFrame {
+        png_base64: BASE64.encode(to_png(&code)?),
+        png_modules: code.width() + 2 * QUIET_MODULES,
+    })
+}
+
 /// 모듈 격자를 1비트 회색조 PNG 로 그린다. 1모듈 = 1픽셀.
 ///
 /// 8비트로 그려도 파일 크기는 거의 같지만(deflate 가 흡수한다) 원본 버퍼가 8배 커진다. 1비트가
@@ -522,6 +573,36 @@ mod tests {
         // 1부터 센다. 0도 2도 없다.
         assert!(plan.image(0).is_err());
         assert!(plan.image(2).is_err());
+    }
+
+    #[test]
+    fn a_stream_frame_fits_the_module_cap() {
+        let capacity = stream_capacity();
+        // 실측 1,465 바이트 — 125모듈 상한이 버전 27(125모듈)까지 허용하고, 그 등급 L 용량이
+        // 이 값이다. 이 숫자가 스트림의 처리율을 그대로 정하므로(프레임당 1,441 바이트 payload)
+        // 크게 달라지면 README 의 시간 계산도 함께 고쳐야 한다.
+        assert!(
+            (1_200..1_800).contains(&capacity),
+            "스트림 payload 용량이 {capacity} 바이트다 — README 의 처리율도 함께 고칠 것"
+        );
+
+        // 0xAA 를 쓴다. 0x5A('Z') 처럼 영숫자 글자를 쓰면 인코더가 영숫자 모드로 접어 더
+        // 많이 담기고, 그러면 바이트 모드 용량을 재는 것이 아니게 된다.
+        let frame = render_frame(&vec![0xAAu8; capacity]).unwrap();
+        assert!(frame.png_modules <= MAX_MODULES + 2 * QUIET_MODULES);
+        // 한 바이트만 더 넣으면 상한을 넘어야 한다 — 이분 탐색이 최대를 찾았다는 뜻이다.
+        let over = QrCode::with_error_correction_level(vec![0xAAu8; capacity + 1], EcLevel::L);
+        assert!(over.is_err() || over.unwrap().width() > MAX_MODULES);
+    }
+
+    #[test]
+    fn stream_frames_are_all_the_same_size() {
+        // 화면에서 프레임이 넘어갈 때 크기가 들썩이면 폰이 매번 초점을 다시 잡는다.
+        let capacity = stream_capacity();
+        let first = render_frame(&vec![0x01u8; capacity]).unwrap();
+        let second = render_frame(&vec![0xFEu8; capacity]).unwrap();
+        assert_eq!(first.png_modules, second.png_modules);
+        assert!(first.png_modules <= MAX_MODULES + 2 * QUIET_MODULES);
     }
 
     #[test]

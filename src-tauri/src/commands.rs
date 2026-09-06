@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use rand::RngCore;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -34,6 +36,7 @@ use crate::container::{self, ContainerReader, ContainerWriter, Header};
 use crate::crypto;
 use crate::error::{Error, Result};
 use crate::qr;
+use crate::qrstream;
 use crate::safepath;
 
 pub const EVENT_PACK: &str = "pack-progress";
@@ -401,6 +404,98 @@ pub async fn qr_piece(app: AppHandle, index: usize) -> Result<qr::QrImage> {
             .image(index)
     })
     .await
+}
+
+// ---------------------------------------------------------------- QR 스트림
+
+/// 지금 내보내고 있는 스트림.
+///
+/// 조각 모드의 [`QrSlot`] 과 같은 자리다. 담는 것은 **암호화된 컨테이너 바이트**이고, 평문도
+/// 암호도 여기 들어오지 않는다.
+#[derive(Default)]
+pub struct StreamSlot(Mutex<Option<qrstream::Encoder>>);
+
+/// 스트림을 열 때 화면이 받는 것.
+#[derive(Serialize)]
+pub struct StreamOpened {
+    #[serde(flatten)]
+    pub info: qrstream::StreamInfo,
+    /// 프레임 하나를 그린 심볼의 한 변(모듈 수). 화면이 배율을 정하는 데 쓴다.
+    pub png_modules: usize,
+    /// 블록 수에 5% 를 더한 값 — 대략 이만큼 보내면 폰이 다 푼다. 예상 시간을 적는 데 쓴다.
+    pub frames_needed: usize,
+}
+
+/// 컨테이너 파일을 열어 스트림 인코더를 세운다.
+///
+/// armor 텍스트가 아니라 **되돌린 원시 바이트**를 흘린다. Base64 를 한 겹 벗기면 프레임마다
+/// 33% 를 더 담을 수 있고, 폰이 마지막에 다시 armor 로 감싸면 `.txt` 는 똑같이 나온다.
+#[tauri::command]
+pub async fn qr_stream_open(app: AppHandle, path: String) -> Result<StreamOpened> {
+    blocking(move || {
+        let file = PathBuf::from(&path);
+        let text = fs::read(&file)
+            .map_err(|e| Error::io(&format!("{} 를 열 수 없습니다", file.display()), e))?;
+
+        // 초기 버전이 만든 원시 바이너리 컨테이너도 그대로 받는다 (`armor.rs` 의 관용과 같다).
+        let source = match std::str::from_utf8(&text) {
+            Ok(as_text) if armor::looks_armored(as_text) => {
+                let body = armor::body_of(as_text)?;
+                BASE64_STANDARD
+                    .decode(body.as_bytes())
+                    .map_err(|_| Error::ArmorDamaged)?
+            }
+            _ => text,
+        };
+
+        let capacity = qr::stream_capacity();
+        let block_size = capacity.saturating_sub(qrstream::HEADER_LEN).max(1);
+        let encoder = qrstream::Encoder::new(&source, block_size)?;
+
+        // 프레임 하나를 실제로 그려 화면이 쓸 배율을 알아 온다. 모든 프레임이 같은 크기다.
+        let png_modules = qr::render_frame(&encoder.frame(0))?.png_modules;
+        // LT 부호의 실측 오버헤드는 5~8% 다. 넉넉히 잡아 화면이 시간을 과소평가하지 않게 한다.
+        let frames_needed = encoder.blocks() + encoder.blocks().div_ceil(12) + 8;
+
+        let opened = StreamOpened {
+            info: encoder.info(),
+            png_modules,
+            frames_needed,
+        };
+        match app.state::<StreamSlot>().0.lock() {
+            Ok(mut slot) => *slot = Some(encoder),
+            Err(poisoned) => *poisoned.into_inner() = Some(encoder),
+        }
+        Ok(opened)
+    })
+    .await
+}
+
+/// `seq` 번째 프레임의 그림. 화면이 끝없이 세어 올리며 부른다.
+#[tauri::command]
+pub async fn qr_stream_frame(app: AppHandle, seq: u32) -> Result<qr::QrFrame> {
+    blocking(move || {
+        let slot = app.state::<StreamSlot>();
+        let guard = slot
+            .0
+            .lock()
+            .map_err(|_| Error::Internal("스트림을 읽을 수 없습니다".to_string()))?;
+        let encoder = guard
+            .as_ref()
+            .ok_or_else(|| Error::Internal("열려 있는 스트림이 없습니다".to_string()))?;
+        qr::render_frame(&encoder.frame(seq))
+    })
+    .await
+}
+
+/// 스트림을 닫는다. 컨테이너 바이트를 메모리에 붙잡고 있을 이유가 없어지면 곧바로 놓는다.
+#[tauri::command]
+pub async fn qr_stream_close(app: AppHandle) -> Result<()> {
+    match app.state::<StreamSlot>().0.lock() {
+        Ok(mut slot) => *slot = None,
+        Err(poisoned) => *poisoned.into_inner() = None,
+    }
+    Ok(())
 }
 
 #[tauri::command]

@@ -135,6 +135,17 @@
             />
           </div>
           <p class="qr-note tnum" data-pk="pack-qr-note"></p>
+
+          <!--
+            스트림 모드. 조각 모드에 담기지 않는 크기일 때만 나온다.
+            이 QR 은 기본 카메라로 찍어 붙여넣을 수 없다 — 그 사실을 감추지 않는다.
+          -->
+          <div class="qr-stream" data-pk="pack-qr-stream" hidden>
+            <button type="button" class="btn btn-quiet" data-pk="pack-qr-stream-start">
+              스트림으로 보내기
+            </button>
+            <p class="qr-note tnum" data-pk="pack-qr-stream-note"></p>
+          </div>
         </div>
 
         <button type="button" class="btn btn-ghost" data-pk="pack-reveal" hidden>탐색기에서 보기</button>

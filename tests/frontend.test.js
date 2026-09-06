@@ -218,6 +218,17 @@ function handlers(overrides = {}) {
     /// 뷰어가 장을 넘길 때마다 한 장씩 받아 간다. 실제 명령과 같이 1부터 센다.
     qr_piece: async ({ index }) => ({ ...qrPage(index), total: 0 }),
 
+    qr_stream_open: async () => ({
+      total_bytes: 400 * 1024,
+      block_size: 1441,
+      blocks: 285,
+      fingerprint: "0123456789abcdef",
+      png_modules: 133,
+      frames_needed: 317,
+    }),
+    qr_stream_frame: async ({ seq }) => ({ png_base64: `FRAME${seq}`, png_modules: 133 }),
+    qr_stream_close: async () => null,
+
     inspect: async ({ path: p }) => ({
       source: "file",
       path: p,
@@ -772,6 +783,84 @@ describe("QR 코드 — 휴대폰으로 옮기기", () => {
     assert.match(note, /현실적이지 않습니다/, "왜 안 되는지가 빠지면 게으름으로 보인다");
     // 묶기 자체는 성공했다. 경고로 뒤집지 않는다.
     assert.equal(app.hook("pack-status").dataset.kind, "ok");
+  });
+
+  it("조각 모드에 담기면 스트림을 제안하지 않는다", async () => {
+    // 스트림은 기본 카메라로 찍어 붙여넣을 수 없다. 되는 쪽이 있으면 언제나 그쪽이 낫다.
+    const app = await boot({ pack: async () => ({ ...PACK_RESULT, ...qrPlan(3) }) });
+    await packOnce(app, "pw123456");
+    assert.equal(app.visible("pack-qr-stream"), false);
+  });
+
+  it("조각 모드에 안 담기면 스트림을 제안한다", async () => {
+    const app = await boot({
+      pack: async () => ({
+        ...PACK_RESULT,
+        container_bytes: 400 * 1024,
+        qr_plan: null,
+        qr_first: null,
+        qr_omitted: true,
+      }),
+    });
+    await packOnce(app, "pw123456");
+
+    assert.equal(app.visible("pack-qr-stream"), true);
+    // 조각 모드가 왜 안 되는지는 여전히 말해 준다.
+    assert.match(app.text("pack-qr-note"), /128장까지만/);
+  });
+
+  it("스트림은 프레임을 계속 흘려 보내고, 끝을 약속하지 않는다", async () => {
+    const app = await boot({
+      pack: async () => ({
+        ...PACK_RESULT,
+        container_bytes: 400 * 1024,
+        qr_plan: null,
+        qr_first: null,
+        qr_omitted: true,
+      }),
+    });
+    await packOnce(app, "pw123456");
+
+    app.hook("pack-qr-speed").value = "300";
+    await app.click("pack-qr-stream-start");
+
+    assert.equal(app.hook("pack-qr").dataset.state, "stream");
+    assert.equal(app.attr("pack-qr-image", "src"), "data:image/png;base64,FRAME0");
+    // 조각 모드의 넘기기는 뜻이 없다 — 끝이 없으므로 '다음' 도 없다.
+    assert.equal(app.visible("pack-qr-nav"), false);
+
+    // 예상 시간을 그대로 적어 준다. 45분이 걸릴 일을 말없이 시작하면 안 된다.
+    const note = app.text("pack-qr-note");
+    assert.match(note, /317장/);
+    assert.match(note, /분 걸립니다/);
+    // 기본 카메라로 안 된다는 사실을 감추지 않는다.
+    assert.match(note, /기본 카메라로 찍어 붙여넣을 수 없습니다/);
+
+    await app.wait(800);
+    const sent = Number(app.text("pack-qr-index").replace(/[^\d]/g, ""));
+    assert.ok(sent >= 2, `${sent}장만 보냈다`);
+    assert.notEqual(app.attr("pack-qr-image", "src"), "data:image/png;base64,FRAME0");
+  });
+
+  it("스트림을 멈추면 컨테이너를 붙잡고 있지 않는다", async () => {
+    const app = await boot({
+      pack: async () => ({
+        ...PACK_RESULT,
+        container_bytes: 400 * 1024,
+        qr_plan: null,
+        qr_first: null,
+        qr_omitted: true,
+      }),
+    });
+    await packOnce(app, "pw123456");
+
+    await app.click("pack-qr-stream-start");
+    assert.equal(app.text("pack-qr-stream-start"), "그만 보내기");
+
+    await app.click("pack-qr-stream-start");
+    assert.ok(app.called("qr_stream_close"), "붙잡고 있던 바이트를 놓아야 한다");
+    assert.equal(app.text("pack-qr-stream-start"), "스트림으로 보내기");
+    assert.equal(app.visible("pack-qr-image"), false);
   });
 
   it("한도를 알려 주지 않은 응답에도 0 B 같은 숫자를 지어내지 않는다", async () => {

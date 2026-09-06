@@ -11,6 +11,7 @@
 // 돌아야 하고, 그 성질을 지키려고 여기만 선택적으로 둔다.
 
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import fs from "node:fs";
 import path from "node:path";
 import { before, describe, it } from "node:test";
@@ -24,6 +25,17 @@ try {
 }
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+
+// Rust 인코더가 만든 골든 픽스처. 스트림 모드는 이걸 그대로 먹여 검증한다.
+const streamGolden = JSON.parse(
+  fs.readFileSync(path.join(root, "tests", "fixtures", "stream-frames.json"), "utf8"),
+);
+const unhex = (text) =>
+  Uint8Array.from({ length: text.length / 2 }, (_, i) =>
+    Number.parseInt(text.slice(i * 2, i * 2 + 2), 16),
+  );
+const STREAM_SOURCE = unhex(streamGolden.source);
+const STREAM_FRAMES = streamGolden.frames.map(unhex);
 
 // 타이밍을 여기에 다시 적지 않는다. `export.js` 가 바뀌면 테스트가 함께 움직여야 한다.
 const { BUSY_DELAY_MS, BUSY_HOLD_MS } = await import("../www/export.js");
@@ -139,6 +151,11 @@ async function boot(options = {}) {
       listeners.barcodesScanned?.({ barcodes: [{ rawValue: text }] });
       await settle();
     },
+    /** 스트림 프레임 한 장. 바이너리라 `bytes` 로만 온다. */
+    scanFrame: async (frame) => {
+      listeners.barcodesScanned?.({ barcodes: [{ bytes: Array.from(frame) }] });
+      await settle();
+    },
     /** `rawValue` 가 빈 기기를 흉내 낸다 — `bytes` 로 떨어져야 한다. */
     scanBytes: async (text) => {
       const bytes = [...text].map((ch) => ch.charCodeAt(0));
@@ -212,6 +229,66 @@ describe("앱 배선", { skip: JSDOM ? false : "jsdom 이 없습니다 — npm i
 
     await app.scan(pieces[1]);
     assert.equal(app.el("scan-bar").getAttribute("aria-valuenow"), "5");
+  });
+
+  it("스트림 프레임을 알아보고 끝까지 복원해 저장한다", async () => {
+    // 사용자에게 모드를 묻지 않는다 — 첫 심볼의 매직이 말해 준다. 프레임은 Rust 인코더가
+    // 만든 골든 픽스처를 그대로 쓴다 (tests/fixtures/stream-frames.json).
+    const app = await boot();
+    for (const frame of STREAM_FRAMES) {
+      await app.scanFrame(frame);
+      if (app.state() === "complete") break;
+    }
+    // 화면은 복원되는 즉시 넘어가고, 텍스트로 옮겨 적는 일은 그 뒤에 이어진다.
+    await app.wait(60);
+
+    assert.equal(app.state(), "complete", "다 모으면 결과로 넘어가야 한다");
+    assert.ok(app.log.some(([name]) => name === "stopScan"), "카메라를 놓아야 한다");
+    assert.match(app.el("result-summary").textContent, /^1,000바이트를 모두 복원했습니다/);
+
+    await app.click("scan-save");
+
+    // 저장된 텍스트가 `armor::wrap_single_line()` 과 같은 모양이라야 풀기 탭이 그대로 받는다.
+    const [file] = app.written;
+    const lines = file.data.split("\n");
+    assert.equal(lines[0], "-----BEGIN PACKER CONTAINER-----");
+    assert.equal(lines[2], "-----END PACKER CONTAINER-----");
+    assert.equal(lines[1], Buffer.from(STREAM_SOURCE).toString("base64"));
+  });
+
+  it("조각을 모으는 중이면 스트림 프레임에 갈아타지 않는다", async () => {
+    // 모드는 첫 심볼로 정해지고 다 모을 때까지 바뀌지 않는다. 뒤늦게 다른 묶음이 들어와도
+    // 모으던 것을 버리면 안 된다.
+    const app = await boot();
+    await app.scan(makePieces(BODY, 3)[0]);
+    assert.equal(app.el("scan-progress").textContent, "1 / 3");
+
+    await app.scanFrame(STREAM_FRAMES[0]);
+
+    assert.equal(app.el("scan-progress").textContent, "1 / 3", "모으던 것을 잃으면 안 된다");
+    assert.equal(app.el("scan-list").hidden, false, "조각 모드의 칩이 그대로 있어야 한다");
+  });
+
+  it("스트림 모드에서는 칩 대신 막대만 쓴다", async () => {
+    // 순번을 채우는 방식이 아니라 "어느 장이 빠졌는지" 라는 개념 자체가 없다.
+    const app = await boot();
+    await app.scanFrame(STREAM_FRAMES[0]);
+
+    assert.equal(app.el("scan-list").hidden, true);
+    assert.equal(app.el("scan-bar").hidden, false);
+    assert.match(app.el("scan-progress").textContent, /^\d+%$/);
+    assert.match(app.el("scan-total").textContent, /그대로 비추고 계세요/);
+  });
+
+  it("스트림 도중에 다른 묶음이 섞이면 짚어 준다", async () => {
+    const app = await boot();
+    await app.scanFrame(STREAM_FRAMES[0]);
+
+    const other = Uint8Array.from(STREAM_FRAMES[1]);
+    other[4] ^= 0xff; // 지문 한 바이트
+    await app.scanFrame(other);
+
+    assert.match(app.el("scan-status").textContent, /다른 묶음/);
   });
 
   it("조각이 적으면 칩을 그대로 쓴다", async () => {

@@ -15,6 +15,17 @@ import {
 } from "./collector.js";
 
 import {
+  addFrame,
+  createStream,
+  isComplete as streamComplete,
+  looksLikeStream,
+  percent as streamPercent,
+  takeBytes,
+  verify,
+} from "./stream.js";
+
+import {
+  barcodeBytes,
   barcodeText,
   buzz,
   cameraPermission,
@@ -42,6 +53,8 @@ import {
   safeFileName,
 } from "./export.js";
 
+import { armorFromBytes } from "./armor.js";
+
 // ---------------------------------------------------------------- 안내 문구
 
 const REJECT_TEXT = {
@@ -50,6 +63,12 @@ const REJECT_TEXT = {
   unaligned: "조각이 잘려 들어왔습니다. 다시 비춰 주세요.",
   range: "순번이 올바르지 않습니다.",
   structure: "Packer 조각의 모양이 아닙니다.",
+};
+
+const STREAM_REJECT_TEXT = {
+  "not-stream": "Packer 가 만든 QR 이 아닙니다.",
+  damaged: "프레임을 온전히 읽지 못했습니다. 조금 더 가까이서 다시 비춰 주세요.",
+  range: "프레임의 값이 올바르지 않습니다.",
 };
 
 const CONFLICT_TEXT = {
@@ -61,8 +80,12 @@ const CONFLICT_TEXT = {
 // ---------------------------------------------------------------- 상태
 
 const state = {
-  /// 지금 모으고 있는 조각들.
+  /// 지금 모으고 있는 조각들 (조각 모드).
   collection: createCollection(),
+  /// 지금 모으고 있는 프레임들 (스트림 모드). 첫 심볼의 매직으로 어느 쪽인지 정해진다.
+  stream: createStream(),
+  /// `null` | `"pieces"` | `"stream"`. 한 번 정해지면 다 모을 때까지 바뀌지 않는다.
+  mode: null,
   /// 다 모아 합친 텍스트 (아직이면 null).
   joined: null,
   scanning: false,
@@ -199,6 +222,8 @@ function renderChips() {
 }
 
 function render() {
+  if (state.mode === "stream") return renderStream();
+
   const { collection } = state;
   const total = collection.total;
   const got = collection.pieces.size;
@@ -216,6 +241,36 @@ function render() {
   }
 
   renderChips();
+}
+
+/**
+ * 스트림 모드의 진행 표시.
+ *
+ * 여기에는 칩이 없다. 순번을 채우는 방식이 아니라 **아무 프레임이나 모으면 되는** 방식이라,
+ * "어느 장이 빠졌는지" 라는 개념 자체가 없다 — 그게 이 모드의 요점이다. 그래서 조각 모드가
+ * 칩으로 말하던 것을 여기서는 막대와 퍼센트가 말한다.
+ */
+function renderStream() {
+  const { stream } = state;
+  const done = streamPercent(stream);
+
+  setText("scan-progress", `${done}%`);
+  setText(
+    "scan-total",
+    done === 100 ? "다 모았습니다" : "그대로 비추고 계세요 — 순서는 상관없습니다",
+  );
+
+  show("scan-list", false);
+  show("scan-bar", true);
+  const fill = el("scan-bar-fill");
+  if (fill) fill.style.width = `${done}%`;
+  const bar = el("scan-bar");
+  if (bar) {
+    bar.setAttribute("role", "progressbar");
+    bar.setAttribute("aria-valuemin", "0");
+    bar.setAttribute("aria-valuemax", "100");
+    bar.setAttribute("aria-valuenow", String(done));
+  }
 }
 
 // ---------------------------------------------------------------- 스캔
@@ -304,13 +359,30 @@ async function endScan() {
   state.listeners = [];
 }
 
+/**
+ * 심볼 하나를 받는다.
+ *
+ * **사용자에게 모드를 묻지 않는다.** 첫 심볼의 매직(`PQS1`)이 스트림 프레임인지 조각인지
+ * 말해 주므로 그걸로 정하고, 한 번 정해지면 다 모을 때까지 바꾸지 않는다 — 도중에 다른 모드의
+ * 심볼이 들어오면 그건 다른 묶음이 섞인 것이다.
+ */
 function handleBarcode(barcode) {
   if (!state.scanning) return;
+
+  const bytes = barcodeBytes(barcode);
+  if (state.mode === null && looksLikeStream(bytes)) state.mode = "stream";
+  if (state.mode === "stream") {
+    handleStreamFrame(bytes);
+    return;
+  }
 
   const text = barcodeText(barcode);
   if (text === "") return;
 
   const result = addPiece(state.collection, text);
+  // 조각을 하나라도 제대로 받았으면 모드를 잠근다. 뒤늦게 다른 묶음의 스트림 프레임이 들어와도
+  // 모으던 것을 버리고 갈아타지 않는다.
+  if (result.status !== "rejected") state.mode = "pieces";
 
   // 같은 심볼이 계속 눈에 들어오는 것이 정상이다. 아무 일도 없었던 것처럼 넘어간다 —
   // 여기서 화면을 건드리거나 진동하면 쓸 수 없는 앱이 된다.
@@ -333,6 +405,28 @@ function handleBarcode(barcode) {
   warn(REJECT_TEXT[result.reason] ?? "읽을 수 없는 QR 입니다.", "warn");
 }
 
+/// 스트림 프레임 하나. 조각 모드와 달리 **순번을 채우는 것이 아니라** 풀린 블록을 센다.
+function handleStreamFrame(bytes) {
+  const result = addFrame(state.stream, bytes);
+
+  // 연속 스캔은 같은 심볼을 초당 여러 번 읽는다. 아무 일도 없었던 것처럼 넘어간다.
+  if (result.status === "duplicate") return;
+
+  if (result.status === "added") {
+    state.lastWarning = "";
+    void buzz("tick");
+    render();
+    if (streamComplete(state.stream)) void finishStream();
+    return;
+  }
+
+  if (result.status === "conflict") {
+    warn("다른 묶음의 QR 입니다. 한 묶음만 비춰 주세요.", "warn");
+    return;
+  }
+  warn(STREAM_REJECT_TEXT[result.reason] ?? "읽을 수 없는 QR 입니다.", "warn");
+}
+
 async function finish() {
   // 합치기를 먼저 한다. 여기서 실패하면 카메라를 끄지 않고 계속 모을 수 있어야 한다.
   let joined;
@@ -343,14 +437,65 @@ async function finish() {
     return;
   }
 
-  state.joined = joined;
-  await endScan();
-
-  setState("complete");
-  setText(
-    "result-summary",
+  await showResult(
+    joined,
     `${state.collection.total}장을 모두 읽어 ${joined.length.toLocaleString("ko-KR")}자로 합쳤습니다.`,
   );
+}
+
+/**
+ * 스트림 모드를 마무리한다.
+ *
+ * 조각 모드와 달리 할 일이 하나 더 있다. 프레임이 실어 나른 것은 **Base64 를 벗긴 원시
+ * 바이트**라서(프레임마다 33% 를 더 담기 위해서다) 여기서 다시 armor 로 감싸야 한다. 수 MB 면
+ * 그 옮겨 적기만으로 몇 초가 걸리므로 조각으로 나눠 돌고 진행 막대에 보고한다 — 1단계에서
+ * 만들어 둔 막대가 실제로 값을 하는 자리다.
+ */
+async function finishStream() {
+  let bytes;
+  try {
+    bytes = takeBytes(state.stream);
+  } catch (error) {
+    warn(`복원하지 못했습니다: ${reason(error)}`, "bad");
+    return;
+  }
+
+  // 카메라를 먼저 끈다. 옮겨 적는 동안 프레임이 계속 들어오면 화면만 붐빈다.
+  await endScan();
+  setState("complete");
+  setText("result-summary", "");
+  setText("result-note", "");
+
+  startBusy("armor");
+  let joined;
+  try {
+    joined = await armorFromBytes(bytes, tickBusy);
+  } catch (error) {
+    await stopBusy();
+    setState("scanning");
+    warn(`옮겨 적지 못했습니다: ${reason(error)}`, "bad");
+    return;
+  }
+  await stopBusy();
+
+  // 지문이 어긋나면 여기서 말해 준다. 조용히 넘기면 PC 의 풀기 탭에서 "손상되었습니다" 로만
+  // 나타나고, 그때는 무엇이 문제였는지도 모른 채 처음부터 다시 찍어야 한다.
+  const sound = await verify(state.stream, bytes).catch(() => true);
+  const warning = sound ? "" : "\n복원한 내용이 보낸 쪽과 다릅니다 — 다시 모으는 편이 좋습니다.";
+
+  await showResult(
+    joined,
+    `${bytes.length.toLocaleString("ko-KR")}바이트를 모두 복원했습니다.${warning}`,
+  );
+}
+
+/// 결과 화면으로 넘어간다. 두 모드가 함께 쓴다.
+async function showResult(joined, summary) {
+  state.joined = joined;
+  if (state.scanning) await endScan();
+
+  setState("complete");
+  setText("result-summary", summary);
   setText("result-note", "");
   resetExportProgress();
 
@@ -373,6 +518,7 @@ const NUMBER = new Intl.NumberFormat("ko-KR");
 const PHASE_TEXT = {
   save: "저장하는 중",
   share: "보낼 파일을 쓰는 중",
+  armor: "텍스트로 옮겨 적는 중",
 };
 
 /**
@@ -400,9 +546,12 @@ function renderExportProgress({ done, total, phase }) {
       delete fill.dataset.indeterminate;
     }
     bar?.setAttribute("aria-valuenow", String(percent));
+    // 저장·보내기는 글자를 세고, 옮겨 적기는 바이트를 센다. 단위를 틀리게 적으면 사용자가
+    // 파일 크기를 오해한다.
+    const unit = phase === "armor" ? "바이트" : "자";
     setText(
       "export-progress-label",
-      `${name} ${percent}% · ${NUMBER.format(done)} / ${NUMBER.format(total)}자`,
+      `${name} ${percent}% · ${NUMBER.format(done)} / ${NUMBER.format(total)}${unit}`,
     );
   } else {
     if (fill) {
@@ -560,6 +709,8 @@ async function runExport(mode) {
 
 async function reset() {
   state.collection = createCollection();
+  state.stream = createStream();
+  state.mode = null;
   state.joined = null;
   state.lastWarning = "";
   resetExportProgress();

@@ -58,6 +58,7 @@ src-tauri/src/
   commands.rs           Tauri 명령 + 파이프라인 조립 + 진행률
   armor.rs              Base64 텍스트 껍데기 (복사·붙여넣기 가능한 형태)
   qr.rs                 QR 나눔 계획과 조각 그림 (한 장씩 그린다)
+  qrstream.rs           스트림 모드 — 파운틴(LT) 부호 인코더
   container.rs          컨테이너 헤더와 청크 프레이밍
   crypto.rs             Argon2id 키 유도 + AES-256-GCM
   archive.rs            트리 순회, 매니페스트 직렬화, 복원
@@ -197,6 +198,65 @@ ISO-8859-1 이나 UTF-8 로 제각기 짐작하는데, 우리 payload 는 전부
 이 관용은 리더에만 있고 라이터는 그대로다. `.txt` 형식은 달라지지 않는다. 다만 조각을 이어 붙인
 텍스트는 이 변경 이전 빌드에서 `ArmorDamaged` 가 된다.
 
+### 스트림 모드 (파운틴 부호) — 조각 모드에 안 담기는 크기
+
+조각 모드의 벽은 용량이 아니라 **놓친 한 장**이다. 순번이 고정돼 있으니 한 장을 놓치면 그
+장이 다시 올 때까지 기다려야 하고, 순차 슬라이드쇼에서 그건 한 바퀴를 통째로 다시 도는 일이다.
+쿠폰 수집가 문제라 장수가 늘수록 급격히 나빠진다 — 10 MB(약 4,800장 상당)를 5% 놓치며 찍으면
+24분이 아니라 한 시간이 넘는다.
+
+LT(Luby Transform) 부호는 그 항을 없앤다. 프레임마다 **소스 블록 몇 개를 XOR 한 것**을 담고,
+어떤 블록을 골랐는지는 프레임 번호를 시드로 한 난수열이 정한다. 받는 쪽은 아무 프레임이나
+K(1+ε)개쯤 모으면 전부 풀 수 있다. 그래서 화면은 끝없이 돌기만 하면 되고, 놓친 프레임을
+되찾으러 갈 일이 없다.
+
+**대신 기본 카메라로 찍어 붙여넣을 수 없다.** 프레임 하나는 XOR 된 바이트 덩어리라 사람이
+이어 붙일 방법이 없고, 휴대폰의 [`조각 모으기`](mobile/README.md) 앱이 **필수**가 된다. 위에서
+자랑한 성질을 잃는 것이므로 **조각 모드를 대체하지 않고 옆에 둔다** — 컨테이너가 132 KiB 안이면
+조각 모드만 내놓고, 넘을 때만 스트림을 제안한다. 화면도 그 사실을 감추지 않고 적는다.
+
+프레임 = 헤더 24바이트 + payload. 조각 모드와 달리 텍스트가 아니라 **원시 바이너리**를 담는다 —
+Base64 를 한 겹 벗기면 33% 를 더 담을 수 있고, 어차피 사람이 읽을 내용이 아니다. 폰은
+`barcode.bytes` 로 그대로 받는다.
+
+| offset | size | 내용 |
+| --- | --- | --- |
+| 0 | 4 | 매직 `PQS1` — 폰이 두 모드를 이걸로 가른다 |
+| 4 | 8 | 컨테이너 지문 (SHA-256 앞 8바이트) |
+| 12 | 4 | 컨테이너 전체 바이트 수 |
+| 16 | 2 | 블록 크기 |
+| 18 | 4 | 프레임 번호 = PRNG 시드 |
+| 22 | 2 | payload CRC-16 |
+
+블록 수는 싣지 않는다. `ceil(전체 / 블록크기)` 로 양쪽이 같은 값을 계산하므로, 실어 보내면
+어긋날 수 있는 자리만 하나 늘어난다.
+
+**처리율.** payload 는 프레임당 1,441바이트다(`qr::stream_capacity()` 1,465에서 헤더 24를 뺀
+값 — 125모듈 상한이 버전 27까지 허용한다). 프레임당 350ms 면 **초당 약 4.1 KB**:
+
+| 컨테이너 | 프레임 | 걸리는 시간 |
+| --- | --- | --- |
+| 1 MB | 약 760 | 약 4분 |
+| 10 MB | 약 7,800 | 약 45분 |
+| 16 MiB (상한) | 약 12,500 | 약 73분 |
+
+화면은 시작하기 전에 이 숫자를 그대로 적는다. 45분이 걸릴 일을 말없이 시작하면 안 된다.
+16 MiB 상한은 "여기까지가 쓸 만하다" 가 아니라 **"여기부터는 확실히 아니다"** 라는 선이다 —
+컨테이너는 어차피 텍스트라서 클립보드(64 MiB)나 메일 첨부가 몇 초면 끝난다. QR 이 이기는 경우는
+물리적으로 망이 끊긴 자리뿐이다.
+
+**두 언어가 같은 난수열을 내야 한다.** 인코더는 `src-tauri/src/qrstream.rs`, 디코더는
+`mobile/www/stream.js` 다. 블록 선택이 한 비트라도 어긋나면 프레임은 멀쩡히 읽히는데 XOR 이
+안 맞아 **한참 뒤 복호화 실패로만** 나타난다. 그래서 표준 라이브러리 RNG 를 쓰지 않고 32비트
+xorshift 를 규격으로 못박고(자바스크립트에 64비트 정수가 없다 — `Math.imul` 로 그대로 옮겨진다),
+골든 픽스처 `mobile/tests/fixtures/stream-frames.json` 이 양쪽에서 붙잡는다:
+`src-tauri/tests/stream_format.rs` 는 인코더가 픽스처와 바이트 단위로 같은지 보고,
+`mobile/tests/stream.test.js` 는 같은 픽스처를 디코딩해 원본이 나오는지 본다.
+
+시드는 그대로 쓰지 않고 한 번 섞는다. 프레임 번호는 0, 1, 2, … 로 붙는데 xorshift 는 이웃한
+시드에서 이웃한 첫 출력을 내고, 그 첫 출력이 곧 **차수**다. 섞지 않으면 초반에 차수 1 프레임이
+나오지 않아 디코딩이 시작조차 못 한다 — 실제로 그 테스트가 이 버그를 잡았다.
+
 ### 설계 근거
 
 - **청크 단위 암호화** — 원샷 GCM 은 평문 전체를 메모리에 올려야 하고 키/nonce 당 약 64 GiB
@@ -233,7 +293,7 @@ ISO-8859-1 이나 UTF-8 로 제각기 짐작하는데, 우리 payload 는 전부
 | 탭 | `tab[data-tab=pack\|unpack]`, `panel[data-tab=pack\|unpack]` |
 | 묶기 | `pack-dropzone` `pack-list` `pack-empty` `pack-summary` `pack-clear` `pack-add-files` `pack-add-folders` `pack-key` `pack-key-toggle` `pack-key-strength` `pack-submit` `pack-progress` `pack-progress-fill` `pack-progress-label` `pack-status` `pack-reveal` |
 | 결과 텍스트 | `pack-output` `pack-output-text` `pack-output-copy` `pack-output-note` |
-| 결과 QR | `pack-qr` (`data-state=single\|split\|toobig`) `pack-qr-image` `pack-qr-note` `pack-qr-nav` `pack-qr-prev` `pack-qr-next` `pack-qr-index` `pack-qr-play` `pack-qr-speed` `pack-qr-speed-label` |
+| 결과 QR | `pack-qr` (`data-state=single\|split\|toobig\|stream`) `pack-qr-image` `pack-qr-note` `pack-qr-nav` `pack-qr-prev` `pack-qr-next` `pack-qr-index` `pack-qr-play` `pack-qr-speed` `pack-qr-speed-label` `pack-qr-stream` `pack-qr-stream-start` `pack-qr-stream-note` |
 | 풀기 | `unpack-dropzone` `unpack-pick` `unpack-file` `unpack-file-name` `unpack-file-meta` `unpack-text` `unpack-text-clear` `unpack-source-note` `unpack-key` `unpack-key-toggle` `unpack-key-hint` `unpack-dest` `unpack-dest-pick` `unpack-submit` `unpack-progress` `unpack-progress-fill` `unpack-progress-label` `unpack-status` `unpack-reveal` |
 | 목록 행 | `row-template` (안에 `[data-field=name]` `[data-field=meta]` `[data-pk=row-remove]`) |
 

@@ -41,8 +41,11 @@ const state = {
   items: [],
   /// 방금 묶어 낸 결과. `{ dest, text }`
   packed: null,
-  /// 결과를 담은 QR 코드 그림들과 지금 보고 있는 장. `{ images, index }` (없으면 null)
+  /// 결과 QR 의 나눔과 지금 보고 있는 장.
+  /// `{ total, pngModules, index, cache, playing, timer, dwellMs }` (없으면 null)
   qr: null,
+  /// 스트림 모드로 흘려 보내는 중. `{ seq, timer, info, sent }` (아니면 null)
+  stream: null,
   /// 풀어낼 대상. `{ kind: "file" | "text", info, text }`
   source: null,
 };
@@ -547,6 +550,100 @@ function renderPackQr(result) {
   setText("pack-qr-note", qrNote(result, state.qr));
   showPackQrPage();
   void prefetchQr();
+
+  // 조각 모드에 담기지 않는 크기면 스트림 모드를 제안한다. 담기는 크기면 제안하지 않는다 —
+  // 스트림은 기본 카메라로 찍어 붙여넣을 수 없어서, 되는 쪽이 있으면 언제나 그쪽이 낫다.
+  show("pack-qr-stream", !state.qr && Boolean(state.packed));
+  setText("pack-qr-stream-note", "");
+}
+
+// ------------------------------------------------------------ 스트림 모드
+
+/**
+ * 파운틴 부호로 끝없이 흘려 보낸다.
+ *
+ * 조각 모드와 달리 **끝이 없다.** 아무 프레임이나 충분히 모으면 폰이 스스로 다 풀고 화면을
+ * 바꾸므로, 여기서는 멈출 시점을 알 수 없고 알 필요도 없다. 그래서 '다음이 잠긴다' 는 신호가
+ * 성립하지 않고, 대신 보낸 프레임 수와 예상 시간을 적어 준다.
+ */
+async function startQrStream() {
+  if (!state.packed) return;
+  stopQrPlay();
+
+  let opened;
+  try {
+    opened = await invoke("qr_stream_open", { path: state.packed.dest });
+  } catch (error) {
+    setText("pack-qr-stream-note", `스트림을 열지 못했습니다: ${errorText(error)}`);
+    return;
+  }
+
+  state.stream = { seq: 0, timer: null, info: opened, sent: 0 };
+  const section = el("pack-qr");
+  if (section) section.dataset.state = "stream";
+  show("pack-qr-nav", false);
+  show("pack-qr-image", true);
+
+  const minutes = Math.max(1, Math.round((opened.frames_needed * qrDwellFromUi()) / 60000));
+  setText(
+    "pack-qr-note",
+    `${qrBytes(opened.total_bytes)} · 프레임 약 ${opened.frames_needed.toLocaleString("ko-KR")}장, ` +
+      `대략 ${minutes}분 걸립니다.\n` +
+      `이 QR 은 기본 카메라로 찍어 붙여넣을 수 없습니다 — 휴대폰의 '조각 모으기' 앱이 ` +
+      `필요합니다. 순서는 상관없고 놓친 프레임도 되찾을 필요가 없습니다. 다 모이면 폰이 ` +
+      `알아서 멈춥니다.`,
+  );
+  setText("pack-qr-stream-note", "");
+  await tickQrStream();
+}
+
+async function tickQrStream() {
+  const stream = state.stream;
+  if (!stream) return;
+
+  let frame;
+  try {
+    frame = await invoke("qr_stream_frame", { seq: stream.seq });
+  } catch {
+    // 결과가 바뀌었거나 스트림이 닫혔다. 조용히 멈춘다.
+    stopQrStream();
+    return;
+  }
+  if (state.stream !== stream) return;
+
+  const image = el("pack-qr-image");
+  if (image) {
+    image.src = `data:image/png;base64,${frame.png_base64}`;
+    const modules = Number(frame.png_modules) || 0;
+    if (modules > 0) {
+      image.style.width = `${modules * Math.max(3, Math.min(10, Math.floor(560 / modules)))}px`;
+    }
+    image.alt = "묶은 결과를 흘려 보내는 QR 코드";
+  }
+
+  stream.seq += 1;
+  stream.sent += 1;
+  setText("pack-qr-index", `${stream.sent.toLocaleString("ko-KR")} 프레임`);
+  setText("pack-qr-stream-note", "보내는 중입니다. 폰이 다 모으면 알아서 멈춥니다.");
+  setText("pack-qr-stream-start", "그만 보내기");
+
+  stream.timer = setTimeout(() => void tickQrStream(), qrDwellFromUi());
+}
+
+function stopQrStream() {
+  const stream = state.stream;
+  if (!stream) return;
+  if (stream.timer !== null) clearTimeout(stream.timer);
+  state.stream = null;
+  // 컨테이너 바이트를 붙잡고 있을 이유가 없어졌다. 곧바로 놓는다.
+  void invoke("qr_stream_close").catch(() => {});
+
+  setText("pack-qr-stream-start", "스트림으로 보내기");
+  setText("pack-qr-stream-note", "");
+  setText("pack-qr-index", "");
+  const section = el("pack-qr");
+  if (section) section.dataset.state = "toobig";
+  show("pack-qr-image", false);
 }
 
 /// 슬라이더가 있으면 그 값을, 없으면 기본값을.
@@ -725,6 +822,8 @@ function renderQrPlayButton() {
 
 function clearPackQr() {
   stopQrPlay();
+  stopQrStream();
+  show("pack-qr-stream", false);
   state.qr = null;
   const section = el("pack-qr");
   if (section) section.dataset.state = "";
@@ -980,6 +1079,9 @@ function wireEvents() {
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) stopQrPlay();
   });
+  el("pack-qr-stream-start")?.addEventListener("click", () =>
+    state.stream ? stopQrStream() : void startQrStream(),
+  );
 
   el("unpack-pick")?.addEventListener("click", async () => {
     const picked = await invoke("pick_container");
