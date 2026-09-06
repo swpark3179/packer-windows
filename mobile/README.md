@@ -34,7 +34,7 @@ www/bridge.js      네이티브 호출과 와이어 값
 www/app.js         둘을 화면에 잇는 배선. data-pk 훅으로만 DOM 을 만진다.
 www/index.html     훅만 있는 마크업
 www/styles.css     화면
-scripts/           네이티브 필수 설정 패치 · 릴리스 버전 주입 (둘 다 멱등)
+scripts/           네이티브 필수 설정 패치 · 릴리스 버전 주입 (둘 다 멱등) · Play 업로드
 tests/             node:test
 ```
 
@@ -262,6 +262,9 @@ npm test
 - `tests/set-native-version.test.js` — 릴리스 버전을 네이티브에 넣는 스크립트를 실제 CLI 로
   돌려 확인한다. `cap add` 템플릿이 바뀌면 앵커 정규식이 조용히 빗나가는데, 그러면 릴리스가
   1.0 (1) 로 빌드돼 **두 번째 TestFlight 업로드에서야** 터진다.
+- `tests/upload-to-play.test.js` — 가짜 Play 서버를 세워 업로드 스크립트를 실제 CLI 로 돌리고,
+  JWT 서명과 오간 요청을 그대로 검사한다. 이쪽은 진짜로 올려 보기 전에는 맞는지 알 길이 없어서,
+  틀리면 릴리스 당일에야 드러난다.
 
 실기기 확인은 이렇게 한다:
 
@@ -289,9 +292,14 @@ npm test
 
 ## 릴리스
 
-`.github/workflows/release-mobile.yml` 이 서명된 APK 를 GitHub 릴리스에 붙이고 IPA 를 TestFlight
-에 올린다. Actions 탭에서 손으로 실행한다. 준비해야 하는 GitHub secret 과 애플·안드로이드 자격
-증명을 만드는 방법은 [`RELEASE.md`](RELEASE.md) 에 있다.
+`.github/workflows/release-mobile.yml` 이 서명된 APK 를 GitHub 릴리스에 붙이고, AAB 를 Google
+Play 트랙에, IPA 를 TestFlight 에 올린다. Actions 탭에서 손으로 실행한다. 준비해야 하는 GitHub
+secret 과 Play·애플·안드로이드 자격 증명을 만드는 방법은 [`RELEASE.md`](RELEASE.md) 에 있다.
+
+**Play 에 처음 올릴 때는 손이 한 번 필요하다** — Play Developer API 는 이미 Play Console 에 있는
+앱에만 번들을 올릴 수 있어서, 앱을 만들고 첫 AAB 를 올리는 것까지는 사람이 해야 한다. 그리고
+Play 는 앱을 자기 키로 다시 서명하므로 **GitHub 릴리스의 APK 와 Play 에서 받은 앱은 서로
+덮어쓰지 못한다.** 둘 다 `RELEASE.md` 2절에 적어 두었다.
 
 버전은 `mobile-v*` 태그에서 계산하므로 데스크톱 `v*` 릴리스와 섞이지 않는다 — 앱만 고쳤을 때
 데스크톱 버전이 따라 오르지 않는다. 빌드 직전에 `scripts/set-native-version.mjs` 가
