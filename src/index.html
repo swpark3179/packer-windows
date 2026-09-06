@@ -134,6 +134,30 @@
               hidden
             />
           </div>
+
+          <!--
+            놓친 장 부르기. 폰이 "남은 순번 3, 7, 12~15" 라고 알려 주면 그 글자를 그대로 넣어
+            그 장들만 불러낸다 — 한 바퀴를 통째로 다시 돌지 않아도 된다.
+            여러 장을 넣으면 그 목록만 되풀이해 돈다 (main.js 의 applyQrGoto 참고).
+          -->
+          <div class="qr-jump" data-pk="pack-qr-jump" hidden>
+            <label class="sr-only" for="pack-qr-goto">놓친 장 번호</label>
+            <input
+              class="input"
+              id="pack-qr-goto"
+              data-pk="pack-qr-goto"
+              type="text"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="놓친 장 번호 (예: 3, 7, 12~15)"
+            />
+            <button type="button" class="btn btn-quiet" data-pk="pack-qr-goto-go">그 장 보기</button>
+            <button type="button" class="btn btn-quiet" data-pk="pack-qr-goto-clear" hidden>
+              전체로 돌아가기
+            </button>
+          </div>
+          <p class="qr-note qr-jump-note tnum" data-pk="pack-qr-goto-note"></p>
+
           <p class="qr-note tnum" data-pk="pack-qr-note"></p>
 
           <!--

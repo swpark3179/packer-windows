@@ -212,6 +212,9 @@ export function createStream() {
     pending: [],
     /// 이미 본 프레임 번호. 같은 심볼이 초당 여러 번 들어온다.
     seen: new Set(),
+    /// 이미 본 번호가 다시 들어온 횟수. 진행에는 쓰이지 않지만 **화면이 이걸로 진단한다** —
+    /// 새 프레임 없이 이 숫자만 오르면 PC 화면이 멈춰 있다는 뜻이다 (`app.js` 의 계기).
+    duplicates: 0,
   };
 }
 
@@ -285,6 +288,7 @@ export function addFrame(stream, bytes) {
 
   // 연속 스캔은 같은 심볼을 초당 여러 번 읽는다. 아무 일도 없었던 것처럼 넘어가야 한다.
   if (stream.seen.has(parsed.seq)) {
+    stream.duplicates += 1;
     return { status: "duplicate", got: stream.solvedCount, need: stream.blocks };
   }
   stream.seen.add(parsed.seq);
@@ -307,6 +311,59 @@ export function isComplete(stream) {
 export function percent(stream) {
   if (stream.blocks === 0) return 0;
   return Math.round((stream.solvedCount / stream.blocks) * 100);
+}
+
+/**
+ * 이만큼 받으면 대개 다 풀린다 — **`commands.rs` 의 `frames_needed` 와 같은 식이다.**
+ *
+ * 보내는 쪽(PC)은 이 값으로 예상 시간을 적고, 받는 쪽(폰)은 "얼마나 왔는지" 를 이 값으로
+ * 잰다. 두 숫자가 다르면 같은 스트림을 두고 두 화면이 다른 말을 하게 되므로 식을 옮겨 적었다.
+ * 규격이 아니라 **어림**이라서 어긋나도 복원은 되지만, 그때는 화면이 서로 다른 시간을
+ * 약속한다. `commands.rs` 를 고치면 여기도 함께 고쳐야 한다 (`tests/stream.test.js` 가 두
+ * 식을 나란히 붙잡는다).
+ *
+ * LT 부호의 실측 오버헤드는 5~8% 다. 블록 수의 1/12(≈8.3%)에 상수 8을 얹어 넉넉히 잡는다 —
+ * 진행률이 100% 를 눈앞에 두고 한참 서 있는 것보다, 조금 일찍 끝나는 편이 낫다.
+ */
+export function framesNeeded(blocks) {
+  if (blocks <= 0) return 0;
+  return blocks + Math.ceil(blocks / 12) + 8;
+}
+
+/**
+ * 화면에 적을 수 있는 모든 진행 수치. **퍼센트 하나로는 진행을 볼 수 없어서 생겼다.**
+ *
+ * LT 부호의 복원은 고르게 오르지 않는다. 초반에는 XOR 덩어리만 쌓여 `solved` 가 거의 늘지
+ * 않다가, 마지막 몇 프레임에서 한꺼번에 풀린다(눈사태). 그래서 `percent` 만 보고 있으면
+ * **스트림이 멀쩡히 도는 동안 화면이 몇 분씩 멈춰 있는 것처럼 보인다.**
+ *
+ * 그 구간에서도 확실히 움직이는 값이 둘 있다: 받은 프레임 수(`frames`)와 아직 못 푼 프레임
+ * 수(`pending`). 앞의 것은 필요한 양(`framesNeeded`) 대비 비율로 바꿔 두면 거의 선형으로
+ * 차오르므로, 화면은 그걸 **같은 막대의 옅은 층**으로 깔고 실제 복원을 그 위에 얹는다.
+ *
+ * @returns 셈만 한 값들. 시계는 여기 없다 — 시간과 속도는 화면(`app.js`)이 잰다.
+ */
+export function stats(stream) {
+  const blocks = stream.blocks;
+  const frames = stream.seen.size;
+  const needed = framesNeeded(blocks);
+  return {
+    blocks,
+    solved: stream.solvedCount,
+    percent: percent(stream),
+    totalBytes: stream.totalBytes,
+    /// 풀린 블록이 실어 온 바이트. 마지막 블록의 채움을 셈에 넣지 않도록 전체에서 자른다.
+    doneBytes: Math.min(stream.solvedCount * stream.blockSize, stream.totalBytes),
+    /// 처음 보는 번호로 받아들인 프레임. 중복은 여기 들어오지 않는다.
+    frames,
+    duplicates: stream.duplicates,
+    /// 아직 못 푼 프레임. 눈사태 직전에 가장 크게 부풀었다가 한 번에 0으로 꺼진다.
+    pending: stream.pending.length,
+    framesNeeded: needed,
+    /// 0~100. **이 값은 프레임이 들어오는 한 멈추지 않는다.** 100 에 닿아도 아직 안 풀렸을 수
+    /// 있으므로(어림이다) 진행률로 내세우지 않고 뒤에 깔기만 한다.
+    framePercent: needed === 0 ? 0 : Math.min(100, Math.round((frames / needed) * 100)),
+  };
 }
 
 /**

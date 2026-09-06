@@ -249,6 +249,53 @@ cd mobile && npm test          # 반드시 함께 — 픽스처만 갈면 어긋
 조각이 `CHIP_LIMIT`(24장)을 넘으면 칩이 화면을 덮으므로 그때는 막대로 **바꾼다** — 더하지
 않는다. 빠진 순번은 바로 위의 `scan-total` 이 계속 말해 준다.
 
+**빠진 순번은 PC 에 옮겨 칠 수 있는 글자로 적는다.** 이어진 번호를 범위로 접어
+`남은 순번 3, 7, 12~15 (6장)` 처럼 쓰고, 몇 장 안 남으면 상태 줄이 한 번 더 짚어 준다 —
+`2번 읽었습니다 — PC 에 넣을 번호: 3, 7`. 데스크톱의 '놓친 장 부르기' 입력칸이 같은 표기를
+받으므로(`../src/main.js` 의 `parsePageList`) 화면의 글자를 그대로 치면
+그 장들만 돌아온다. 마지막 몇 장 때문에 한 바퀴를 통째로 다시 도는 것이 이 모드에서 가장 오래
+걸리는 구간이라, 그 길을 없애려고 두 표기를 맞춰 두었다 — `~` 를 다른 기호로 바꾸면 이 길이
+조용히 끊긴다 (`tests/collector.test.js` 의 `summarizeIndices` 가 그 표기를 붙잡는다).
+
+## 스트림 진행은 퍼센트 하나로 말할 수 없다
+
+LT 부호의 복원은 고르게 오르지 않는다. 초반에는 XOR 덩어리만 쌓여 풀린 블록이 거의 늘지
+않다가, 마지막 몇 프레임에서 한꺼번에 풀린다(눈사태). **퍼센트만 보여 주면 멀쩡히 도는
+스트림이 몇 분씩 멈춘 것처럼 보인다** — 그리고 그 화면 앞에서 할 수 있는 판단이 아무것도
+없다. 그래서 층을 나눠 적는다 — 아래 다섯 가지가 한 화면에 함께 있다.
+
+| 층 | 무엇 | 성질 |
+| --- | --- | --- |
+| `16%` | 풀린 블록의 비율 | 진짜 진행. **서 있을 때가 있다** |
+| `블록 312 / 1,940` | 그 퍼센트의 실체 | 1씩 오르는 것이 눈에 보인다 |
+| 막대의 옅은 층 | 받은 프레임 / 필요한 양 | **프레임이 들어오는 한 멈추지 않는다** |
+| `프레임 480 / 약 2,050장 · 1.2 MB / 7.4 MB` | 받은 양과 크기 | 총량 대비 어디쯤인지 |
+| `초당 3.2장 · 남은 시간 약 8분 · 푸는 중 168장` | 속도·남은 시간·대기 | 초마다 갱신된다 |
+
+옅은 층을 뒤에 깔고 진짜 진행을 그 위에 얹는 것이 요점이다. 같은 색을 쓰지 않는 이유는 그
+값이 **어림**이기 때문이다 — 필요한 프레임 수는 `blocks + ceil(blocks/12) + 8` 로 넉넉히 잡은
+값이라 100% 에 닿아도 아직 안 풀렸을 수 있다. 읽어 주는 값(`aria-valuenow`)도 진짜 진행 쪽이다.
+
+이 식은 **PC 쪽 `src-tauri/src/commands.rs` 의 `frames_needed` 와 같아야 한다.** 폰은 이 값을
+프레임 헤더에서 받지 못해 스스로 계산하는데, 어긋나면 같은 스트림을 두고 두 화면이 서로 다른
+진행을 말하게 된다. `tests/stream.test.js` 가 값을 손으로 적어 두어 어느 한쪽을 고치면 먼저
+깨지게 해 두었다.
+
+### 안 들어오는 것과 아직 안 풀린 것은 다르다
+
+진행이 멈춘 것처럼 보이는 상황은 둘인데 원인도 대처도 정반대다. 계기(1초마다 도는 타이머)가
+그 둘을 가른다.
+
+| 화면 | 뜻 | 할 일 |
+| --- | --- | --- |
+| `푸는 중 168장` | 프레임은 들어오는데 아직 안 풀렸다 | 그대로 두면 된다 |
+| `4초째 새 프레임이 없습니다` | 아무것도 안 읽히고 있다 | 다시 비춘다 |
+| `4초째 같은 프레임만 들어옵니다` | 심볼은 읽히는데 PC 가 안 넘어간다 | PC 를 본다 |
+
+마지막 줄이 `stream.js` 가 중복 프레임을 세는 유일한 이유다. 진행에는 넣지 않지만(같은 번호는
+아무것도 더해 주지 않는다) **새 프레임 없이 그 숫자만 오르는 것**은 PC 화면이 멈췄다는 뜻이라,
+폰 쪽에서 알아낼 수 있는 유일한 방법이다.
+
 ## 형식 계약
 
 입력 형식은 `../src-tauri/src/armor.rs` 가 정한다. 3장으로 갈라진 경우:
@@ -280,7 +327,7 @@ cd mobile && npm test          # 반드시 함께 — 픽스처만 갈면 어긋
 | --- | --- |
 | 뼈대 | `app` (`data-state=idle\|denied\|scanning\|complete\|unsupported`) |
 | 준비 | `intro` `perm-note` `perm-settings` `scan-start` `scan-error` |
-| 스캔 | `scan-overlay` `scan-progress` `scan-total` `scan-list` `scan-bar` `scan-bar-fill` `chip-template` (안에 `[data-field=index]`, `data-got=true\|false`) `scan-status` (`data-tone=warn\|bad`) `scan-torch` `scan-stop` |
+| 스캔 | `scan-overlay` `scan-progress` `scan-total` `scan-list` `scan-bar` `scan-bar-fill` `scan-bar-lead` `scan-bar-label` `scan-bar-note` `chip-template` (안에 `[data-field=index]`, `data-got=true\|false`) `scan-status` (`data-tone=warn\|bad`) `scan-torch` `scan-stop` |
 | 결과 | `result` `result-summary` `result-note` `save-name` `save-hint` `scan-share` `scan-save` `scan-reset` |
 | 진행 막대 | `export-progress` `export-progress-fill` `export-progress-label` |
 

@@ -12,6 +12,7 @@ import {
   isComplete,
   joinCollection,
   missingIndices,
+  summarizeIndices,
 } from "./collector.js";
 
 import {
@@ -19,7 +20,7 @@ import {
   createStream,
   isComplete as streamComplete,
   looksLikeStream,
-  percent as streamPercent,
+  stats as streamStats,
   takeBytes,
   verify,
 } from "./stream.js";
@@ -100,15 +101,26 @@ const state = {
   exporting: false,
   /// 진행 막대의 지연 표시 상태. `shownAt` 이 0이면 아직 띄우지 않았다.
   busy: { timer: null, shownAt: 0, done: 0, total: 0, phase: "" },
+  /// 스트림 진행의 **움직임**을 재는 계기. 자세한 것은 아래 '스트림 계기' 절에.
+  meter: { timer: null, frames: 0, duplicates: 0, rate: 0, echoing: false, lastNewAt: 0 },
 };
 
 // ---------------------------------------------------------------- DOM 훅
 
-const el = (hook) => document.querySelector(`[data-pk="${hook}"]`);
+/// 이 모듈이 만지는 문서. **불러올 때 한 번 붙잡는다.**
+///
+/// 앱 안에서는 문서가 바뀌지 않으므로 `document` 를 매번 보는 것과 같다. 다른 점은 테스트에서
+/// 드러난다 — 창을 새로 세워 `app.js` 를 다시 불러도, 앞 인스턴스의 계기(1초마다 도는 타이머)가
+/// 새 화면에 끼어들지 못한다. 각자 자기 문서만 그린다.
+const doc = document;
 
+const el = (hook) => doc.querySelector(`[data-pk="${hook}"]`);
+
+/// 같은 글자를 다시 쓰지 않는다. `textContent` 에 같은 값을 넣어도 DOM 은 바뀐 것으로 보고,
+/// `aria-live` 영역이면 스크린 리더가 그때마다 다시 읽는다 — 초당 여러 번 지나는 경로다.
 function setText(hook, text) {
   const node = el(hook);
-  if (node) node.textContent = text;
+  if (node && node.textContent !== text) node.textContent = text;
 }
 
 function show(hook, visible) {
@@ -177,6 +189,13 @@ function renderScanBar() {
   const fill = el("scan-bar-fill");
   if (fill) fill.style.width = `${percent}%`;
 
+  // 옅은 층과 아래 두 줄은 스트림 모드의 것이다. 조각 모드에서는 `n / N` 과 남은 순번이 이미
+  // 정확해서 더 말할 것이 없다.
+  const lead = el("scan-bar-lead");
+  if (lead) lead.style.width = "0";
+  show("scan-bar-label", false);
+  show("scan-bar-note", false);
+
   const bar = el("scan-bar");
   if (bar) {
     bar.setAttribute("role", "progressbar");
@@ -235,9 +254,14 @@ function render() {
     setText("scan-total", "QR 을 비추면 전체 장수를 알려 줍니다");
   } else {
     const missing = missingIndices(collection);
-    if (missing.length === 0) setText("scan-total", "다 모았습니다");
-    else if (missing.length > 6) setText("scan-total", `${missing.length}장 남았습니다`);
-    else setText("scan-total", `남은 순번 ${missing.join(", ")}`);
+    if (missing.length === 0) {
+      setText("scan-total", "다 모았습니다");
+    } else {
+      // 이어진 번호는 범위로 접는다. 남은 것이 많아도 **PC 에 그대로 옮겨 칠 수 있는 글자**로
+      // 보여 주는 것이 요점이다 (데스크톱의 '놓친 장 부르기' 가 같은 표기를 받는다).
+      const { text, more } = summarizeIndices(missing);
+      setText("scan-total", `남은 순번 ${text}${more > 0 ? " …" : ""} (${missing.length}장)`);
+    }
   }
 
   renderChips();
@@ -247,30 +271,161 @@ function render() {
  * 스트림 모드의 진행 표시.
  *
  * 여기에는 칩이 없다. 순번을 채우는 방식이 아니라 **아무 프레임이나 모으면 되는** 방식이라,
- * "어느 장이 빠졌는지" 라는 개념 자체가 없다 — 그게 이 모드의 요점이다. 그래서 조각 모드가
- * 칩으로 말하던 것을 여기서는 막대와 퍼센트가 말한다.
+ * "어느 장이 빠졌는지" 라는 개념 자체가 없다 — 그게 이 모드의 요점이다.
+ *
+ * 대신 퍼센트 하나만 보여 주면 안 된다. LT 부호의 복원은 고르게 오르지 않는다 — 초반에는
+ * XOR 덩어리만 쌓여 퍼센트가 몇 분씩 제자리에 서 있다가 마지막에 한꺼번에 풀린다. 그동안
+ * 화면이 퍼센트만 말하면 **멀쩡히 도는 스트림이 멈춘 것처럼 보인다.** 그래서 층을 나눠
+ * 적는다:
+ *
+ *   퍼센트          진짜 진행. 서 있을 때가 있다.
+ *   블록 n / N      그 퍼센트의 실체. 1 오르는 것이 눈에 보인다.
+ *   막대의 옅은 층  받은 프레임 / 필요한 양. **프레임이 들어오는 한 멈추지 않는다.**
+ *   아래 두 줄      받은 양·크기, 그리고 속도·남은 시간 (혹은 왜 안 들어오는지).
  */
 function renderStream() {
-  const { stream } = state;
-  const done = streamPercent(stream);
+  const info = streamStats(state.stream);
+  const done = info.percent;
 
   setText("scan-progress", `${done}%`);
   setText(
     "scan-total",
-    done === 100 ? "다 모았습니다" : "그대로 비추고 계세요 — 순서는 상관없습니다",
+    done === 100
+      ? "다 모았습니다"
+      : `블록 ${NUMBER.format(info.solved)} / ${NUMBER.format(info.blocks)}`,
   );
 
   show("scan-list", false);
   show("scan-bar", true);
+
   const fill = el("scan-bar-fill");
   if (fill) fill.style.width = `${done}%`;
+  // 옅은 층은 **받은 프레임**이다. 복원이 눈사태를 기다리며 서 있는 동안에도 이 층은 자란다 —
+  // "얼마나 왔는지" 를 볼 수 있는 유일한 자리라서, 진짜 진행 뒤에 깔되 지우지는 않는다.
+  const lead = el("scan-bar-lead");
+  if (lead) lead.style.width = `${info.framePercent}%`;
+
   const bar = el("scan-bar");
   if (bar) {
     bar.setAttribute("role", "progressbar");
     bar.setAttribute("aria-valuemin", "0");
     bar.setAttribute("aria-valuemax", "100");
+    // 읽어 주는 값은 **복원**이다. 옅은 층은 어림이라 여기에 넣으면 거짓말이 된다.
     bar.setAttribute("aria-valuenow", String(done));
   }
+
+  show("scan-bar-label", true);
+  setText(
+    "scan-bar-label",
+    `프레임 ${NUMBER.format(info.frames)} / 약 ${NUMBER.format(info.framesNeeded)}장 · ` +
+      `${formatBytes(info.doneBytes)} / ${formatBytes(info.totalBytes)}`,
+  );
+
+  const note = streamNote(info);
+  show("scan-bar-note", note !== "");
+  setText("scan-bar-note", note);
+}
+
+// ---------------------------------------------------------------- 스트림 계기
+
+/// 계기의 눈금 간격. 1초면 "초당 몇 장" 이 그대로 읽히고, 그보다 잦으면 숫자가 튄다.
+const METER_TICK_MS = 1000;
+
+/// 이만큼 새 프레임이 없으면 화면이 그 사실을 말한다. 카메라가 초점을 다시 잡는 데 1~2초가
+/// 걸리므로 그보다는 넉넉해야 하고, 그보다 길면 사용자가 이미 폰을 내려놓은 뒤다.
+const STALL_MS = 3000;
+
+/**
+ * 아래 줄. **속도와 남은 시간, 혹은 왜 안 들어오는지.**
+ *
+ * 진행이 멈춘 것처럼 보이는 상황은 둘인데 원인도 대처도 정반대다. 프레임은 계속 들어오는데
+ * 아직 안 풀린 것(정상 — 기다리면 된다)과, 아예 안 들어오는 것(비정상 — 손을 써야 한다).
+ * 그 둘을 가르는 것이 이 줄의 존재 이유다.
+ */
+function streamNote(info) {
+  const { meter } = state;
+  if (info.percent === 100) return "";
+
+  const silent = meter.lastNewAt === 0 ? 0 : Date.now() - meter.lastNewAt;
+  if (silent >= STALL_MS) {
+    const seconds = Math.round(silent / 1000);
+    // 같은 번호만 되풀이해 들어온다 = 심볼은 읽히는데 PC 가 다음 프레임으로 넘어가지 않는다.
+    return meter.echoing
+      ? `${seconds}초째 같은 프레임만 들어옵니다 — PC 쪽 스트림이 멈춰 있는지 봐 주세요`
+      : `${seconds}초째 새 프레임이 없습니다 — QR 이 화면에 꽉 차게 다시 비춰 주세요`;
+  }
+
+  const parts = [];
+  // 속도를 모르면 남은 시간도 지어내지 않는다.
+  if (meter.rate >= 0.1) {
+    const left = info.framesNeeded - info.frames;
+    parts.push(`초당 ${meter.rate.toFixed(1)}장`);
+    parts.push(left <= 0 ? "이제 곧 풀립니다" : `남은 시간 ${etaText(left / meter.rate)}`);
+  }
+  // 아직 못 푼 프레임. 눈사태 직전에 가장 크게 부풀었다가 한 번에 꺼지므로, 퍼센트가 서 있는
+  // 동안 이 숫자가 오르는 것 자체가 "쌓이고 있다" 는 증거다.
+  if (info.pending > 0) parts.push(`푸는 중 ${NUMBER.format(info.pending)}장`);
+  // 첫 1초는 속도를 모른다. 그때 줄을 통째로 비우면 아래가 들썩이므로 자리를 지킨다.
+  return parts.length === 0 ? "속도를 재는 중…" : parts.join(" · ");
+}
+
+/// 남은 시간. 정확한 척하지 않는다 — 속도가 초마다 흔들리므로 십 초·분 단위로만 끊는다.
+function etaText(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "곧";
+  if (seconds < 90) return `약 ${Math.max(10, Math.round(seconds / 10) * 10)}초`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `약 ${minutes}분`;
+  return `약 ${Math.floor(minutes / 60)}시간 ${minutes % 60}분`;
+}
+
+/**
+ * 계기를 돌린다. 프레임이 들어오지 **않는** 동안에도 화면이 말을 해야 해서 시계가 필요하다.
+ *
+ * 눈금마다 하는 일은 두 가지다. 지난 1초에 새로 들어온 프레임 수로 속도를 고르고, 새 프레임
+ * 없이 중복만 늘었는지(= PC 화면이 멈췄다)를 판단한다.
+ */
+function startMeter() {
+  const { meter, stream } = state;
+  if (meter.timer !== null) return;
+
+  meter.frames = stream.seen.size;
+  meter.duplicates = stream.duplicates;
+  meter.rate = 0;
+  meter.echoing = false;
+  meter.lastNewAt = Date.now();
+
+  const timer = setInterval(tickMeter, METER_TICK_MS);
+  // 노드에서는 타이머가 프로세스를 붙잡아 테스트가 끝나지 못한다. 브라우저의 `setInterval` 은
+  // 숫자를 돌려주므로 `unref` 가 없고, 그때는 아무 일도 일어나지 않는다.
+  timer?.unref?.();
+  meter.timer = timer;
+}
+
+function stopMeter() {
+  const { meter } = state;
+  if (meter.timer !== null) {
+    clearInterval(meter.timer);
+    meter.timer = null;
+  }
+  meter.rate = 0;
+  meter.echoing = false;
+  meter.lastNewAt = 0;
+}
+
+function tickMeter() {
+  const { meter, stream } = state;
+  if (state.mode !== "stream") return;
+
+  const frames = stream.seen.size;
+  const fresh = frames - meter.frames;
+  // 지수 이동 평균. 인식이 한 번 끊길 때마다 숫자가 0으로 떨어졌다 돌아오면 읽을 수 없다.
+  meter.rate = meter.rate === 0 ? fresh : meter.rate * 0.6 + fresh * 0.4;
+  meter.echoing = fresh === 0 && stream.duplicates > meter.duplicates;
+  meter.frames = frames;
+  meter.duplicates = stream.duplicates;
+  if (fresh > 0) meter.lastNewAt = Date.now();
+
+  renderStream();
 }
 
 // ---------------------------------------------------------------- 스캔
@@ -336,6 +491,9 @@ async function beginScan() {
 
 async function endScan() {
   state.scanning = false;
+  // 카메라를 놓으면 프레임도 끊긴다. 계기를 그대로 두면 "3초째 새 프레임이 없습니다" 를
+  // 스스로 띄운다 — 아무도 비추고 있지 않은 화면에 대고.
+  stopMeter();
 
   await stopScan();
   await keepAwake(false);
@@ -391,7 +549,7 @@ function handleBarcode(barcode) {
   if (result.status === "added") {
     state.lastWarning = "";
     void buzz("tick");
-    setStatus(`${result.index}번 읽었습니다`);
+    setStatus(readNote(result.index));
     render();
     if (isComplete(state.collection)) void finish();
     return;
@@ -405,16 +563,42 @@ function handleBarcode(barcode) {
   warn(REJECT_TEXT[result.reason] ?? "읽을 수 없는 QR 입니다.", "warn");
 }
 
+/**
+ * 조각 하나를 읽었을 때의 상태 줄.
+ *
+ * 몇 장 안 남았으면 **그 번호를 그대로 알려 준다.** 마지막 몇 장을 놓쳐 한 바퀴를 통째로 다시
+ * 도는 것이 조각 모드에서 가장 오래 걸리는 구간인데, 데스크톱에 그 번호를 넣으면 그 장들만
+ * 돌려 주기 때문이다 (`src/index.html` 의 '놓친 장 부르기'). 화면에 뜬 글자를 그대로 옮겨
+ * 치면 되도록 표기까지 맞춰 두었다.
+ */
+function readNote(index) {
+  const missing = missingIndices(state.collection);
+  const { text, more } = summarizeIndices(missing);
+  if (missing.length === 0 || more > 0 || missing.length > 8) {
+    return `${index}번 읽었습니다`;
+  }
+  // 번호 뒤에 조사를 붙이지 않는다 — 끝소리에 따라 '을/를' 이 갈리는데 목록의 마지막 숫자는
+  // 매번 달라진다. 콜론으로 끊으면 그 문제가 사라지고 옮겨 칠 자리도 분명해진다.
+  return `${index}번 읽었습니다 — PC 에 넣을 번호: ${text}`;
+}
+
 /// 스트림 프레임 하나. 조각 모드와 달리 **순번을 채우는 것이 아니라** 풀린 블록을 센다.
 function handleStreamFrame(bytes) {
   const result = addFrame(state.stream, bytes);
 
-  // 연속 스캔은 같은 심볼을 초당 여러 번 읽는다. 아무 일도 없었던 것처럼 넘어간다.
+  // 연속 스캔은 같은 심볼을 초당 여러 번 읽는다. 아무 일도 없었던 것처럼 넘어간다 —
+  // 다만 계기는 세고 있다. 중복만 들어오는 것도 화면이 말해 줘야 하는 사실이다.
   if (result.status === "duplicate") return;
 
   if (result.status === "added") {
     state.lastWarning = "";
+    // 첫 프레임에서 계기를 돌린다. 그 전에는 잴 것이 없다.
+    startMeter();
+    state.meter.lastNewAt = Date.now();
     void buzz("tick");
+    // 조각 모드는 "몇 번을 읽었다" 를 적지만 스트림에는 번호라는 개념이 없다. 대신 이 모드에서
+    // 사람이 가장 자주 하는 걱정 — "순서가 틀린 것 아닌가" — 에 답한다.
+    setStatus("순서는 상관없습니다 — 그대로 비추고 계세요");
     render();
     if (streamComplete(state.stream)) void finishStream();
     return;
@@ -514,6 +698,16 @@ async function showResult(joined, summary) {
 // ---------------------------------------------------------------- 진행 막대
 
 const NUMBER = new Intl.NumberFormat("ko-KR");
+
+/// 사람이 읽는 크기. 데스크톱 `src/main.js` 의 같은 함수와 규칙이 같다.
+function formatBytes(bytes) {
+  if (!bytes) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const step = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / 1024 ** step;
+  const digits = step === 0 ? 0 : value < 10 ? 1 : 0;
+  return `${value.toFixed(digits)} ${units[step]}`;
+}
 
 const PHASE_TEXT = {
   save: "저장하는 중",
@@ -708,6 +902,7 @@ async function runExport(mode) {
 }
 
 async function reset() {
+  stopMeter();
   state.collection = createCollection();
   state.stream = createStream();
   state.mode = null;
@@ -748,8 +943,8 @@ function wire() {
   on("perm-settings", "click", () => void openSettings());
 
   // 앱이 가려지면 카메라를 놓는다 (OS 가 어차피 회수한다). 돌아오면 하던 일을 이어 간다.
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) {
+  doc.addEventListener("visibilitychange", () => {
+    if (doc.hidden) {
       if (state.scanning) void endScan();
       return;
     }

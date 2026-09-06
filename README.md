@@ -166,6 +166,22 @@ QUFBQkJCQ0ND...
 둔다. 손으로 넘길 때 양끝에서 되돌아 감지 않는 것도 의도다 — '다음' 이 잠기는 것이 "다 찍었다"
 는 유일한 신호다.
 
+**놓친 장은 불러낼 수 있다.** 한 바퀴를 돌고 나면 대개 몇 장이 빈다. 그 몇 장을 위해 한 바퀴를
+통째로 다시 도는 것(128장이면 45초)이 이 모드에서 가장 아까운 시간이라, 번호를 넣어 그 장만
+보게 한다. 폰이 이미 어느 장이 빠졌는지 알고 화면에 적고 있으므로(`남은 순번 3, 7, 12~15`)
+**그 글자를 그대로 옮겨 치면 된다** — 쉼표와 `~` 표기를 양쪽이 같이 쓴다 (`-` 도 받는다).
+
+| 넣은 값 | 하는 일 |
+| --- | --- |
+| `7` | 7번 장에 서서 기다린다. 한 장이면 넘길 이유가 없다 |
+| `3, 7, 12~15` | 그 6장만 되풀이해 돈다. 몇 바퀴째인지 적어 준다 |
+| `5, 99` (총 16장) | 5번만 부르고, 범위 밖은 건너뛰었다고 말해 준다 |
+
+목록을 도는 동안에는 '이전·다음' 도 그 안에서만 움직이고, 번호 줄에 `7 / 128 · 부른 장 2/6`
+처럼 목록 안 위치가 함께 뜬다. **전체 순회와 달리 목록은 한 바퀴에 멈추지 않는다** — 여섯 장의
+한 바퀴는 2초라 '다음이 잠긴다' 는 신호가 성립하지 않고, 애초에 이 목록은 폰이 "이것만 있으면
+된다" 고 알려 준 것이기 때문이다. 대신 바퀴 수를 적고, '전체로 돌아가기' 로 언제든 놓는다.
+
 **그림은 한 장씩 그린다.** 심볼 하나가 base64 로 약 6 KiB 라, 128장을 한 응답에 실으면 곧
 메가바이트가 되고 직렬화·파싱만으로 웹뷰가 몇 초씩 멈춘다. 묶기 응답에는 나눔의 요약
 (`qr_plan`: 장수·모듈 수·ECC 등급)과 **첫 장만** 싣고, 나머지는 뷰어가 넘길 때마다 `qr_piece`
@@ -214,6 +230,13 @@ K(1+ε)개쯤 모으면 전부 풀 수 있다. 그래서 화면은 끝없이 돌
 이어 붙일 방법이 없고, 휴대폰의 [`조각 모으기`](mobile/README.md) 앱이 **필수**가 된다. 위에서
 자랑한 성질을 잃는 것이므로 **조각 모드를 대체하지 않고 옆에 둔다** — 컨테이너가 132 KiB 안이면
 조각 모드만 내놓고, 넘을 때만 스트림을 제안한다. 화면도 그 사실을 감추지 않고 적는다.
+
+**보내는 쪽도 진행을 적는다.** 끝이 없는 스트림이라도 "대략 이만큼 보내면 폰이 다 푼다" 는
+양은 알고 있으므로(`frames_needed` = 블록 수 + 8% + 8), `480 / 약 2,050 프레임` 처럼 그 대비로
+적고 한 바퀴를 넘기면 몇 바퀴째인지로 바꾼다. 한 바퀴를 넘겨 계속 보내는 것이 낭비가 아니라는
+사실(프레임은 매번 **새로** 만들어진다)도 그때 함께 말해 준다. 받는 쪽은 이 값을 프레임에서
+받지 못해 [같은 식을 따로 갖고 있다](mobile/README.md#스트림-진행은-퍼센트-하나로-말할-수-없다) —
+한쪽을 고치면 다른 쪽도 고쳐야 한다.
 
 프레임 = 헤더 24바이트 + payload. 조각 모드와 달리 텍스트가 아니라 **원시 바이너리**를 담는다 —
 Base64 를 한 겹 벗기면 33% 를 더 담을 수 있고, 어차피 사람이 읽을 내용이 아니다. 폰은
@@ -293,7 +316,7 @@ xorshift 를 규격으로 못박고(자바스크립트에 64비트 정수가 없
 | 탭 | `tab[data-tab=pack\|unpack]`, `panel[data-tab=pack\|unpack]` |
 | 묶기 | `pack-dropzone` `pack-list` `pack-empty` `pack-summary` `pack-clear` `pack-add-files` `pack-add-folders` `pack-key` `pack-key-toggle` `pack-key-strength` `pack-submit` `pack-progress` `pack-progress-fill` `pack-progress-label` `pack-status` `pack-reveal` |
 | 결과 텍스트 | `pack-output` `pack-output-text` `pack-output-copy` `pack-output-note` |
-| 결과 QR | `pack-qr` (`data-state=single\|split\|toobig\|stream`) `pack-qr-image` `pack-qr-note` `pack-qr-nav` `pack-qr-prev` `pack-qr-next` `pack-qr-index` `pack-qr-play` `pack-qr-speed` `pack-qr-speed-label` `pack-qr-stream` `pack-qr-stream-start` `pack-qr-stream-note` |
+| 결과 QR | `pack-qr` (`data-state=single\|split\|toobig\|stream`) `pack-qr-image` `pack-qr-note` `pack-qr-nav` `pack-qr-prev` `pack-qr-next` `pack-qr-index` `pack-qr-play` `pack-qr-speed` `pack-qr-speed-label` `pack-qr-jump` `pack-qr-goto` `pack-qr-goto-go` `pack-qr-goto-clear` `pack-qr-goto-note` `pack-qr-stream` `pack-qr-stream-start` `pack-qr-stream-note` |
 | 풀기 | `unpack-dropzone` `unpack-pick` `unpack-file` `unpack-file-name` `unpack-file-meta` `unpack-text` `unpack-text-clear` `unpack-source-note` `unpack-key` `unpack-key-toggle` `unpack-key-hint` `unpack-dest` `unpack-dest-pick` `unpack-submit` `unpack-progress` `unpack-progress-fill` `unpack-progress-label` `unpack-status` `unpack-reveal` |
 | 목록 행 | `row-template` (안에 `[data-field=name]` `[data-field=meta]` `[data-pk=row-remove]`) |
 

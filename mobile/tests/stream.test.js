@@ -27,12 +27,14 @@ import {
   blockIndices,
   createStream,
   crc16,
+  framesNeeded,
   isComplete,
   looksLikeStream,
   parseFrame,
   percent,
   rng,
   solitonCdf,
+  stats,
   takeBytes,
 } from "../www/stream.js";
 
@@ -277,5 +279,86 @@ describe("수집", () => {
     const stream = createStream();
     assert.equal(percent(stream), 0);
     assert.equal(isComplete(stream), false);
+  });
+});
+
+// ---------------------------------------------------------------- 진행 수치
+
+describe("진행 수치", () => {
+  /**
+   * **Rust 와 같은 식이어야 한다** (`src-tauri/src/commands.rs` 의 `frames_needed`).
+   *
+   * 폰은 이 값을 프레임에서 받지 못하고 스스로 계산한다. 어긋나면 같은 스트림을 두고 PC 와
+   * 폰이 서로 다른 진행을 말하게 되고, 그건 화면을 믿을 수 없게 만든다. 값을 여기 손으로
+   * 적어 두어, 어느 한쪽을 고치면 이 줄이 먼저 깨지게 한다.
+   */
+  it("필요한 프레임 수를 Rust 와 같은 식으로 센다", () => {
+    // blocks + ceil(blocks / 12) + 8
+    assert.equal(framesNeeded(0), 0, "받은 것이 없으면 셀 것도 없다");
+    assert.equal(framesNeeded(1), 10);
+    assert.equal(framesNeeded(16), 26);
+    assert.equal(framesNeeded(1200), 1308);
+    // 실제 오버헤드(5~8%)보다 넉넉해야 한다. 모자라면 100% 앞에서 한참 서 있게 된다.
+    assert.ok(framesNeeded(1200) >= Math.round(1200 * 1.05));
+  });
+
+  it("퍼센트가 서 있는 동안에도 받은 프레임과 대기가 움직인다", () => {
+    // 이 테스트가 화면 설계의 근거다. LT 복원은 마지막에 몰아서 일어나므로, 그 전까지
+    // `percent` 만 보면 멈춰 있는 것과 구별할 수 없다.
+    const stream = createStream();
+    let moved = 0;
+    let lastPercent = 0;
+    let stalledWhileMoving = false;
+
+    for (const frame of FRAMES) {
+      addFrame(stream, frame);
+      const now = stats(stream);
+      assert.equal(now.frames, stream.seen.size);
+      assert.ok(now.frames > moved, "받은 프레임은 프레임마다 반드시 는다");
+      moved = now.frames;
+      if (now.percent === lastPercent && now.frames > 1) stalledWhileMoving = true;
+      lastPercent = now.percent;
+      if (isComplete(stream)) break;
+    }
+
+    assert.ok(stalledWhileMoving, "퍼센트가 한 번도 서 있지 않았다면 이 화면은 필요 없다");
+    const done = stats(stream);
+    assert.equal(done.percent, 100);
+    assert.equal(done.solved, done.blocks);
+    assert.equal(done.doneBytes, golden.totalBytes, "마지막 블록의 채움을 세면 안 된다");
+    assert.equal(done.totalBytes, golden.totalBytes);
+    assert.equal(done.pending, 0, "다 풀렸으면 대기가 남을 수 없다");
+  });
+
+  it("중복은 진행이 아니라 진단이다", () => {
+    // 같은 번호만 들어오는 것은 PC 화면이 멈췄다는 뜻이다. 진행에는 넣지 않되 세기는 한다.
+    const stream = createStream();
+    addFrame(stream, FRAMES[0]);
+    const before = stats(stream);
+
+    addFrame(stream, FRAMES[0]);
+    addFrame(stream, FRAMES[0]);
+    const after = stats(stream);
+
+    assert.equal(after.frames, before.frames, "중복은 받은 프레임에 들어가지 않는다");
+    assert.equal(after.percent, before.percent);
+    assert.equal(after.duplicates, 2);
+  });
+
+  it("받은 비율은 100 을 넘지 않는다", () => {
+    // 어림이라 실제로 넘길 수 있다. 막대가 판 밖으로 나가면 안 된다.
+    const stream = createStream();
+    for (const frame of FRAMES) addFrame(stream, frame);
+    const now = stats(stream);
+    assert.ok(now.framePercent >= 0 && now.framePercent <= 100, `${now.framePercent}`);
+  });
+
+  it("빈 수집도 숫자를 지어내지 않는다", () => {
+    const empty = stats(createStream());
+    assert.deepEqual(
+      { blocks: empty.blocks, frames: empty.frames, needed: empty.framesNeeded },
+      { blocks: 0, frames: 0, needed: 0 },
+    );
+    assert.equal(empty.framePercent, 0);
   });
 });

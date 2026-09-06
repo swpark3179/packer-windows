@@ -627,6 +627,31 @@ body[data-busy="true"] {
   gap: 6px;
 }
 
+/* 놓친 장 부르기. 입력칸이 번호 목록("3, 7, 12~15")을 그대로 받는다. */
+.qr-jump {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+}
+
+.qr-jump .input {
+  flex: 0 1 320px;
+  font-size: 13px;
+  padding: 7px 10px;
+}
+
+/* 부르기 칸이 지금 무엇을 하고 있는지. 바로 아래의 안내(.qr-note)와 달리 **상태**라서 덜
+ * 튀게 두고, 할 말이 없을 때는 자리도 차지하지 않는다. */
+.qr-jump-note {
+  color: var(--text-dim);
+}
+
+.qr-jump-note:empty {
+  display: none;
+}
+
 .qr-nav {
   display: flex;
   align-items: center;
