@@ -16,12 +16,13 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 use crate::error::{Error, Result};
 use crate::safepath;
@@ -73,11 +74,58 @@ pub enum Tick<'a> {
     Advance { bytes: u64, path: &'a str },
 }
 
+/// 한 엔트리의 내용이 어디서 오는지.
+///
+/// **메모리에서 오는 갈래가 있어서 열거형이다.** 텍스트 입력 모드는 사람이 창에 친 글을 바로
+/// 묶는데, 그걸 임시 파일로 한 번 떨어뜨리면 **평문이 디스크에 남는다** — 곧바로 지워도 지운
+/// 자리를 덮어쓰지는 못한다. 이 앱이 없애려는 노출이 정확히 그것이라, 그 한 종류를 만들지
+/// 않으려고 원본을 바이트로도 받는다.
+pub enum Source {
+    /// 디스크에서 스트리밍으로 읽는다. 파일을 통째로 메모리에 올리지 않는다.
+    File(PathBuf),
+    /// 이미 손에 있는 바이트. 어디에도 쓰지 않고 그대로 흘려보낸다.
+    Memory(Vec<u8>),
+}
+
+impl Drop for Source {
+    /// 메모리 원본은 **평문**이다. 놓을 때 지운다.
+    ///
+    /// 힙에서 그냥 풀려나면 그 바이트는 다음에 그 자리를 받는 할당까지 그대로 남아 있고,
+    /// 프로세스가 죽어 코어 덤프가 떨어지면 거기에도 실린다. 임시 파일을 만들지 않으려고
+    /// 이 갈래를 낸 것이므로, 메모리에서도 같은 규율을 지킨다.
+    fn drop(&mut self) {
+        if let Source::Memory(bytes) = self {
+            bytes.zeroize();
+        }
+    }
+}
+
+impl Source {
+    /// 안내 문구에 적을 이름. 메모리 원본에는 경로가 없다.
+    fn label(&self) -> String {
+        match self {
+            Source::File(path) => path.display().to_string(),
+            Source::Memory(_) => "입력한 텍스트".to_string(),
+        }
+    }
+
+    fn open(&self) -> Result<Box<dyn Read + '_>> {
+        match self {
+            Source::File(path) => {
+                let file = fs::File::open(path)
+                    .map_err(|e| Error::io(&format!("{} 을 열 수 없습니다", path.display()), e))?;
+                Ok(Box::new(file))
+            }
+            Source::Memory(bytes) => Ok(Box::new(Cursor::new(bytes.as_slice()))),
+        }
+    }
+}
+
 /// 묶기 전에 원본을 훑어 얻은 정보.
 pub struct Scan {
     pub manifest: Manifest,
-    /// `File` 엔트리와 같은 순서의 실제 원본 경로.
-    pub sources: Vec<PathBuf>,
+    /// `File` 엔트리와 같은 순서의 실제 원본.
+    pub sources: Vec<Source>,
     pub total_bytes: u64,
     pub file_count: usize,
     pub dir_count: usize,
@@ -123,7 +171,7 @@ fn mtime_of(meta: &fs::Metadata) -> i64 {
 /// 내용까지 조용히 담게 된다.
 pub fn scan(roots: &[PathBuf]) -> Result<Scan> {
     let mut entries: Vec<Entry> = Vec::new();
-    let mut sources: Vec<PathBuf> = Vec::new();
+    let mut sources: Vec<Source> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     let mut taken: HashSet<String> = HashSet::new();
     let mut total_bytes = 0u64;
@@ -160,7 +208,7 @@ pub fn scan(roots: &[PathBuf]) -> Result<Scan> {
                 size: meta.len(),
                 mtime: mtime_of(&meta),
             });
-            sources.push(root.clone());
+            sources.push(Source::File(root.clone()));
             continue;
         }
 
@@ -247,7 +295,7 @@ pub fn scan(roots: &[PathBuf]) -> Result<Scan> {
                     size: meta.len(),
                     mtime: mtime_of(&meta),
                 });
-                sources.push(item.path().to_path_buf());
+                sources.push(Source::File(item.path().to_path_buf()));
             }
         }
     }
@@ -270,6 +318,70 @@ pub fn scan(roots: &[PathBuf]) -> Result<Scan> {
         skipped,
     })
 }
+
+/// 손에 든 바이트 하나를 파일 한 개짜리 매니페스트로 세운다.
+///
+/// 텍스트 입력 모드가 쓴다. [`scan`] 과 하는 일은 같지만 **디스크를 건드리지 않는다** —
+/// 임시 파일로 한 번 떨어뜨리면 평문이 디스크에 남고, 그것이 이 앱이 없애려는 노출 그 자체다.
+/// 그래서 원본을 [`Source::Memory`] 로 들고 간다 ([`write_payload`] 가 그대로 흘려보낸다).
+///
+/// 이름은 컨테이너 안에서 쓸 파일 이름이다. 경로 구분자와 상위 참조는 여기서 걷어 낸다 —
+/// 푸는 쪽의 [`safepath`] 가 다시 한번 막지만, 애초에 만들지 않는 편이 낫다.
+pub fn scan_text(name: &str, bytes: Vec<u8>) -> Result<Scan> {
+    if bytes.is_empty() {
+        return Err(Error::NothingToPack);
+    }
+    let size = bytes.len() as u64;
+    let entry = Entry {
+        rel_path: text_entry_name(name),
+        kind: Kind::File,
+        size,
+        mtime: unix_secs(SystemTime::now()),
+    };
+
+    Ok(Scan {
+        manifest: Manifest {
+            version: MANIFEST_VERSION,
+            created_utc: unix_secs(SystemTime::now()),
+            entries: vec![entry],
+        },
+        sources: vec![Source::Memory(bytes)],
+        total_bytes: size,
+        file_count: 1,
+        dir_count: 0,
+        skipped: Vec::new(),
+    })
+}
+
+/// 사람이 적은 이름을 컨테이너 안의 파일 이름으로 다듬는다.
+///
+/// 비거나 전부 걷어내지면 [`DEFAULT_TEXT_NAME`] 으로 돌아간다 — 이름이 없다고 묶기를 거절하는
+/// 것은 사용자가 고칠 거리도 아닌 일로 막아서는 것이다.
+fn text_entry_name(name: &str) -> String {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .map(|c| match c {
+            // 경로가 되는 글자와 제어문자만 막는다. 한글·공백·괄호는 파일 이름으로 멀쩡하다.
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    // `.` 과 `..` 은 파일 이름이 아니다.
+    let cleaned = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    if cleaned.is_empty() {
+        return DEFAULT_TEXT_NAME.to_string();
+    }
+    // 확장자가 없으면 붙여 준다. 풀어낸 뒤 더블클릭으로 열리는 편이 낫다.
+    if Path::new(cleaned).extension().is_none() {
+        return format!("{cleaned}.txt");
+    }
+    cleaned.to_string()
+}
+
+/// 이름을 적지 않았을 때 컨테이너 안에 들어가는 파일 이름.
+pub const DEFAULT_TEXT_NAME: &str = "메모.txt";
 
 /// 한 항목의 크기만 빠르게 재본다. 드롭 목록에 표시할 용도.
 ///
@@ -362,14 +474,13 @@ pub fn write_payload<W: Write>(
         let mut hasher = Sha256::new();
         let mut remaining = entry.size;
 
-        let mut file = fs::File::open(source)
-            .map_err(|e| Error::io(&format!("{} 을 열 수 없습니다", source.display()), e))?;
+        let mut reader = source.open()?;
 
         while remaining > 0 {
             let want = buf.len().min(remaining as usize);
-            let n = file
+            let n = reader
                 .read(&mut buf[..want])
-                .map_err(|e| Error::io(&format!("{} 을 읽을 수 없습니다", source.display()), e))?;
+                .map_err(|e| Error::io(&format!("{} 을 읽을 수 없습니다", source.label()), e))?;
             if n == 0 {
                 break; // 파일이 줄었다 — 아래에서 0으로 채운다.
             }
@@ -399,7 +510,7 @@ pub fn write_payload<W: Write>(
         } else {
             // 파일이 커졌는지도 확인한다 — 남은 바이트가 있으면 잘린 것이다.
             let mut probe = [0u8; 1];
-            if matches!(file.read(&mut probe), Ok(1)) {
+            if matches!(reader.read(&mut probe), Ok(1)) {
                 report.changed.push(entry.rel_path.clone());
             }
         }

@@ -15,6 +15,9 @@ pub fn run() {
         .manage(commands::QrSlot::default())
         // 스트림 모드가 흘려 보내는 컨테이너 바이트. 조각 모드의 QrSlot 과 같은 자리다.
         .manage(commands::StreamSlot::default())
+        // 방금 묶어 낸 컨테이너가 놓인 자리. 저장 위치를 나중에 묻게 되면서 결과가 먼저
+        // 임시 폴더에 앉고, '파일로 저장' 이 여기서 꺼내 옮겨 적는다.
+        .manage(commands::PackedSlot::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -23,6 +26,8 @@ pub fn run() {
             commands::inspect,
             commands::inspect_text,
             commands::pack,
+            commands::pack_text,
+            commands::save_container,
             commands::qr_piece,
             commands::qr_stream_open,
             commands::qr_stream_frame,

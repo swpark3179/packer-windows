@@ -6,8 +6,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use packer_lib::archive::scan_text;
 use packer_lib::archive::Tick;
-use packer_lib::commands::{pack_to_file, pack_to_file_with_qr, unpack_to_dir, ContainerSource};
+use packer_lib::commands::{
+    pack_scan_with_qr, pack_to_file, pack_to_file_with_qr, unpack_to_dir, ContainerSource,
+};
 use packer_lib::error::Error;
 
 fn write_file(path: &Path, contents: &[u8]) {
@@ -142,6 +145,59 @@ fn packs_and_unpacks_a_real_tree() {
 
     // 최상위 폴더 이름까지 그대로 살아난다.
     assert_trees_match(&source, &dest.join("원본"));
+}
+
+/// 텍스트 입력 모드. **평문이 디스크에 한 번도 앉지 않는다.**
+///
+/// 임시 파일로 떨어뜨렸다 지우는 편이 짧지만 지운 자리를 덮어쓰지는 못하므로, 이 앱이
+/// 없애려는 노출을 스스로 만드는 셈이 된다. `archive::scan_text` 가 바이트를 그대로 들고
+/// 파이프라인에 들어가는지 여기서 확인한다.
+#[test]
+fn packs_text_typed_into_the_window_without_touching_the_disk() {
+    let work = tempfile::tempdir().unwrap();
+    let container = work.path().join("note.txt");
+    let key = "메모 열쇠 2026!";
+    let body = "첫 줄\n둘째 줄 — 한글과 emoji 🙂\n";
+
+    let scan = scan_text("회의록", body.as_bytes().to_vec()).unwrap();
+    // 이름에 확장자가 없으면 붙여 준다 — 풀어낸 뒤 더블클릭으로 열려야 한다.
+    assert_eq!(scan.manifest.entries[0].rel_path, "회의록.txt");
+    assert_eq!(scan.file_count, 1);
+    assert_eq!(scan.dir_count, 0);
+
+    let (packed, _) = pack_scan_with_qr(scan, key, &container, &mut silent).unwrap();
+    assert_eq!(packed.file_count, 1);
+    assert!(packed.changed.is_empty(), "{:?}", packed.changed);
+
+    let dest = work.path().join("복원");
+    let restored = unpack_to_dir(&from_file(&container), key, &dest, &mut silent).unwrap();
+    assert_eq!(restored.file_count, 1);
+    assert!(
+        restored.hash_mismatch.is_empty(),
+        "sha256 불일치: {:?}",
+        restored.hash_mismatch
+    );
+    assert_eq!(fs::read_to_string(dest.join("회의록.txt")).unwrap(), body);
+}
+
+/// 이름 자리에 경로를 적어도 컨테이너 안에서 경로가 되지 않는다.
+#[test]
+fn a_text_entry_name_never_becomes_a_path() {
+    for name in ["../../etc/passwd", "  ..  ", "", "C:\\Windows\\notes"] {
+        let scan = scan_text(name, b"x".to_vec()).unwrap();
+        let rel = &scan.manifest.entries[0].rel_path;
+        assert!(!rel.contains('/'), "{name} → {rel}");
+        assert!(!rel.contains('\\'), "{name} → {rel}");
+        assert!(!rel.starts_with('.'), "{name} → {rel}");
+        assert!(!rel.is_empty(), "{name} → 빈 이름");
+    }
+}
+
+/// 빈 텍스트는 묶을 것이 없다. 0바이트짜리 파일 하나를 만들어 주는 것은 답이 아니다.
+#[test]
+fn empty_text_is_nothing_to_pack() {
+    let refused = scan_text("메모", Vec::new()).err().expect("거절해야 한다");
+    assert!(matches!(refused, Error::NothingToPack), "{refused:?}");
 }
 
 #[test]

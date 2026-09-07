@@ -364,6 +364,54 @@ pub struct PackOutcome {
     pub qr_limit_pieces: usize,
 }
 
+/// 마지막으로 묶어 낸 컨테이너가 놓인 자리.
+///
+/// **저장 위치를 먼저 묻지 않게 된 뒤로 생겼다.** 결과를 텍스트로 옮길지 QR 로 보낼지는
+/// 묶어 보고 나서야 정할 수 있는데(크기를 알아야 갈래가 갈린다), 그러려면 묶기가 먼저 끝나
+/// 있어야 한다. 그래서 목적지를 주지 않으면 임시 폴더에 쓰고, 화면의 '파일로 저장' 이
+/// [`save_container`] 로 옮겨 적는다.
+///
+/// 담고 있는 것은 **이미 armor 로 옮겨진 암호문**이다. 평문도 암호도 여기 들어오지 않는다.
+#[derive(Default)]
+pub struct PackedSlot(Mutex<Option<Packed>>);
+
+/// 방금 만든 컨테이너 하나.
+pub struct Packed {
+    path: PathBuf,
+    /// 임시 폴더에 만든 것이면 그 폴더. 다음 묶기에서 통째로 지운다.
+    temp_dir: Option<PathBuf>,
+}
+
+impl PackedSlot {
+    /// 새 결과를 담고 **지난 임시 폴더를 지운다.**
+    ///
+    /// 지우는 자리가 여기인 이유는, 임시 컨테이너의 수명이 정확히 "다음 묶기까지" 이기 때문이다.
+    /// 사람이 저장하지 않고 다시 묶으면 앞의 것은 그 순간 쓸모를 잃는다.
+    fn put(&self, packed: Option<Packed>) {
+        let mut slot = match self.0.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(old) = slot.take() {
+            if let Some(dir) = old.temp_dir {
+                let _ = fs::remove_dir_all(dir);
+            }
+        }
+        *slot = packed;
+    }
+
+    /// 지금 들고 있는 컨테이너의 경로.
+    fn path(&self) -> Result<PathBuf> {
+        let slot = match self.0.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        slot.as_ref()
+            .map(|packed| packed.path.clone())
+            .ok_or_else(|| Error::Internal("저장할 결과가 없습니다".to_string()))
+    }
+}
+
 /// 마지막으로 묶은 결과의 QR 나눔.
 ///
 /// 그림을 미리 다 그려 응답에 싣는 대신, 나눔만 여기 붙잡아 두고 뷰어가 장을 넘길 때마다 한
@@ -504,37 +552,104 @@ pub async fn qr_stream_close(app: AppHandle) -> Result<()> {
     Ok(())
 }
 
+/// 고른 파일·폴더를 묶는다.
+///
+/// `dest` 를 주지 않으면 **임시 폴더에 쓴다.** 저장 위치를 묻는 자리가 묶기 앞에서 뒤로
+/// 옮겨졌기 때문이다 — 결과를 텍스트로 옮길지 QR 로 보낼지는 크기를 알아야 정할 수 있고,
+/// 그 크기는 묶어 봐야 나온다. 화면은 결과를 보고 나서 '파일로 저장'([`save_container`])을
+/// 누른다.
 #[tauri::command]
 pub async fn pack(
     app: AppHandle,
     paths: Vec<String>,
     passphrase: String,
-    dest: String,
+    dest: Option<String>,
+    suggested_name: Option<String>,
 ) -> Result<PackOutcome> {
-    blocking(move || pack_blocking(app, paths, passphrase, dest)).await
+    blocking(move || {
+        let roots = dedupe(paths);
+        let scan = if roots.is_empty() {
+            Err(Error::NothingToPack)
+        } else {
+            archive::scan(&roots)
+        };
+        pack_blocking(app, scan, passphrase, dest, suggested_name)
+    })
+    .await
 }
 
+/// 창에 직접 친 텍스트를 묶는다.
+///
+/// **평문을 디스크에 떨어뜨리지 않는다.** 임시 파일로 한 번 쓰고 지우는 편이 훨씬 짧은 길이지만,
+/// 지운 자리를 덮어쓰지는 못하므로 이 앱이 없애려는 노출을 스스로 하나 만드는 셈이 된다.
+/// 그래서 [`archive::scan_text`] 가 바이트를 그대로 들고 파이프라인으로 들어간다.
+#[tauri::command]
+pub async fn pack_text(
+    app: AppHandle,
+    text: String,
+    name: Option<String>,
+    passphrase: String,
+    dest: Option<String>,
+    suggested_name: Option<String>,
+) -> Result<PackOutcome> {
+    blocking(move || {
+        let mut text = text;
+        let entry_name = name.unwrap_or_else(|| archive::DEFAULT_TEXT_NAME.to_string());
+        let scan = archive::scan_text(&entry_name, text.as_bytes().to_vec());
+        // 평문 사본을 손에 쥐고 있을 이유가 없다. `scan` 이 이미 바이트를 가져갔고,
+        // 그쪽은 놓일 때 스스로 지운다 (`archive::Source` 의 `Drop`).
+        text.zeroize();
+        pack_blocking(app, scan, passphrase, dest, suggested_name)
+    })
+    .await
+}
+
+/// 훑기 결과와 키를 받아 묶는다.
+///
+/// **키를 지우는 자리가 여기 하나다.** 훑을 것이 없거나(`NothingToPack`) 훑기가 실패한 경우도
+/// 이 함수를 지나게 하려고 `scan` 을 `Result` 로 받는다 — 갈래마다 `zeroize` 를 흩어 놓으면
+/// 새 갈래가 하나 생길 때마다 조용히 빠뜨리게 된다.
 fn pack_blocking(
     app: AppHandle,
-    paths: Vec<String>,
+    scan: Result<archive::Scan>,
     mut passphrase: String,
-    dest: String,
+    dest: Option<String>,
+    suggested_name: Option<String>,
+) -> Result<PackOutcome> {
+    let outcome = pack_guarded(app, scan, &passphrase, dest, suggested_name);
+    passphrase.zeroize();
+    outcome
+}
+
+fn pack_guarded(
+    app: AppHandle,
+    scan: Result<archive::Scan>,
+    passphrase: &str,
+    dest: Option<String>,
+    suggested_name: Option<String>,
 ) -> Result<PackOutcome> {
     if passphrase.is_empty() {
         return Err(Error::EmptyKey);
     }
-    let roots = dedupe(paths);
-    if roots.is_empty() {
-        return Err(Error::NothingToPack);
-    }
-    let dest_path = PathBuf::from(&dest);
+    let scan = scan?;
+
+    // 목적지를 주지 않았으면 임시 폴더에 쓴다. 폴더째 만들어 두는 것은 그 안의 파일 이름을
+    // 사람이 고른 이름 그대로 둘 수 있어서다 — 나중에 '탐색기에서 보기' 로 열어도 알아본다.
+    let staged = match dest {
+        Some(_) => None,
+        None => Some(temp_dir_in(&std::env::temp_dir(), "packer-out-")?),
+    };
+    let dest_path = match (&dest, &staged) {
+        (Some(dest), _) => PathBuf::from(dest),
+        (None, Some(dir)) => dir.join(temp_container_name(suggested_name.as_deref())),
+        (None, None) => unreachable!("staged 는 dest 가 없을 때만 None 이다"),
+    };
 
     // `Reporter` 가 핸들을 가져가므로 QR 나눔을 담아 둘 몫을 따로 챙긴다. `AppHandle` 복제는
     // 참조 세기만 올린다.
     let handle = app.clone();
     let mut reporter = Reporter::new(app, EVENT_PACK, "packing");
-    let packed = pack_to_file_with_qr(&roots, &passphrase, &dest_path, &mut |t| reporter.on(t));
-    passphrase.zeroize();
+    let packed = pack_scan_with_qr(scan, passphrase, &dest_path, &mut |t| reporter.on(t));
     if packed.is_ok() {
         reporter.finish();
     }
@@ -545,14 +660,74 @@ fn pack_blocking(
     });
 
     match outcome {
-        Ok(o) => Ok(o),
+        Ok(o) => {
+            // 지난 임시 컨테이너는 이 순간 쓸모를 잃는다. `put` 이 함께 지운다.
+            handle.state::<PackedSlot>().put(Some(Packed {
+                path: dest_path,
+                temp_dir: staged,
+            }));
+            Ok(o)
+        }
         Err(e) => {
             // 반쯤 쓰다 만 텍스트는 남기지 않는다. 열리지 않는 파일이 디스크에 남아 있으면
             // 사용자는 성공했는지 실패했는지 알 수 없다.
             let _ = fs::remove_file(&dest_path);
+            if let Some(dir) = staged {
+                let _ = fs::remove_dir_all(dir);
+            }
             Err(e)
         }
     }
+}
+
+/// 임시 폴더 안에 쓸 파일 이름. 화면이 제안한 이름을 쓰되 경로가 되는 글자는 걷어 낸다.
+fn temp_container_name(suggested: Option<&str>) -> String {
+    let cleaned: String = suggested
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    if cleaned.is_empty() {
+        return format!("packer.{CONTAINER_EXTENSION}");
+    }
+    cleaned.to_string()
+}
+
+/// 임시 폴더에 있는 컨테이너를 사람이 고른 자리로 옮겨 적는다.
+///
+/// **경로를 화면에서 받지 않는다.** 원본은 [`PackedSlot`] 이 들고 있는 것 하나뿐이라,
+/// 이 명령으로는 방금 묶은 결과 말고 다른 파일을 복사해 낼 수 없다.
+///
+/// 옮긴 뒤에도 임시 파일은 그대로 둔다. QR 스트림([`qr_stream_open`])이 그 경로를 읽고 있고,
+/// 어차피 다음 묶기에서 [`PackedSlot::put`] 이 지운다.
+#[tauri::command]
+pub async fn save_container(app: AppHandle, dest: String) -> Result<u64> {
+    blocking(move || {
+        let from = app.state::<PackedSlot>().path()?;
+        let to = PathBuf::from(&dest);
+        if from == to {
+            // 이미 그 자리에 있다. 자기 자신에게 복사하면 내용이 잘린다.
+            return fs::metadata(&to)
+                .map(|m| m.len())
+                .map_err(|e| Error::io(&format!("{} 를 읽을 수 없습니다", to.display()), e));
+        }
+        if let Some(parent) = to.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    Error::io(&format!("{} 를 만들 수 없습니다", parent.display()), e)
+                })?;
+            }
+        }
+        fs::copy(&from, &to)
+            .map_err(|e| Error::io(&format!("{} 로 저장할 수 없습니다", to.display()), e))
+    })
+    .await
 }
 
 /// Tauri 창 없이도 쓸 수 있는 묶기 진입점. 통합 테스트가 이걸 직접 부른다.
@@ -581,8 +756,22 @@ pub fn pack_to_file_with_qr(
     if passphrase.is_empty() {
         return Err(Error::EmptyKey);
     }
+    pack_scan_with_qr(archive::scan(roots)?, passphrase, dest_path, on)
+}
 
-    let scan = archive::scan(roots)?;
+/// [`pack_to_file_with_qr`] 과 같되 이미 훑어 둔 [`archive::Scan`] 에서 시작한다.
+///
+/// 원본이 디스크가 아니라 **메모리**일 수 있어서 갈라졌다 — 텍스트 입력 모드는 사람이 창에 친
+/// 글을 임시 파일 없이 그대로 묶는다 ([`archive::scan_text`]).
+pub fn pack_scan_with_qr(
+    scan: archive::Scan,
+    passphrase: &str,
+    dest_path: &Path,
+    on: &mut dyn FnMut(Tick),
+) -> Result<(PackOutcome, Option<qr::QrPlan>)> {
+    if passphrase.is_empty() {
+        return Err(Error::EmptyKey);
+    }
 
     let kdf = crypto::KdfParams::generate();
     let keys = crypto::derive_keys(passphrase, &kdf)?;
@@ -863,14 +1052,22 @@ fn move_into_place(staging: &Path, dest: &Path) -> Result<Vec<String>> {
 }
 
 fn staging_dir(dest: &Path) -> Result<PathBuf> {
+    temp_dir_in(dest, ".packer-part-")
+}
+
+/// `parent` 안에 아무도 쓰지 않는 이름으로 폴더를 하나 만든다.
+///
+/// 이름을 난수로 짓고 `create_dir` 의 성공 자체를 자리 잡기로 삼는다 — 있는지 먼저 보고 만들면
+/// 그 사이에 다른 실행이 끼어들 수 있다.
+fn temp_dir_in(parent: &Path, prefix: &str) -> Result<PathBuf> {
     for _ in 0..64 {
         let mut raw = [0u8; 8];
         rand::rngs::OsRng.fill_bytes(&mut raw);
-        let name: String = raw.iter().fold(".packer-part-".to_string(), |mut acc, b| {
+        let name: String = raw.iter().fold(prefix.to_string(), |mut acc, b| {
             acc.push_str(&format!("{b:02x}"));
             acc
         });
-        let candidate = dest.join(name);
+        let candidate = parent.join(name);
         match fs::create_dir(&candidate) {
             Ok(()) => return Ok(candidate),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -999,4 +1196,45 @@ where
     tauri::async_runtime::spawn_blocking(job)
         .await
         .map_err(|e| Error::Internal(format!("작업 스레드가 중단되었습니다: {e}")))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_temp_container_name_never_becomes_a_path() {
+        // 화면이 제안한 이름을 그대로 쓰되, 임시 폴더 **밖**을 가리키게 두면 안 된다.
+        for suggested in ["../../evil.txt", "C:\\Windows\\x.txt", "  ..  ", "", "   "] {
+            let name = temp_container_name(Some(suggested));
+            assert!(!name.contains('/'), "{suggested} → {name}");
+            assert!(!name.contains('\\'), "{suggested} → {name}");
+            assert!(!name.starts_with('.'), "{suggested} → {name}");
+            assert!(!name.is_empty(), "{suggested} → 빈 이름");
+        }
+    }
+
+    #[test]
+    fn a_sane_suggestion_is_kept_as_it_is() {
+        // 이름을 알아볼 수 있어야 '탐색기에서 보기' 로 열었을 때 자기 파일인 줄 안다.
+        assert_eq!(
+            temp_container_name(Some("보고서.packer.txt")),
+            "보고서.packer.txt"
+        );
+        assert_eq!(
+            temp_container_name(None),
+            format!("packer.{CONTAINER_EXTENSION}")
+        );
+    }
+
+    #[test]
+    fn temp_dirs_do_not_collide() {
+        let parent = std::env::temp_dir();
+        let a = temp_dir_in(&parent, "packer-test-").unwrap();
+        let b = temp_dir_in(&parent, "packer-test-").unwrap();
+        assert_ne!(a, b);
+        assert!(a.is_dir() && b.is_dir());
+        let _ = fs::remove_dir_all(&a);
+        let _ = fs::remove_dir_all(&b);
+    }
 }

@@ -25,7 +25,7 @@ const bridge = await import("../www/bridge.js");
  *          noFilesystem?: boolean, platform?: string}} options
  */
 function install(options = {}) {
-  const log = { write: [], append: [], deleted: [], shared: [] };
+  const log = { write: [], append: [], deleted: [], shared: [], listeners: [], emit: null };
   let appends = 0;
 
   const Filesystem = {
@@ -57,9 +57,19 @@ function install(options = {}) {
     },
   };
 
+  /// 연속 스캔을 흉내 낸다. `emit` 으로 한 카메라 프레임 몫을 통째로 흘려보낸다.
+  const BarcodeScanner = {
+    async addListener(name, handler) {
+      log.listeners.push(name);
+      if (name === "barcodesScanned") log.emit = (barcodes) => handler({ barcodes });
+      return { remove: async () => {} };
+    },
+  };
+
   const plugins = {};
   if (!options.noFilesystem) plugins.Filesystem = Filesystem;
   if (!options.noShare) plugins.Share = Share;
+  if (!options.noScanner) plugins.BarcodeScanner = BarcodeScanner;
 
   globalThis.Capacitor = { Plugins: plugins, getPlatform: () => options.platform ?? "android" };
   return log;
@@ -258,5 +268,30 @@ describe("platform", () => {
   it("그냥 브라우저로 열면 web 이다", () => {
     delete globalThis.Capacitor;
     assert.equal(bridge.platform(), "web");
+  });
+});
+
+describe("onBarcodes — 한 프레임에 여러 심볼", () => {
+  it("한 번에 들어온 심볼을 하나도 버리지 않는다", async () => {
+    // **PC 의 스트림 모드가 이 계약 위에 서 있다.** 화면에 프레임을 1·2·4장 나란히 세우는 것은
+    // 카메라 프레임이 16:9 라 정사각형 심볼 하나로는 좌우가 노는 것을 쓰는 일인데, 여기서
+    // 첫 심볼만 넘기면 나머지는 그냥 버려진다 — 화면은 멀쩡히 도는데 처리량만 그대로다.
+    const log = install();
+    const seen = [];
+    await bridge.onBarcodes((barcode) => seen.push(barcode.rawValue));
+
+    assert.deepEqual(log.listeners, ["barcodesScanned"]);
+    log.emit([{ rawValue: "A" }, { rawValue: "B" }, { rawValue: "C" }, { rawValue: "D" }]);
+    assert.deepEqual(seen, ["A", "B", "C", "D"]);
+  });
+
+  it("심볼이 없는 프레임은 아무 일도 일으키지 않는다", async () => {
+    const log = install();
+    let calls = 0;
+    await bridge.onBarcodes(() => (calls += 1));
+
+    log.emit([]);
+    log.emit(undefined);
+    assert.equal(calls, 0);
   });
 });
