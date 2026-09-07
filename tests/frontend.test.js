@@ -159,6 +159,34 @@ async function mount(handlers = {}) {
       await settle();
     },
     rows: () => Array.from(window.document.querySelectorAll('[data-pk="pack-list"] .row')),
+    /** 스트림 타일 판에 서 있는 그림들. `src` 속성을 그대로 준다. */
+    tiles: () =>
+      Array.from(hook("pack-qr-stream-grid")?.children ?? []).map((img) =>
+        img.getAttribute("src"),
+      ),
+    /** 타일에 인라인으로 박힌 폭. 정수 배율이 실제로 적용됐는지 본다. */
+    tileWidths: () =>
+      Array.from(hook("pack-qr-stream-grid")?.children ?? []).map((img) => img.style.width),
+    /** 타일 수 라디오를 고른다. */
+    pickTiles: async (count) => {
+      const radio = Array.from(
+        window.document.querySelectorAll('[data-pk="pack-qr-tile"]'),
+      ).find((r) => r.value === String(count));
+      assert.ok(radio, `${count}장 선택지가 없다`);
+      radio.checked = true;
+      radio.dispatchEvent(new window.Event("change", { bubbles: true }));
+      await settle();
+    },
+    /** 안쪽 탭을 누른다. `which` 는 data-input / data-result 값이다. */
+    subtab: async (name, which) => {
+      const button = Array.from(
+        window.document.querySelectorAll(`[data-pk="${name}"]`),
+      ).find((b) => b.dataset.input === which || b.dataset.result === which);
+      assert.ok(button, `${name}=${which} 탭이 없다`);
+      button.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+      await settle();
+      await settle();
+    },
   };
 }
 
@@ -192,7 +220,9 @@ const QR_LIMIT_BYTES = 2953;
 const QR_LIMIT_PIECES = 128;
 
 const PACK_RESULT = {
-  dest: "C:\\out\\bundle.txt",
+  // 저장 위치를 나중에 묻게 되면서 결과는 **임시 폴더**에 먼저 앉는다. 사람이 고른 자리는
+  // `save_container` 가 옮겨 적은 뒤에야 생긴다.
+  dest: "C:\\temp\\packer-out-a1\\bundle.txt",
   container_bytes: 1024,
   original_bytes: 4096,
   file_count: 2,
@@ -276,6 +306,8 @@ function handlers(overrides = {}) {
     copy_container_to_clipboard: async () => 4096,
 
     pack: async () => PACK_RESULT,
+    pack_text: async () => PACK_RESULT,
+    save_container: async () => 1024,
 
     unpack: async () => ({
       dest: "C:\\out\\restored",
@@ -446,7 +478,7 @@ describe("암호화 키", () => {
 });
 
 describe("묶고 암호화하기", () => {
-  it("경로·키·저장 위치를 그대로 pack 에 넘긴다", async () => {
+  it("경로와 키를 그대로 pack 에 넘긴다", async () => {
     const app = await boot();
     await app.drop(["C:\\src\\a.txt", "C:\\src\\b.bin"]);
     await app.type("pack-key", "열려라 참깨");
@@ -457,17 +489,25 @@ describe("묶고 암호화하기", () => {
     // jsdom 창의 배열은 프로토타입이 달라 strict 비교를 통과하지 못한다. 값만 본다.
     assert.deepEqual(Array.from(args.paths), ["C:\\src\\a.txt", "C:\\src\\b.bin"]);
     assert.equal(args.passphrase, "열려라 참깨");
-    assert.equal(args.dest, "C:\\out\\bundle.txt");
   });
 
-  it("기본 파일 이름이 .txt 로 제안된다", async () => {
+  it("묶기 전에는 저장 위치를 묻지 않는다", async () => {
+    // 결과를 텍스트로 부칠지 QR 로 비출지는 크기를 알아야 정할 수 있고, 그 크기는 묶어 봐야
+    // 나온다. QR 로 비추고 말 것이었다면 파일은 애초에 만들 필요가 없었다.
     const app = await boot();
-    await app.drop(["C:\\src\\a.txt"]);
-    await app.type("pack-key", "pw123456");
-    await app.click("pack-submit");
+    await packOnce(app);
 
-    const args = app.argsOf("pick_save_path");
-    assert.ok(args.suggestedName.endsWith(".txt"), `제안된 이름: ${args.suggestedName}`);
+    assert.equal(app.called("pick_save_path"), false);
+    assert.equal(app.argsOf("pack").dest, null);
+    assert.equal(app.visible("pack-output"), true);
+  });
+
+  it("아직 저장되지 않았다는 것을 결과에 적는다", async () => {
+    const app = await boot();
+    await packOnce(app);
+
+    assert.match(app.text("pack-save-note"), /아직 파일로 저장하지 않았습니다/);
+    assert.equal(app.visible("pack-reveal"), false, "저장하기 전에는 열어 볼 자리가 없다");
   });
 
   it("성공하면 절약률과 안내를 보여 준다", async () => {
@@ -478,16 +518,6 @@ describe("묶고 암호화하기", () => {
     assert.equal(app.hook("pack-status").dataset.kind, "ok");
     assert.match(app.text("pack-status"), /파일 2개를 텍스트로 묶었습니다/);
     assert.match(app.text("pack-status"), /75% 절약/);
-    assert.equal(app.visible("pack-reveal"), true);
-  });
-
-  it("저장 위치를 취소하면 아무것도 하지 않는다", async () => {
-    const app = await boot({ pick_save_path: async () => null });
-    await packOnce(app);
-
-    assert.equal(app.called("pack"), false);
-    assert.equal(app.visible("pack-status"), false);
-    assert.equal(app.visible("pack-output"), false);
   });
 
   it("실패하면 Rust 가 준 한국어 문장을 그대로 띄운다", async () => {
@@ -526,6 +556,224 @@ describe("묶고 암호화하기", () => {
   });
 });
 
+describe("입력 모드 — 파일 선택 / 텍스트 입력", () => {
+  it("처음에는 파일 선택 모드로 선다", async () => {
+    const app = await boot();
+    const panels = Array.from(
+      app.window.document.querySelectorAll('[data-pk="pack-input-panel"]'),
+    );
+    assert.equal(panels.find((p) => p.dataset.input === "files").hidden, false);
+    assert.equal(panels.find((p) => p.dataset.input === "text").hidden, true);
+  });
+
+  it("텍스트 입력으로 바꾸면 드롭존 대신 글 칸이 선다", async () => {
+    const app = await boot();
+    await app.subtab("pack-input-tab", "text");
+
+    const panels = Array.from(
+      app.window.document.querySelectorAll('[data-pk="pack-input-panel"]'),
+    );
+    assert.equal(panels.find((p) => p.dataset.input === "files").hidden, true);
+    assert.equal(panels.find((p) => p.dataset.input === "text").hidden, false);
+  });
+
+  it("텍스트 모드에서는 글과 키가 모두 있어야 묶기가 열린다", async () => {
+    const app = await boot();
+    await app.subtab("pack-input-tab", "text");
+    await app.type("pack-key", "pw123456");
+    assert.equal(app.hook("pack-submit").disabled, true, "빈 글로는 묶을 것이 없다");
+
+    await app.type("pack-text", "  \n  ");
+    assert.equal(app.hook("pack-submit").disabled, true, "공백만 있는 것도 빈 글이다");
+
+    await app.type("pack-text", "옮길 메모 한 줄");
+    assert.equal(app.hook("pack-submit").disabled, false);
+  });
+
+  it("적은 글을 pack_text 로 넘긴다 — 임시 파일을 거치지 않는다", async () => {
+    const app = await boot();
+    await app.subtab("pack-input-tab", "text");
+    await app.type("pack-text-name", "회의록");
+    await app.type("pack-text", "첫 줄\n둘째 줄");
+    await app.type("pack-key", "pw123456");
+    await app.click("pack-submit");
+
+    const args = app.argsOf("pack_text");
+    assert.ok(args, "pack_text 가 호출되지 않았다");
+    assert.equal(args.text, "첫 줄\n둘째 줄");
+    assert.equal(args.name, "회의록");
+    assert.equal(args.passphrase, "pw123456");
+    assert.equal(args.dest, null);
+    assert.equal(app.called("pack"), false, "파일 쪽 명령이 함께 불리면 안 된다");
+  });
+
+  it("이름을 비워 두면 Rust 가 기본 이름을 정하게 둔다", async () => {
+    const app = await boot();
+    await app.subtab("pack-input-tab", "text");
+    await app.type("pack-text", "이름 없는 메모");
+    await app.type("pack-key", "pw123456");
+    await app.click("pack-submit");
+
+    // 빈 문자열이 아니라 null 이다. 기본값을 JS 에 한 번 더 적어 두면 언젠가 어긋난다.
+    assert.equal(app.argsOf("pack_text").name, null);
+  });
+
+  it("글자 수를 세어 준다 — 묶기 전에 크기를 가늠할 유일한 숫자다", async () => {
+    const app = await boot();
+    await app.subtab("pack-input-tab", "text");
+    assert.equal(app.text("pack-text-count"), "");
+    await app.type("pack-text", "12345");
+    assert.match(app.text("pack-text-count"), /5자/);
+  });
+
+  it("모드를 오가도 담아 둔 것이 사라지지 않는다", async () => {
+    const app = await boot();
+    await app.drop(["C:\\src\\a.txt"]);
+    await app.subtab("pack-input-tab", "text");
+    await app.type("pack-text", "지워지면 안 되는 글");
+    await app.subtab("pack-input-tab", "files");
+
+    assert.equal(app.rows().length, 1, "파일 목록이 사라졌다");
+    await app.subtab("pack-input-tab", "text");
+    assert.equal(app.value("pack-text"), "지워지면 안 되는 글");
+  });
+
+  it("파일이 담겨 있어도 텍스트 모드에서는 글만 묶는다", async () => {
+    const app = await boot();
+    await app.drop(["C:\\src\\a.txt"]);
+    await app.subtab("pack-input-tab", "text");
+    await app.type("pack-text", "이것만 묶는다");
+    await app.type("pack-key", "pw123456");
+    await app.click("pack-submit");
+
+    assert.equal(app.called("pack"), false);
+    assert.equal(app.argsOf("pack_text").text, "이것만 묶는다");
+  });
+
+  it("'모두 비우기' 는 파일 목록만 비운다", async () => {
+    const app = await boot();
+    await app.subtab("pack-input-tab", "text");
+    await app.type("pack-text", "남아 있어야 하는 글");
+    await app.subtab("pack-input-tab", "files");
+    await app.drop(["C:\\src\\a.txt"]);
+    await app.click("pack-clear");
+
+    assert.equal(app.rows().length, 0);
+    assert.equal(app.value("pack-text"), "남아 있어야 하는 글");
+  });
+});
+
+describe("결과 모드 — 텍스트 / QR 탭", () => {
+  it("묶고 나서야 결과 탭이 뜨고, 텍스트 쪽이 먼저 열린다", async () => {
+    const app = await boot();
+    assert.equal(app.visible("pack-result"), false);
+
+    await packOnce(app);
+    assert.equal(app.visible("pack-result"), true);
+    const panels = Array.from(
+      app.window.document.querySelectorAll('[data-pk="pack-result-panel"]'),
+    );
+    assert.equal(panels.find((p) => p.dataset.result === "text").hidden, false);
+    assert.equal(panels.find((p) => p.dataset.result === "qr").hidden, true);
+  });
+
+  it("QR 탭으로 옮기면 그림 쪽이 열린다", async () => {
+    const app = await boot();
+    await packOnce(app);
+    await app.subtab("pack-result-tab", "qr");
+
+    const panels = Array.from(
+      app.window.document.querySelectorAll('[data-pk="pack-result-panel"]'),
+    );
+    assert.equal(panels.find((p) => p.dataset.result === "qr").hidden, false);
+    assert.equal(panels.find((p) => p.dataset.result === "text").hidden, true);
+    assert.equal(app.visible("pack-qr"), true);
+  });
+
+  it("QR 탭에서 나가면 흘려 보내던 것을 멈춘다", async () => {
+    // 안 보이는 화면에서 프레임 번호만 앞으로 가면 폰은 그 번호들을 영영 못 본다.
+    const app = await boot({
+      pack: async () => ({
+        ...PACK_RESULT,
+        container_bytes: 400 * 1024,
+        qr_plan: null,
+        qr_first: null,
+        qr_omitted: true,
+      }),
+    });
+    await packOnce(app, "pw123456");
+    await app.subtab("pack-result-tab", "qr");
+    await app.click("pack-qr-stream-start");
+    assert.equal(app.text("pack-qr-stream-start"), "그만 보내기");
+
+    await app.subtab("pack-result-tab", "text");
+    assert.ok(app.called("qr_stream_close"), "탭을 떠나면 붙잡은 바이트를 놓아야 한다");
+    assert.equal(app.text("pack-qr-stream-start"), "스트림으로 보내기");
+  });
+
+  it("'파일로 저장' 이 위치를 묻고 그 자리로 옮겨 적는다", async () => {
+    const app = await boot();
+    await packOnce(app);
+    assert.equal(app.called("pick_save_path"), false, "묶을 때는 묻지 않는다");
+
+    await app.click("pack-save");
+
+    assert.ok(app.argsOf("pick_save_path").suggestedName.endsWith(".txt"));
+    // 경로를 Rust 로 넘기지 않는다 — 원본은 Rust 가 붙잡고 있는 결과 하나뿐이다.
+    assert.deepEqual(Object.keys(app.argsOf("save_container")), ["dest"]);
+    assert.equal(app.argsOf("save_container").dest, "C:\\out\\bundle.txt");
+    assert.match(app.text("pack-save-note"), /C:\\out\\bundle\.txt/);
+    assert.match(app.text("pack-save-note"), /저장했습니다/);
+    assert.equal(app.visible("pack-reveal"), true);
+  });
+
+  it("저장 위치를 취소하면 아무것도 옮기지 않는다", async () => {
+    const app = await boot({ pick_save_path: async () => null });
+    await packOnce(app);
+    await app.click("pack-save");
+
+    assert.equal(app.called("save_container"), false);
+    // 묶은 결과 자체는 그대로 있다 — 취소한 것은 저장이지 묶기가 아니다.
+    assert.equal(app.visible("pack-output"), true);
+    assert.match(app.text("pack-save-note"), /아직 파일로 저장하지 않았습니다/);
+  });
+
+  it("저장에 실패하면 이유를 그대로 띄운다", async () => {
+    const app = await boot({
+      save_container: async () => {
+        throw { code: "Io", message: "D:\\x 로 저장할 수 없습니다: 액세스가 거부되었습니다" };
+      },
+    });
+    await packOnce(app);
+    await app.click("pack-save");
+
+    assert.equal(app.hook("pack-status").dataset.kind, "error");
+    assert.match(app.text("pack-status"), /액세스가 거부되었습니다/);
+    assert.equal(app.visible("pack-reveal"), false);
+  });
+
+  it("저장한 뒤 입력 모드를 바꿔도 열어 볼 자리가 남는다", async () => {
+    const app = await boot();
+    await packOnce(app);
+    await app.click("pack-save");
+    await app.subtab("pack-input-tab", "text");
+
+    assert.equal(app.visible("pack-reveal"), true, "저장해 둔 파일로 가는 길이 끊기면 안 된다");
+    assert.match(app.text("pack-save-note"), /저장했습니다/);
+  });
+
+  it("다시 묶으면 저장 표시가 처음으로 돌아간다", async () => {
+    const app = await boot();
+    await packOnce(app);
+    await app.click("pack-save");
+    assert.equal(app.visible("pack-reveal"), true);
+
+    await app.click("pack-submit");
+    assert.match(app.text("pack-save-note"), /아직 파일로 저장하지 않았습니다/);
+    assert.equal(app.visible("pack-reveal"), false, "지난 결과를 가리키는 자리가 남으면 안 된다");
+  });
+});
+
 describe("텍스트 결과 — 요청의 핵심", () => {
   it("묶은 결과를 복사할 수 있는 텍스트로 보여 준다", async () => {
     const app = await boot();
@@ -555,7 +803,8 @@ describe("텍스트 결과 — 요청의 핵심", () => {
     // 본문을 IPC 로 한 번 더 넘기지 않고 Rust 가 파일에서 직접 읽어 올린다.
     const args = app.argsOf("copy_container_to_clipboard");
     assert.ok(args, "클립보드 명령이 호출되지 않았다");
-    assert.equal(args.path, "C:\\out\\bundle.txt");
+    // 저장 전에는 임시 폴더의 것을 읽는다. 복사는 저장과 무관하게 언제든 된다.
+    assert.equal(args.path, "C:\\temp\\packer-out-a1\\bundle.txt");
     assert.equal(app.hook("pack-status").dataset.kind, "ok");
     assert.match(app.text("pack-status"), /클립보드에 복사했습니다/);
   });
@@ -962,16 +1211,23 @@ describe("QR 코드 — 휴대폰으로 옮기기", () => {
     await app.click("pack-qr-stream-start");
 
     assert.equal(app.hook("pack-qr").dataset.state, "stream");
-    assert.equal(app.attr("pack-qr-image", "src"), "data:image/png;base64,FRAME0");
+    // 기본은 두 장이다. 한 화면에 두 프레임이 나란히 선다.
+    assert.deepEqual(app.tiles(), [
+      "data:image/png;base64,FRAME0",
+      "data:image/png;base64,FRAME1",
+    ]);
+    assert.equal(app.visible("pack-qr-stream-frame"), true);
+    assert.equal(app.visible("pack-qr-image"), false, "조각 모드의 그림판은 접혀 있어야 한다");
     // 조각 모드의 넘기기는 뜻이 없다 — 끝이 없으므로 '다음' 도 없다.
     assert.equal(app.visible("pack-qr-nav"), false);
 
-    // 예상 시간을 그대로 적어 준다. 45분이 걸릴 일을 말없이 시작하면 안 된다.
     const note = app.text("pack-qr-note");
     assert.match(note, /317장/);
-    assert.match(note, /분 걸립니다/);
     // 기본 카메라로 안 된다는 사실을 감추지 않는다.
     assert.match(note, /기본 카메라로 찍어 붙여넣을 수 없습니다/);
+    // 예상 시간은 넘김 속도와 타일 수의 곱이라 그 둘이 붙어 있는 자리에서 적는다. 45분이
+    // 걸릴 일을 말없이 시작하지 않는다는 약속은 시작하자마자 그려지는 이 줄이 지킨다.
+    assert.match(app.text("pack-qr-tiles-note"), /한 바퀴에 약 \d+분/);
 
     await app.wait(800);
     // 보낸 장수만 세면 진행을 볼 수 없다. "한 바퀴" 대비로 적는다 — 그 양(frames_needed)은
@@ -981,7 +1237,182 @@ describe("QR 코드 — 휴대폰으로 옮기기", () => {
     const sent = Number(index.split(" ")[0]);
     assert.ok(sent >= 2, `${sent}장만 보냈다`);
     assert.match(app.text("pack-qr-stream-note"), /한 바퀴의 \d+%/);
-    assert.notEqual(app.attr("pack-qr-image", "src"), "data:image/png;base64,FRAME0");
+    assert.notEqual(app.tiles()[0], "data:image/png;base64,FRAME0");
+  });
+
+  it("한 화면에 1·2·4장을 세울 수 있다", async () => {
+    const app = await boot({
+      pack: async () => ({
+        ...PACK_RESULT,
+        container_bytes: 400 * 1024,
+        qr_plan: null,
+        qr_first: null,
+        qr_omitted: true,
+      }),
+    });
+    await packOnce(app, "pw123456");
+
+    await app.pickTiles(1);
+    await app.click("pack-qr-stream-start");
+    assert.deepEqual(app.tiles(), ["data:image/png;base64,FRAME0"]);
+    await app.click("pack-qr-stream-start");
+
+    await app.pickTiles(4);
+    await app.click("pack-qr-stream-start");
+    const four = app.tiles();
+    assert.equal(four.length, 4, `${four.length}장이 섰다`);
+    // 프레임 번호가 겹치면 폰이 셋을 중복으로 버린다. 넷 다 서로 달라야 한다.
+    assert.equal(new Set(four).size, 4, `번호가 겹쳤다: ${four.join(", ")}`);
+    // 4장은 한 줄로 늘어놓지 않는다 — 같은 폭에서 2×2 가 더 크게 담긴다.
+    assert.equal(app.hook("pack-qr-stream-grid").dataset.cols, "2");
+  });
+
+  it("타일을 늘려도 그림은 정수 배율로만 커진다", async () => {
+    // 배율에 소수점이 붙으면 모듈 폭이 3px/4px 로 들쭉날쭉해져 초점이 맞아도 안 읽힌다.
+    // 133모듈에서 한 장이면 4배(532px), 두 장이면 판을 넓혀도 3배(399px)가 한계다.
+    const app = await boot({
+      pack: async () => ({
+        ...PACK_RESULT,
+        container_bytes: 400 * 1024,
+        qr_plan: null,
+        qr_first: null,
+        qr_omitted: true,
+      }),
+    });
+    await packOnce(app, "pw123456");
+
+    await app.pickTiles(1);
+    await app.click("pack-qr-stream-start");
+    assert.deepEqual(app.tileWidths(), ["532px"]);
+    await app.click("pack-qr-stream-start");
+
+    await app.pickTiles(2);
+    await app.click("pack-qr-stream-start");
+    assert.deepEqual(app.tileWidths(), ["399px", "399px"]);
+    for (const width of app.tileWidths()) {
+      assert.equal(Number(width.replace("px", "")) % 133, 0, `${width} 가 정수 배율이 아니다`);
+    }
+  });
+
+  it("타일 수를 처리량으로 적어 준다 — 속도 조절과 같은 단위로", async () => {
+    const app = await boot({
+      pack: async () => ({
+        ...PACK_RESULT,
+        container_bytes: 400 * 1024,
+        qr_plan: null,
+        qr_first: null,
+        qr_omitted: true,
+      }),
+    });
+    await packOnce(app, "pw123456");
+    app.hook("pack-qr-stream-speed").value = "500";
+
+    await app.pickTiles(2);
+    // 500ms 에 두 장이면 초당 4.0장이다.
+    assert.match(app.text("pack-qr-tiles-note"), /초당 4\.0장/);
+    // 넘김 횟수가 그대로라는 것이 이 조작의 요지다. 그 말을 적어 둔다.
+    assert.match(app.text("pack-qr-tiles-note"), /넘김 횟수는 그대로/);
+
+    await app.pickTiles(1);
+    assert.match(app.text("pack-qr-tiles-note"), /초당 2\.0장/);
+  });
+
+  it("설정을 바꾸면 한 바퀴 시간도 같이 고쳐 준다", async () => {
+    // 시작할 때 `pack-qr-note` 에 적어 둔 숫자는 설정을 바꾸는 순간 거짓이 된다. 두 조작이
+    // 붙어 있는 자리에서 결과도 같이 보여야 어느 쪽을 만질지 정할 수 있다.
+    const app = await boot({
+      pack: async () => ({
+        ...PACK_RESULT,
+        container_bytes: 400 * 1024,
+        qr_plan: null,
+        qr_first: null,
+        qr_omitted: true,
+      }),
+    });
+    await packOnce(app, "pw123456");
+    // 스트림이 열리기 전에는 잴 것이 없다. 없는 숫자를 지어내지 않는다.
+    assert.doesNotMatch(app.text("pack-qr-tiles-note"), /한 바퀴에 약/);
+
+    app.hook("pack-qr-stream-speed").value = "1000";
+    await app.pickTiles(1);
+    await app.click("pack-qr-stream-start");
+    // 317프레임 × 1000ms ÷ 1장 = 317초 ≈ 5분.
+    assert.match(app.text("pack-qr-tiles-note"), /한 바퀴에 약 5분/);
+
+    await app.pickTiles(4);
+    // 같은 속도에 네 장이면 4분의 1이다.
+    assert.match(app.text("pack-qr-tiles-note"), /한 바퀴에 약 1분/);
+  });
+
+  it("폰이 못 따라오는 설정이면 그렇게 말해 준다", async () => {
+    // 초당 12장 언저리가 ML Kit 의 천장이다. 그 위로는 보낸 프레임이 그냥 지나가므로,
+    // 더 늘리는 것이 이득이 0 이 아니라 마이너스가 된다.
+    const app = await boot({
+      pack: async () => ({
+        ...PACK_RESULT,
+        container_bytes: 400 * 1024,
+        qr_plan: null,
+        qr_first: null,
+        qr_omitted: true,
+      }),
+    });
+    await packOnce(app, "pw123456");
+
+    app.hook("pack-qr-stream-speed").value = "300";
+    await app.pickTiles(2);
+    assert.doesNotMatch(app.text("pack-qr-tiles-note"), /천장을 넘어서/);
+
+    // 300ms 에 네 장이면 초당 13.3장 — 천장 위다.
+    await app.pickTiles(4);
+    assert.match(app.text("pack-qr-tiles-note"), /천장을 넘어서/);
+    assert.match(app.text("pack-qr-tiles-note"), /초당 n장/);
+  });
+
+  it("흘려 보내는 중에 타일 수를 바꾸면 다음 화면부터 먹는다", async () => {
+    const app = await boot({
+      pack: async () => ({
+        ...PACK_RESULT,
+        container_bytes: 400 * 1024,
+        qr_plan: null,
+        qr_first: null,
+        qr_omitted: true,
+      }),
+    });
+    await packOnce(app, "pw123456");
+
+    app.hook("pack-qr-stream-speed").value = "300";
+    await app.pickTiles(2);
+    await app.click("pack-qr-stream-start");
+    assert.equal(app.tiles().length, 2);
+
+    await app.pickTiles(4);
+    await app.wait(700);
+    assert.equal(app.tiles().length, 4, "바꾼 수가 다음 화면부터 서야 한다");
+    assert.equal(new Set(app.tiles()).size, 4);
+  });
+
+  it("타일 수만큼 한 번에 세므로 진행도 그만큼 빨리 찬다", async () => {
+    const app = await boot({
+      pack: async () => ({
+        ...PACK_RESULT,
+        container_bytes: 400 * 1024,
+        qr_plan: null,
+        qr_first: null,
+        qr_omitted: true,
+      }),
+    });
+    await packOnce(app, "pw123456");
+
+    app.hook("pack-qr-stream-speed").value = "300";
+    await app.pickTiles(4);
+    await app.click("pack-qr-stream-start");
+    await app.wait(700);
+
+    const index = app.text("pack-qr-index");
+    const sent = Number(index.split(" ")[0]);
+    // 세 화면이면 12장이다. 타이머 오차를 감안해 두 화면(8장)만 요구한다.
+    assert.ok(sent >= 8, `${sent}장만 보냈다 — 화면마다 4장이 나가야 한다`);
+    assert.equal(sent % 4, 0, `${sent}장 — 화면 단위로 떨어져야 한다`);
   });
 
   it("스트림을 멈추면 컨테이너를 붙잡고 있지 않는다", async () => {
@@ -1003,6 +1434,9 @@ describe("QR 코드 — 휴대폰으로 옮기기", () => {
     assert.ok(app.called("qr_stream_close"), "붙잡고 있던 바이트를 놓아야 한다");
     assert.equal(app.text("pack-qr-stream-start"), "스트림으로 보내기");
     assert.equal(app.visible("pack-qr-image"), false);
+    assert.equal(app.visible("pack-qr-stream-frame"), false);
+    // 판에 남은 그림은 이미 지나간 프레임이다. 다음에 켤 때 한 박자 서 있으면 안 된다.
+    assert.deepEqual(app.tiles(), []);
   });
 
   it("빠르게 보내기를 켜야 300ms 아래가 열린다", async () => {

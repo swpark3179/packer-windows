@@ -13,15 +13,42 @@ RlNYUEFDSzEBAAEBAQAAAEK5K6b6r1aIIlxEpDdMCbgnJMwY3L43uqdbB7QKUNsBAAABAAMAAAAE
 -----END PACKER CONTAINER-----
 ```
 
-- **묶기** — 창으로 파일/폴더를 끌어다 놓고 암호화 키를 넣은 뒤 "묶고 암호화하기".
-  압축 + 직렬화 + 암호화를 한 번에 처리하고 `.txt` 로 저장한다. 결과 텍스트를 화면에서 바로
-  확인하고 "전체 복사" 로 클립보드에 담을 수 있다. **QR 코드로도 띄운다** — 한 장에 담기지
-  않으면 여러 장으로 나눠 한 번에 한 장씩 보여 주고, 사용자가 순서대로 스캔해 이어 붙인다.
+- **묶기** — 무엇을 묶을지 먼저 고른다. **파일 선택**은 창으로 파일/폴더를 끌어다 놓는
+  길이고, **텍스트 입력**은 창에 바로 친 글을 그대로 묶는 길이다. 암호화 키를 넣고 "묶고
+  암호화하기" 를 누르면 압축 + 직렬화 + 암호화를 한 번에 처리한다.
+- **결과** — 어떻게 옮길지도 탭으로 고른다. **텍스트로 보기**는 결과를 화면에 띄우고 "전체
+  복사" 와 "파일로 저장" 을 준다. **QR 코드**는 같은 결과를 그림으로 띄운다 — 한 장에 담기지
+  않으면 여러 장으로 나눠 보여 주고, 조각 모드에도 안 담기는 크기면 스트림 모드로 흘려 보낸다
+  (한 화면에 1·2·4장까지 세울 수 있다).
 - **풀기** — `.txt` 파일을 놓거나 **받은 텍스트를 붙여넣고** 같은 키로 "풀고 복호화하기".
   복호화 + 역직렬화 + 압축해제 후 지정한 폴더에 모아 준다.
 
 "묶고 암호화하기" 가 성공하면 그 키가 풀기 탭에 자동으로 채워진다. **키는 메모리에만 있고
 디스크·localStorage 어디에도 저장하지 않는다** — 앱을 닫으면 사라진다.
+
+### 저장 위치는 묶은 **뒤에** 묻는다
+
+한때 "묶고 암호화하기" 를 누르면 저장 대화상자가 먼저 떴다. 그러면 사람은 결과가 얼마나
+큰지도, QR 로 보낼 수 있는 크기인지도 모르는 채로 파일 자리를 정해야 한다 — QR 로 비추고 말
+것이었다면 그 파일은 애초에 만들 필요가 없었다.
+
+지금은 결과가 먼저 **임시 폴더**에 앉고(`commands::PackedSlot`), 텍스트 탭의 "파일로 저장" 이
+사람이 고른 자리로 옮겨 적는다(`save_container`). 그래서 화면은 결과가 뜬 순간부터
+**아직 저장되지 않았다**고 적어 둔다 — 그 말이 없으면 사람은 저장한 줄 알고 앱을 닫는다.
+임시 컨테이너의 수명은 정확히 "다음 묶기까지" 이고, 그때 `PackedSlot::put` 이 지운다.
+
+`save_container` 는 **경로를 화면에서 받지 않는다.** 원본은 Rust 가 붙잡고 있는 결과 하나뿐이라,
+이 명령으로는 방금 묶은 것 말고 다른 파일을 복사해 낼 수 없다.
+
+### 텍스트 입력 모드는 평문을 디스크에 떨어뜨리지 않는다
+
+창에 친 글을 임시 파일로 한 번 쓰고 지우는 편이 훨씬 짧은 길이다. 파이프라인이 파일에서만
+읽으면 되고 `archive` 를 손댈 일도 없다. 하지만 **지운 자리를 덮어쓰지는 못한다** — 이 앱이
+없애려는 노출을 스스로 하나 만드는 셈이 된다.
+
+그래서 `archive::Source` 를 열거형으로 두고 `Source::Memory` 갈래를 냈다.
+`archive::scan_text` 가 바이트를 그대로 들고 매니페스트를 세우고, `write_payload` 는 파일이든
+메모리든 같은 `Read` 로 흘려보낸다. 평문은 어느 시점에도 디스크에 앉지 않는다.
 
 ---
 
@@ -255,16 +282,18 @@ Base64 를 한 겹 벗기면 33% 를 더 담을 수 있고, 어차피 사람이 
 어긋날 수 있는 자리만 하나 늘어난다.
 
 **처리율.** payload 는 프레임당 1,441바이트다(`qr::stream_capacity()` 1,465에서 헤더 24를 뺀
-값 — 125모듈 상한이 버전 27까지 허용한다). 프레임당 350ms 면 **초당 약 4.1 KB**, 150ms 면
-**초당 약 9.6 KB** 다:
+값 — 125모듈 상한이 버전 27까지 허용한다). 한 화면에 한 장씩 350ms 로 넘기면 **초당 약
+4.1 KB** 이고, 아래의 두 조작이 그 값을 곱한다 — 넘김 속도(150ms 까지)와 타일 수(1·2·4장):
 
-| 컨테이너 | 프레임 | 350ms | 150ms |
-| --- | --- | --- | --- |
-| 1 MB | 약 760 | 약 4분 | 약 2분 |
-| 10 MB | 약 7,800 | 약 45분 | 약 20분 |
-| 16 MiB (상한) | 약 12,500 | 약 73분 | 약 31분 |
+| 컨테이너 | 프레임 | 350ms·1장 | 350ms·2장 | 150ms·2장 |
+| --- | --- | --- | --- | --- |
+| 1 MB | 약 760 | 약 4분 | 약 2분 | 약 1분 |
+| 10 MB | 약 7,800 | 약 45분 | 약 23분 | 약 10분 |
+| 16 MiB (상한) | 약 12,500 | 약 73분 | 약 37분 | 약 16분 |
 
-화면은 시작하기 전에 이 숫자를 그대로 적는다. 45분이 걸릴 일을 말없이 시작하면 안 된다.
+화면은 시작하는 순간 이 숫자를 그대로 적는다 — 45분이 걸릴 일을 말없이 시작하면 안 된다.
+적는 자리는 **넘김 속도와 타일 수 바로 옆**이다. 걸리는 시간은 그 둘의 곱이라, 한 번 적어 두면
+어느 쪽을 만지든 곧 거짓말이 된다.
 16 MiB 상한은 "여기까지가 쓸 만하다" 가 아니라 **"여기부터는 확실히 아니다"** 라는 선이다 —
 컨테이너는 어차피 텍스트라서 클립보드(64 MiB)나 메일 첨부가 몇 초면 끝난다. QR 이 이기는 경우는
 물리적으로 망이 끊긴 자리뿐이다.
@@ -303,6 +332,43 @@ WCAG 2.3.1 이 경고하는 구간이다. 기본값 350ms(초당 2.9회)는 그 
 가 된다. 지금은 조각 모드처럼 **세 프레임을 앞서 만들어 두고**(`STREAM_PREFETCH`), 다음 프레임을
 그릴 **시각**을 잡는다. 늦었을 때 몰아 넘기지는 않는다 — 따라잡기는 프레임 두 장을 거의 동시에
 지나가게 하는 일이라 폰이 둘 다 놓친다.
+
+#### 한 화면에 여러 장 — 카메라 프레임의 절반이 놀고 있었다
+
+넘김 속도를 올리는 것 말고 처리량을 늘리는 길이 하나 더 있고, **그쪽이 값이 더 싸다.**
+
+폰 카메라는 16:9(1920×1080)인데 QR 은 정사각형이다. 한 장만 띄우면 심볼이 프레임의 높이를
+꽉 채워도 좌우가 통째로 남는다 — 실제로 쓰이는 넓이가 56% 다. 두 장을 나란히 세우면 그 빈
+자리에 들어간다:
+
+| 배치 | 심볼 한 변 | 카메라 픽셀/모듈 | 처리량 |
+| --- | --- | --- | --- |
+| 1장 | 1080 | 8.1 | 1× |
+| **2장 가로** | 960 | **7.2** | **2×** |
+| 3장 가로 | 640 | 4.8 | 3× |
+| 2×2 | 540 | 4.1 | 4× |
+
+(심볼 한 변은 133모듈 — 125모듈 상한에 여백 8을 더한 값이다.) 두 장은 해상도를 11% 잃고
+처리량이 2배다. 3장을 한 줄로 늘어놓는 것보다 2×2 가 낫기 때문에 고를 수 있는 값은 **1·2·4**
+장이고, 기본값은 2다.
+
+**받는 쪽은 손댈 것이 없다.** 프레임마다 번호가 헤더에 있고 LT 부호라 순서도 중복도 상관없으며,
+폰의 스캐너는 이미 한 카메라 프레임에서 찾은 심볼을 전부 넘긴다 — `mobile/www/bridge.js` 의
+`onBarcodes` 가 `event.barcodes` 배열을 훑는다.
+
+**왜 속도를 올리는 것보다 싼가.** 넘김 **횟수**가 그대로이기 때문이다. 위에서 든 두 벽 중
+롤링 셔터가 프레임을 찢는 비율은 넘기는 순간에 붙는 비용이라 타일을 늘려도 늘지 않고, 초당 3회를
+넘겨 바뀌는 화면을 경고하는 WCAG 2.3.1 도 마찬가지다. 350ms 에 두 장은 175ms 에 한 장과 처리량이
+같은데, 화면은 여전히 초당 2.9회만 바뀐다 — 그래서 '빠르게 보내기' 를 켜지 않고도 2배가 열린다.
+
+**남는 벽은 하나, 폰이 초당 푸는 심볼 수(8~12장)다.** 350ms 에 두 장이면 초당 5.7장이라 아직
+아래에 있고, 네 장이면 11.4장으로 천장에 닿는다. 그래서 4장은 고를 수 있게만 두고 기본값으로
+삼지 않는다. 화면은 지금 설정의 '초당 몇 장' 을 그대로 적고, 그 선을 넘으면 넘긴 프레임이 그냥
+지나간다는 것과 **확인은 폰에서만 된다**는 것(PC 는 보낸 장수만 센다)을 함께 말해 준다.
+
+그림 크기는 **정수 배율만** 쓴다. 133모듈에서 한 장이면 4배(532px), 두 장이면 판을 넓혀도
+3배(399px)가 한계다 — 모듈당 3px 이 하한이고, 그 아래로 내려가느니 판이 넘치게 두는 편이 낫다.
+인식되지 않는 그림은 작아도 쓸모가 없다.
 
 #### 다시 켤 때 프레임 번호를 0 으로 되돌리면 안 된다
 
@@ -367,9 +433,12 @@ xorshift 를 규격으로 못박고(자바스크립트에 64비트 정수가 없
 | 영역 | 훅 |
 | --- | --- |
 | 탭 | `tab[data-tab=pack\|unpack]`, `panel[data-tab=pack\|unpack]` |
-| 묶기 | `pack-dropzone` `pack-list` `pack-empty` `pack-summary` `pack-clear` `pack-add-files` `pack-add-folders` `pack-key` `pack-key-toggle` `pack-key-strength` `pack-submit` `pack-progress` `pack-progress-fill` `pack-progress-label` `pack-status` `pack-reveal` |
-| 결과 텍스트 | `pack-output` `pack-output-text` `pack-output-copy` `pack-output-note` |
-| 결과 QR | `pack-qr` (`data-state=single\|split\|toobig\|stream`) `pack-qr-image` `pack-qr-note` `pack-qr-nav` `pack-qr-prev` `pack-qr-next` `pack-qr-index` `pack-qr-play` `pack-qr-speed` `pack-qr-speed-label` `pack-qr-jump` `pack-qr-goto` `pack-qr-goto-go` `pack-qr-goto-clear` `pack-qr-goto-note` `pack-qr-stream` `pack-qr-stream-start` `pack-qr-stream-note` `pack-qr-stream-speed` `pack-qr-stream-speed-label` `pack-qr-stream-fast` `pack-qr-stream-fast-note` |
+| 입력 모드 | `pack-input-tab[data-input=files\|text]`, `pack-input-panel[data-input=…]` |
+| 묶기 | `pack-dropzone` `pack-list` `pack-empty` `pack-summary` `pack-clear` `pack-add-files` `pack-add-folders` `pack-key` `pack-key-toggle` `pack-key-strength` `pack-submit` `pack-progress` `pack-progress-fill` `pack-progress-label` `pack-status` |
+| 텍스트 입력 | `pack-text` `pack-text-name` `pack-text-count` |
+| 결과 모드 | `pack-result`, `pack-result-tab[data-result=text\|qr]`, `pack-result-panel[data-result=…]` |
+| 결과 텍스트 | `pack-output` `pack-output-text` `pack-output-copy` `pack-output-note` `pack-save` `pack-save-note` `pack-reveal` |
+| 결과 QR | `pack-qr` (`data-state=single\|split\|toobig\|stream`) `pack-qr-image` `pack-qr-note` `pack-qr-nav` `pack-qr-prev` `pack-qr-next` `pack-qr-index` `pack-qr-play` `pack-qr-speed` `pack-qr-speed-label` `pack-qr-jump` `pack-qr-goto` `pack-qr-goto-go` `pack-qr-goto-clear` `pack-qr-goto-note` `pack-qr-stream` `pack-qr-stream-start` `pack-qr-stream-note` `pack-qr-stream-speed` `pack-qr-stream-speed-label` `pack-qr-stream-fast` `pack-qr-stream-fast-note` `pack-qr-stream-frame` `pack-qr-stream-grid` `pack-qr-tile[value=1\|2\|4]` `pack-qr-tiles-note` |
 | 풀기 | `unpack-dropzone` `unpack-pick` `unpack-file` `unpack-file-name` `unpack-file-meta` `unpack-text` `unpack-text-clear` `unpack-source-note` `unpack-key` `unpack-key-toggle` `unpack-key-hint` `unpack-dest` `unpack-dest-pick` `unpack-submit` `unpack-progress` `unpack-progress-fill` `unpack-progress-label` `unpack-status` `unpack-reveal` |
 | 목록 행 | `row-template` (안에 `[data-field=name]` `[data-field=meta]` `[data-pk=row-remove]`) |
 
@@ -393,6 +462,9 @@ xorshift 를 규격으로 못박고(자바스크립트에 64비트 정수가 없
   모드용 `forced-color-adjust: none` 을 목업 값으로 덮어쓰지 말 것. 확대 배율은 `main.js` 가
   `png_modules` 의 정수 배로 인라인 지정하고, `.qr-index` 의 `min-width` 는 장을 넘길 때
   '다음' 버튼이 옆으로 밀리지 않게 하는 값이다.
+- **`.qr-tile-grid` 의 `gap` 은 `main.js` 의 `QR_TILE_GAP_PX` 와 같아야 한다.** 타일 배율
+  계산이 그 값으로 폭을 나누므로, 한쪽만 고치면 마지막 열이 판 밖으로 밀려 잘린다. 잘린 심볼은
+  읽히지 않는다. 열 수는 `main.js` 가 `data-cols` 로 적어 주니 CSS 에서 따로 정하지 말 것.
 
 ## 폰트
 

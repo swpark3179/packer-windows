@@ -6,11 +6,16 @@
 // 훅 목록 (없는 훅은 조용히 무시되므로 부분 이식도 안전하다):
 //
 //   탭        tab[data-tab=pack|unpack], panel[data-tab=pack|unpack]
+//   입력 모드  pack-input-tab[data-input=files|text], pack-input-panel[data-input=…]
 //   묶기      pack-dropzone, pack-list, pack-empty, pack-summary, pack-clear,
 //             pack-add-files, pack-add-folders, pack-key, pack-key-toggle,
 //             pack-key-strength, pack-submit, pack-progress, pack-progress-fill,
-//             pack-progress-label, pack-status, pack-reveal
-//   결과 텍스트 pack-output, pack-output-text, pack-output-copy, pack-output-note
+//             pack-progress-label, pack-status
+//   텍스트 입력 pack-text, pack-text-name, pack-text-count
+//   결과 모드  pack-result, pack-result-tab[data-result=text|qr],
+//             pack-result-panel[data-result=…]
+//   결과 텍스트 pack-output, pack-output-text, pack-output-copy, pack-output-note,
+//             pack-save, pack-save-note, pack-reveal
 //   결과 QR    pack-qr (data-state=single|split|toobig|stream), pack-qr-image, pack-qr-note,
 //             pack-qr-nav, pack-qr-prev, pack-qr-next, pack-qr-index,
 //             pack-qr-play, pack-qr-speed, pack-qr-speed-label,
@@ -18,7 +23,9 @@
 //             pack-qr-goto-note
 //   스트림     pack-qr-stream, pack-qr-stream-start, pack-qr-stream-note,
 //             pack-qr-stream-speed, pack-qr-stream-speed-label,
-//             pack-qr-stream-fast, pack-qr-stream-fast-note
+//             pack-qr-stream-fast, pack-qr-stream-fast-note,
+//             pack-qr-stream-frame, pack-qr-stream-grid,
+//             pack-qr-tile[value=1|2|4], pack-qr-tiles-note
 //   풀기      unpack-dropzone, unpack-pick, unpack-file, unpack-file-name,
 //             unpack-file-meta, unpack-text, unpack-text-clear, unpack-source-note,
 //             unpack-key, unpack-key-toggle, unpack-key-hint, unpack-dest,
@@ -41,10 +48,17 @@ const session = { key: "" };
 
 const state = {
   activeTab: "pack",
+  /// 무엇을 묶는지. `"files"` 면 드롭한 목록을, `"text"` 면 창에 친 글을 묶는다.
+  inputMode: "files",
+  /// 결과를 어떻게 옮길지. `"text"` | `"qr"`
+  resultTab: "text",
   busy: false,
   /// 묶을 항목. `{ path, name, kind, size, fileCount }`
   items: [],
-  /// 방금 묶어 낸 결과. `{ dest, text }`
+  /// 방금 묶어 낸 결과. `{ dest, text, savedPath }`
+  ///
+  /// `dest` 는 **임시 폴더**일 수 있다 — 저장 위치를 묻는 자리가 묶기 앞에서 뒤로 옮겨졌다.
+  /// `savedPath` 는 사람이 '파일로 저장' 으로 정한 자리이고, 저장하기 전에는 null 이다.
   packed: null,
   /// 결과 QR 의 나눔과 지금 보고 있는 장.
   /// `{ total, pngModules, index, cache, playing, timer, dwellMs, only, lap }` (없으면 null)
@@ -139,6 +153,58 @@ function setTab(tab) {
   for (const panel of all("panel")) {
     panel.hidden = panel.dataset.tab !== tab;
   }
+}
+
+/// 탭 한 줄을 고른다. 버튼과 패널이 같은 `data-*` 값으로 짝지어져 있으면 어느 줄이든 쓴다.
+function selectSubTab(tabHook, panelHook, key, value) {
+  for (const button of all(tabHook)) {
+    const isActive = button.dataset[key] === value;
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-selected", String(isActive));
+  }
+  for (const panel of all(panelHook)) {
+    panel.hidden = panel.dataset[key] !== value;
+  }
+}
+
+/**
+ * 무엇을 묶을지 고른다.
+ *
+ * **모드를 바꿔도 담아 둔 것은 지우지 않는다.** 파일 목록과 텍스트는 서로 다른 자리에 있고,
+ * 왔다 갔다 하는 사이에 한쪽이 사라지면 실수로 잃는다. 묶을 때 지금 모드의 것만 쓴다.
+ */
+function setInputMode(mode) {
+  state.inputMode = mode;
+  selectSubTab("pack-input-tab", "pack-input-panel", "input", mode);
+  // "묶을 파일을 먼저 추가해 주세요" 는 모드를 바꾸는 순간 뜻을 잃는다. 성공 안내는 남긴다.
+  clearErrorStatus("pack");
+  refreshButtons();
+}
+
+/// 결과를 어떻게 옮길지 고른다.
+function setResultTab(tab) {
+  state.resultTab = tab;
+  selectSubTab("pack-result-tab", "pack-result-panel", "result", tab);
+  // QR 탭에서 나가면 화면에 그림이 서 있어도 폰은 아무것도 못 읽는다. 그대로 돌게 두면
+  // 프레임 번호만 앞으로 가고 폰은 그 번호들을 영영 못 본다.
+  if (tab !== "qr") {
+    stopQrPlay();
+    stopQrStream();
+  }
+}
+
+/// 텍스트 입력 모드에 지금 들어 있는 글.
+function packTextValue() {
+  return el("pack-text")?.value ?? "";
+}
+
+/// 글자 수를 세어 준다. 묶기 전에 크기를 가늠할 수 있는 유일한 숫자다.
+function renderPackTextCount() {
+  const text = packTextValue();
+  setText(
+    "pack-text-count",
+    text.length === 0 ? "" : `${text.length.toLocaleString("ko-KR")}자`,
+  );
 }
 
 // ---------------------------------------------------------------- 묶기: 목록
@@ -304,6 +370,16 @@ function clearStatus(tab) {
   show(`${tab}-reveal`, false);
 }
 
+/// 오류만 걷어 낸다.
+///
+/// 성공 안내는 방금 묶어 낸 결과를 가리키는 문장이라, 입력 모드를 바꾸거나 다음에 묶을 글을
+/// 적기 시작했다고 거짓이 되지 않는다. 함께 지우면 '탐색기에서 보기' 까지 사라져서, 저장해 둔
+/// 파일로 가는 길이 이유 없이 끊긴다.
+function clearErrorStatus(tab) {
+  const node = el(`${tab}-status`);
+  if (node && node.dataset.kind === "error") setStatus(tab, "", "info");
+}
+
 function renderProgress(tab, payload) {
   show(`${tab}-progress`, true);
   const { done_bytes: done, total_bytes: total, phase, current_path: current } = payload;
@@ -411,11 +487,18 @@ function applySessionKey() {
 
 // ---------------------------------------------------------------- 버튼 상태
 
+/// 지금 모드에 묶을 것이 들어 있는지.
+function hasSomethingToPack() {
+  return state.inputMode === "text"
+    ? packTextValue().trim().length > 0
+    : state.items.length > 0;
+}
+
 function refreshButtons() {
   const packKey = el("pack-key");
   const packSubmit = el("pack-submit");
   if (packSubmit) {
-    packSubmit.disabled = state.busy || state.items.length === 0 || !(packKey && packKey.value);
+    packSubmit.disabled = state.busy || !hasSomethingToPack() || !(packKey && packKey.value);
   }
 
   const unpackKey = el("unpack-key");
@@ -456,14 +539,20 @@ function refreshButtons() {
     "pack-qr-goto",
     "pack-qr-goto-go",
     "pack-qr-goto-clear",
+    "pack-text-name",
   ]) {
     const node = el(hook);
     if (node) node.disabled = state.busy;
   }
-  for (const node of [packKey, unpackKey, el("unpack-dest"), el("unpack-text")]) {
+  for (const node of [packKey, unpackKey, el("unpack-dest"), el("unpack-text"), el("pack-text")]) {
     if (node) node.disabled = state.busy;
   }
+  // 저장은 결과가 있어야 뜻이 있다. 임시 폴더에 앉아 있는 것을 사람이 정한 자리로 옮기는 일이다.
+  const save = el("pack-save");
+  if (save) save.disabled = state.busy || !state.packed;
   for (const tab of all("tab")) tab.disabled = state.busy;
+  for (const tab of all("pack-input-tab")) tab.disabled = state.busy;
+  for (const tab of all("pack-result-tab")) tab.disabled = state.busy;
 }
 
 function setBusy(busy) {
@@ -477,32 +566,51 @@ function setBusy(busy) {
 
 /// 컨테이너 기본 파일 이름. 결과가 텍스트이므로 확장자도 `.txt` 다.
 function suggestContainerName() {
+  if (state.inputMode === "text") {
+    const base = (el("pack-text-name")?.value || "").trim().replace(/\.[^.]+$/, "");
+    if (base) return `${base}.packer.txt`;
+    return datedContainerName();
+  }
   if (state.items.length === 1) {
     const base = state.items[0].name.replace(/\.[^.]+$/, "");
     return `${base}.packer.txt`;
   }
+  return datedContainerName();
+}
+
+function datedContainerName() {
   const now = new Date();
   const pad = (n) => String(n).padStart(2, "0");
   return `packer-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}.txt`;
 }
 
 function renderPackOutput(result) {
-  state.packed = { dest: result.dest, text: result.preview || null };
+  state.packed = { dest: result.dest, text: result.preview || null, savedPath: null };
 
   const textarea = el("pack-output-text");
   if (textarea) textarea.value = result.preview || "";
 
+  show("pack-result", true);
   show("pack-output", true);
   setText(
     "pack-output-note",
     result.preview_omitted
-      ? `텍스트가 ${formatBytes(result.container_bytes)}라서 화면에는 띄우지 않았습니다. 저장된 파일을 그대로 보내 주세요.`
+      ? `텍스트가 ${formatBytes(result.container_bytes)}라서 화면에는 띄우지 않았습니다. 아래 '파일로 저장' 으로 내려받아 그대로 보내 주세요.`
       : `${formatBytes(result.container_bytes)} · 전체를 복사해 메모장이나 메신저에 붙여도 그대로 풀립니다.`,
   );
+  // **아직 어디에도 저장되지 않았다는 것을 먼저 말한다.** 예전에는 묶기 전에 저장 위치를
+  // 물었으므로 결과가 뜬 시점에 파일은 이미 그 자리에 있었다. 지금은 임시 폴더에 앉아 있고
+  // 다음 묶기에서 지워지므로, 그 사실을 감추면 사람은 저장한 줄 알고 앱을 닫는다.
+  setText(
+    "pack-save-note",
+    "아직 파일로 저장하지 않았습니다 — 다시 묶으면 이 결과는 사라집니다.",
+  );
+  show("pack-reveal", false);
 
   // 화면에 못 띄운 경우에도 클립보드로는 옮길 수 있다 (파일에서 직접 읽는다).
   const copy = el("pack-output-copy");
   if (copy) copy.disabled = false;
+  setResultTab("text");
   refreshButtons();
 }
 
@@ -511,6 +619,9 @@ function clearPackOutput() {
   const textarea = el("pack-output-text");
   if (textarea) textarea.value = "";
   show("pack-output", false);
+  show("pack-result", false);
+  setText("pack-save-note", "");
+  show("pack-reveal", false);
   // 지난 QR 이 남으면 *이전* 컨테이너를 가리키는 그림을 새 결과인 줄 알고 찍어 보낸다.
   // 텍스트를 치우는 모든 경로에서 그림도 함께 사라지도록 여기 안에 둔다.
   clearPackQr();
@@ -599,6 +710,152 @@ function renderPackQr(result) {
 /// 25% 가 된다. 빠른 구간을 열어 두려면 이 항부터 없애야 한다.
 const STREAM_PREFETCH = 3;
 
+/// 한 화면에 세울 프레임 수의 기본값.
+///
+/// **2 인 이유가 카메라 프레임의 모양에 있다.** 폰 카메라는 16:9(1920×1080)인데 QR 은
+/// 정사각형이라, 한 장만 띄우면 프레임의 좌우가 통째로 논다 — 실제로 쓰이는 넓이가 56% 다.
+/// 두 장을 나란히 세우면 심볼 한 변이 1080px 몫에서 960px 몫으로 11% 줄어드는 대신, 한 번
+/// 비출 때 두 프레임이 들어간다.
+///
+/// 파운틴 부호라 받는 쪽은 손댈 것이 없다. 프레임마다 번호가 헤더에 들어 있고 순서도 중복도
+/// 상관없으며, 폰의 스캐너는 이미 한 카메라 프레임에서 찾은 심볼을 **전부** 넘긴다
+/// (`mobile/www/bridge.js` 의 `onBarcodes` 가 `event.barcodes` 를 훑는다).
+///
+/// # 왜 속도를 올리는 것보다 나은가
+///
+/// 넘김 **횟수**가 그대로이기 때문이다. `QR_DWELL_FAST_MIN_MS` 가 설명하는 두 벽 중
+/// 롤링 셔터가 프레임을 찢는 비율은 넘기는 순간에 붙는 비용이라, 타일을 늘려도 늘지 않는다.
+/// 초당 3회를 넘겨 바뀌는 화면을 경고하는 WCAG 2.3.1 도 마찬가지다 — 350ms 에 두 장은
+/// 175ms 에 한 장과 처리량이 같은데 화면은 여전히 초당 2.9회만 바뀐다.
+///
+/// 남는 벽은 하나, **폰이 초당 푸는 심볼 수(8~12장)** 다. 350ms 에 두 장이면 초당 5.7장이라
+/// 아직 아래에 있고, 네 장이면 11.4장으로 천장에 닿는다. 그래서 4장은 고를 수 있게만 두고
+/// 기본값으로 삼지 않는다 (`renderStreamTiles` 가 그 선을 넘으면 화면에 적는다).
+const STREAM_TILES_DEFAULT = 2;
+
+/// 고를 수 있는 타일 수. 3장은 없다 — 2열로 세우는 4장이 같은 폭에서 더 많이 담는다.
+const STREAM_TILE_CHOICES = [1, 2, 4];
+
+/// 타일 하나가 한 열에서 쓰는 기준 폭(px). 한 장일 때는 조각 모드의 그림판과 같은 값이다.
+const QR_STAGE_PX = 560;
+
+/// 타일 판이 넓어질 수 있는 한도(px). 창 기본 폭(940)에서 바깥 여백을 뺀 값이다.
+const QR_STAGE_MAX_PX = 840;
+
+/// 타일 사이 여백(px). `styles.css` 의 `.qr-tile-grid` gap 과 같아야 배율 계산이 실제 자리와 맞다.
+const QR_TILE_GAP_PX = 12;
+
+/// 폰이 초당 풀 수 있는 심볼 수의 어림 천장. 이 위로는 보낸 프레임이 그냥 지나간다.
+const PHONE_SYMBOLS_PER_SECOND = 12;
+
+/// 지금 고른 타일 수.
+function streamTiles() {
+  for (const radio of all("pack-qr-tile")) {
+    if (radio.checked && STREAM_TILE_CHOICES.includes(Number(radio.value))) {
+      return Number(radio.value);
+    }
+  }
+  return STREAM_TILES_DEFAULT;
+}
+
+/// 타일 수에 따른 열 수. 4장은 한 줄로 늘어놓지 않고 2×2 로 세운다.
+function streamCols(tiles) {
+  return tiles === 4 ? 2 : tiles;
+}
+
+/**
+ * 타일 하나의 화면 폭(px).
+ *
+ * PNG 은 1모듈 = 1픽셀이므로 **정수 배율로만** 키운다. 배율에 소수점이 붙으면 모듈 폭이
+ * 3px/4px 로 들쭉날쭉해져 초점이 맞아도 인식되지 않는다. 모듈당 3px 이 하한이다 — 그 아래로
+ * 내려가느니 판이 넘치게 두는 편이 낫다. 인식되지 않는 그림은 작아도 쓸모가 없다.
+ */
+function streamTileWidth(modules, tiles) {
+  if (!(modules > 0)) return 0;
+  const cols = streamCols(tiles);
+  // 한 장이면 지금까지와 똑같은 크기다. 여러 장이면 판을 넓혀 열마다 제 몫을 준다 —
+  // 좁은 판을 그대로 나누면 타일이 하한까지 떨어져 판만 넘치고 얻는 것이 없다.
+  const stage = Math.min(QR_STAGE_PX * cols, QR_STAGE_MAX_PX);
+  const budget = Math.floor((stage - QR_TILE_GAP_PX * (cols - 1)) / cols);
+  return modules * Math.max(3, Math.min(10, Math.floor(budget / modules)));
+}
+
+/// 타일 판을 `tiles` 장에 맞춘다. 이미 맞으면 그대로 두고 그림만 갈아 끼운다.
+function ensureStreamTiles(tiles) {
+  const grid = el("pack-qr-stream-grid");
+  if (!grid) return [];
+  grid.dataset.cols = String(streamCols(tiles));
+  while (grid.childElementCount > tiles) grid.lastElementChild.remove();
+  while (grid.childElementCount < tiles) {
+    const image = document.createElement("img");
+    image.className = "qr-image";
+    image.draggable = false;
+    grid.appendChild(image);
+  }
+  return Array.from(grid.children);
+}
+
+/// 한 화면 몫을 세운다. 프레임 수와 타일 수는 부르는 쪽이 맞춰 준다.
+function paintStreamTiles(frames) {
+  const tiles = frames.length;
+  const images = ensureStreamTiles(tiles);
+  const width = streamTileWidth(frames[0]?.modules ?? 0, tiles);
+  for (let at = 0; at < images.length; at += 1) {
+    const image = images[at];
+    const frame = frames[at];
+    if (!frame) continue;
+    image.src = frame.url;
+    if (width > 0) image.style.width = `${width}px`;
+    else image.style.removeProperty("width");
+    image.alt =
+      tiles > 1
+        ? `묶은 결과를 흘려 보내는 QR 코드 ${tiles}장 중 ${at + 1}번째`
+        : "묶은 결과를 흘려 보내는 QR 코드";
+  }
+}
+
+/**
+ * 타일 수를 고친 결과를 화면에 적는다.
+ *
+ * **처리량을 그대로 말해 준다.** 타일을 늘리는 것은 넘김 속도를 올리는 것과 이득의 모양이
+ * 달라서(넘김 횟수가 늘지 않는다), 두 조작을 같은 단위로 적어 주지 않으면 어느 쪽을 만져야
+ * 하는지 알 수 없다. 그 단위가 '초당 몇 장' 이고, 폰 화면에도 같은 숫자가 뜬다.
+ */
+function renderStreamTiles() {
+  const tiles = streamTiles();
+  const perSecond = (tiles * 1000) / qrStreamDwell();
+  const rate = `초당 ${perSecond.toFixed(1)}장`;
+
+  let note =
+    tiles === 1
+      ? `한 번에 한 장씩 보냅니다 — ${rate}.`
+      : `한 화면에 ${tiles}장을 세웁니다 — 넘김 횟수는 그대로고 초당 들어가는 양만 ` +
+        `${tiles}배입니다 (${rate}). 폰은 한 카메라 프레임에서 본 심볼을 전부 받습니다.`;
+
+  // 한 바퀴에 걸리는 시간은 타일 수와 넘김 속도의 곱으로 정해진다. 두 조작이 여기 붙어
+  // 있으므로 결과도 여기 적는다 — 시작할 때 한 번 적어 둔 `pack-qr-note` 의 숫자는 설정을
+  // 바꾸는 순간 거짓이 된다.
+  const needed = Number(state.stream?.info?.frames_needed) || 0;
+  if (needed > 0) {
+    const minutes = Math.max(1, Math.round((needed * qrStreamDwell()) / (60000 * tiles)));
+    note += ` 이 설정이면 한 바퀴에 약 ${minutes}분입니다.`;
+  }
+
+  if (perSecond > PHONE_SYMBOLS_PER_SECOND) {
+    // 여기서부터는 늘려도 총량이 늘지 않는다. 그 사실은 PC 화면에 나타나지 않는다 —
+    // PC 는 보낸 장수만 세고 있어서, 확인은 폰에서만 된다.
+    note +=
+      `\n폰이 초당 ${PHONE_SYMBOLS_PER_SECOND}장쯤까지만 풉니다. 지금 설정은 그 천장을 ` +
+      `넘어서, 넘긴 프레임은 그냥 지나갑니다 — 넘김 속도를 늦추거나 장수를 줄여 주세요. ` +
+      `폰에 뜨는 '초당 n장' 이 늘지 않으면 그 상태입니다.`;
+  } else if (tiles === 4) {
+    note += `\n4장은 판이 넓어집니다. 창을 키우거나 최대화해 네 장이 다 보이게 두세요 — ` +
+      `잘린 심볼은 읽히지 않습니다.`;
+  }
+
+  setText("pack-qr-tiles-note", note);
+}
+
 /// '빠르게 보내기' 를 켰을 때 열리는 하한(ms). 기본 하한은 `index.html` 의 슬라이더가 정한다.
 ///
 /// **스트림에서는 놓친 프레임의 값이 다르다.** 조각 모드에서 한 장을 놓치면 그 장이 다시 올
@@ -674,41 +931,52 @@ async function startQrStream() {
   const section = el("pack-qr");
   if (section) section.dataset.state = "stream";
   show("pack-qr-nav", false);
-  show("pack-qr-image", true);
+  // 조각 모드의 그림판은 접고 타일 판을 편다. 같은 <img> 를 돌려 쓰지 않는 이유는 배율이다 —
+  // 한쪽은 한 장을, 다른 쪽은 여러 장을 세우므로 두 모드가 서로의 폭을 덮어쓴다.
+  show("pack-qr-image", false);
+  show("pack-qr-stream-frame", true);
 
-  const dwell = qrStreamDwell();
-  const minutes = Math.max(1, Math.round((opened.frames_needed * dwell) / 60000));
+  const tiles = streamTiles();
   // 이어서 보내는 것은 이 판이 끝날 때까지 변하지 않는 사실이라 **프레임마다 바뀌는 줄이 아니라**
   // 결과 안내에 적는다. 아래 `pack-qr-stream-note` 는 첫 프레임에서 곧바로 덮인다.
   const resumeLine = resumed
     ? `\n지난번 다음 번호(${stream.seq.toLocaleString("ko-KR")})부터 이어서 보냅니다 — ` +
       `폰이 모아 둔 것을 그대로 살립니다.`
     : "";
+  // **걸리는 시간은 여기 적지 않는다.** 넘김 속도와 타일 수의 곱으로 정해지는데 둘 다 도는
+  // 중에 바뀌므로, 시작할 때 한 번 적어 두면 곧 거짓말이 된다. 그 숫자는 두 조작이 붙어 있는
+  // 타일 안내(`renderStreamTiles`)가 들고 있고, 아래에서 곧바로 한 번 그린다 — 45분이 걸릴
+  // 일을 말없이 시작하지 않는다는 약속은 그쪽이 지킨다.
   setText(
     "pack-qr-note",
-    `${qrBytes(opened.total_bytes)} · 프레임 약 ${opened.frames_needed.toLocaleString("ko-KR")}장, ` +
-      `대략 ${minutes}분 걸립니다.\n` +
+    `${qrBytes(opened.total_bytes)} · 프레임 약 ${opened.frames_needed.toLocaleString("ko-KR")}장.\n` +
       `이 QR 은 기본 카메라로 찍어 붙여넣을 수 없습니다 — 휴대폰의 '조각 모으기' 앱이 ` +
       `필요합니다. 순서는 상관없고 놓친 프레임도 되찾을 필요가 없습니다. 다 모이면 폰이 ` +
       `알아서 멈춥니다.${resumeLine}`,
   );
   setText("pack-qr-stream-note", "");
   setText("pack-qr-stream-start", "그만 보내기");
+  // 이제 `frames_needed` 를 알게 됐으니 타일 안내가 한 바퀴 시간을 적을 수 있다.
+  renderStreamTiles();
 
-  // 첫 장은 기다렸다 그린다 — 누르자마자 흰 판이 뜨면 고장으로 보인다. 딱 한 장만 기다린다:
-  // 나머지 두 장은 첫 장이 화면에 서 있는 동안 만들면 늦지 않는다.
-  await fillQrStream(1);
+  // 첫 화면은 기다렸다 그린다 — 누르자마자 흰 판이 뜨면 고장으로 보인다. 딱 한 화면 몫만
+  // 기다린다: 나머지는 첫 화면이 서 있는 동안 만들면 늦지 않는다.
+  await fillQrStream(tiles);
   if (state.stream !== stream) return;
   tickQrStream();
 }
 
 /**
- * 프레임 줄을 [`STREAM_PREFETCH`] 만큼 채운다.
+ * 프레임 줄을 [`STREAM_PREFETCH`] **화면** 몫만큼 채운다.
+ *
+ * 세는 단위가 장이 아니라 화면인 것이 중요하다. 타일을 넷으로 두면 한 번 넘길 때 네 장이
+ * 나가므로, 장 수로 세어 두면 미리 만들어 둔 것이 한 화면도 못 되어 매 프레임마다 IPC 를
+ * 기다리게 된다 — 그 기다림이 슬라이더에 적힌 간격을 실제 간격에서 떼어 놓는 항이다.
  *
  * 한 번에 하나씩 받는다. `qr_stream_frame` 은 Rust 쪽에서 뮤텍스 하나를 잡으므로 병렬로 불러도
  * 줄을 서고, 순서가 뒤섞이면 줄에 넣을 자리를 다시 정해야 한다.
  */
-async function fillQrStream(want = STREAM_PREFETCH) {
+async function fillQrStream(want = STREAM_PREFETCH * streamTiles()) {
   const stream = state.stream;
   if (!stream || stream.filling) return;
   stream.filling = true;
@@ -762,8 +1030,10 @@ function tickQrStream() {
   const stream = state.stream;
   if (!stream) return;
 
-  const frame = stream.ready.shift();
-  if (!frame) {
+  const tiles = streamTiles();
+  // **한 화면 몫이 다 차야 넘긴다.** 반만 채워 넘기면 빈 타일이 생기고, 폰은 그 자리에서
+  // 초점을 다시 잡느라 옆의 멀쩡한 심볼까지 놓친다.
+  if (stream.ready.length < tiles) {
     // 만드는 쪽이 못 따라왔다. 지금 그릴 것이 없으니 도착하는 대로 이어 간다 — 여기서 빈 화면을
     // 그리면 폰이 방금 읽던 심볼까지 잃는다.
     void fillQrStream();
@@ -772,16 +1042,10 @@ function tickQrStream() {
     return;
   }
 
-  const image = el("pack-qr-image");
-  if (image) {
-    image.src = frame.url;
-    if (frame.modules > 0) {
-      image.style.width = `${frame.modules * Math.max(3, Math.min(10, Math.floor(560 / frame.modules)))}px`;
-    }
-    image.alt = "묶은 결과를 흘려 보내는 QR 코드";
-  }
+  const frames = stream.ready.splice(0, tiles);
+  paintStreamTiles(frames);
 
-  stream.sent += 1;
+  stream.sent += frames.length;
   markStreamResume(stream);
 
   // **보낸 장수만 세면 진행을 볼 수 없다.** 끝이 없는 스트림이라도 "대략 이만큼 보내면 폰이
@@ -854,6 +1118,13 @@ function stopQrStream() {
   const section = el("pack-qr");
   if (section) section.dataset.state = "toobig";
   show("pack-qr-image", false);
+  show("pack-qr-stream-frame", false);
+  // 타일에 남은 그림은 이미 지나간 프레임이다. 판을 접어도 남겨 두면 다음에 켤 때 옛 프레임이
+  // 한 박자 서 있게 된다.
+  const grid = el("pack-qr-stream-grid");
+  if (grid) grid.textContent = "";
+  // 스트림이 닫혔으니 한 바퀴 시간도 다시 모르는 값이 된다.
+  renderStreamTiles();
 }
 
 /// 스트림의 체류 시간. 전용 슬라이더가 있으면 그 값을, 없으면 조각 모드의 것을 따른다.
@@ -892,8 +1163,12 @@ function setStreamFast(on) {
 }
 
 /// 슬라이더 옆의 숫자. 도는 중에 바꿔도 다음 프레임부터 바로 먹는다.
+///
+/// 타일 안내도 함께 고친다 — 거기 적히는 '초당 몇 장' 은 타일 수와 넘김 속도의 곱이라,
+/// 한쪽만 움직여도 숫자가 달라진다.
 function renderStreamSpeed() {
   setText("pack-qr-stream-speed-label", `${qrStreamDwell()}ms`);
+  renderStreamTiles();
 }
 
 /// 슬라이더가 있으면 그 값을, 없으면 기본값을.
@@ -1284,9 +1559,9 @@ function qrNote(result, qr) {
         ? ` QR 코드 한 장에 ${qrBytes(perQr)} 씩 최대 ${maxQr}장까지만 나눕니다.`
         : "";
     return (
-      `묶은 텍스트가 ${qrBytes(result.container_bytes)}라서 QR 코드로는 보낼 수 없습니다.${cap}\n` +
+      `묶은 텍스트가 ${qrBytes(result.container_bytes)}라서 조각으로는 보낼 수 없습니다.${cap}\n` +
       `그보다 많이 나누면 순서대로 스캔해 이어 붙이는 일 자체가 현실적이지 않습니다. ` +
-      `위의 텍스트를 복사해 보내 주세요.`
+      `아래 스트림 모드로 보내거나, '텍스트로 보기' 탭에서 복사·저장해 보내 주세요.`
     );
   }
 
@@ -1309,32 +1584,52 @@ function qrNote(result, qr) {
   );
 }
 
+/**
+ * 묶는다. **저장 위치는 묻지 않는다.**
+ *
+ * 예전에는 여기서 먼저 `pick_save_path` 를 띄웠다. 그러면 사람은 결과가 얼마나 큰지도, QR 로
+ * 보낼 수 있는 크기인지도 모르는 채로 파일 자리를 정해야 한다 — QR 로 비추고 말 것이었다면
+ * 그 파일은 애초에 만들 필요가 없었다. 그래서 결과는 임시 폴더에 앉히고(Rust 의 `PackedSlot`),
+ * 텍스트로 부칠지 QR 로 비출지 고른 뒤에 '파일로 저장' 이 옮겨 적는다.
+ */
 async function doPack() {
   const key = el("pack-key")?.value || "";
   if (!key) return setStatus("pack", "암호화 키를 입력해 주세요.", "error");
-  if (state.items.length === 0) return setStatus("pack", "묶을 파일을 먼저 추가해 주세요.", "error");
+  if (!hasSomethingToPack()) {
+    return setStatus(
+      "pack",
+      state.inputMode === "text"
+        ? "묶을 텍스트를 먼저 적어 주세요."
+        : "묶을 파일을 먼저 추가해 주세요.",
+      "error",
+    );
+  }
 
-  const dest = await invoke("pick_save_path", {
-    suggestedName: suggestContainerName(),
-    start: recall(REMEMBERED.saveDir) || null,
-  });
-  if (!dest) return; // 사용자가 취소했다.
-
+  const packingText = state.inputMode === "text";
   clearStatus("pack");
   clearPackOutput();
   resetProgress("pack");
   setBusy(true);
   try {
-    const result = await invoke("pack", {
-      paths: state.items.map((i) => i.path),
-      passphrase: key,
-      dest,
-    });
+    const suggestedName = suggestContainerName();
+    const result = packingText
+      ? await invoke("pack_text", {
+          text: packTextValue(),
+          name: (el("pack-text-name")?.value || "").trim() || null,
+          passphrase: key,
+          dest: null,
+          suggestedName,
+        })
+      : await invoke("pack", {
+          paths: state.items.map((i) => i.path),
+          passphrase: key,
+          dest: null,
+          suggestedName,
+        });
 
     // 성공한 키만 이어 준다. 실패한 키를 풀기 탭에 흘려 보내면 혼란만 준다.
     session.key = key;
     applySessionKey();
-    remember(REMEMBERED.saveDir, parentDir(result.dest));
     renderPackOutput(result);
     renderPackQr(result);
 
@@ -1353,12 +1648,42 @@ async function doPack() {
     }
     message += "\n같은 키가 풀기 탭에 채워졌습니다.";
     setStatus("pack", message, result.changed.length || result.skipped.length ? "warn" : "ok");
-    offerReveal("pack", result.dest);
   } catch (err) {
     setStatus("pack", errorText(err), "error");
   } finally {
     setBusy(false);
     resetProgress("pack");
+  }
+}
+
+/**
+ * 임시 폴더에 앉아 있는 결과를 사람이 정한 자리로 옮겨 적는다.
+ *
+ * 경로를 Rust 로 넘기지 않는다 — `save_container` 는 자기가 붙잡고 있는 결과 하나만 복사한다.
+ * 옮긴 뒤에도 임시 파일은 그대로 둔다: QR 스트림이 그 경로를 읽고 있고, 어차피 다음 묶기에서
+ * 지워진다.
+ */
+async function saveContainer() {
+  if (!state.packed) return;
+
+  const dest = await invoke("pick_save_path", {
+    suggestedName: suggestContainerName(),
+    start: recall(REMEMBERED.saveDir) || null,
+  });
+  if (!dest) return; // 사용자가 취소했다.
+
+  setBusy(true);
+  try {
+    const bytes = await invoke("save_container", { dest });
+    state.packed.savedPath = dest;
+    remember(REMEMBERED.saveDir, parentDir(dest));
+    setText("pack-save-note", `${dest} 에 ${formatBytes(bytes)}로 저장했습니다.`);
+    offerReveal("pack", dest);
+  } catch (err) {
+    setText("pack-save-note", "");
+    setStatus("pack", errorText(err), "error");
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -1489,12 +1814,28 @@ function wireEvents() {
   }
 
   el("pack-clear")?.addEventListener("click", () => {
+    // 파일 목록만 비운다. 텍스트 입력 모드의 글은 다른 자리에 있고, 여기서 함께 지우면
+    // 보이지도 않는 것이 사라진다.
     state.items = [];
     clearStatus("pack");
     clearPackOutput();
     renderList();
     refreshButtons();
   });
+
+  for (const button of all("pack-input-tab")) {
+    button.addEventListener("click", () => setInputMode(button.dataset.input));
+  }
+  for (const button of all("pack-result-tab")) {
+    button.addEventListener("click", () => setResultTab(button.dataset.result));
+  }
+  el("pack-save")?.addEventListener("click", saveContainer);
+  el("pack-text")?.addEventListener("input", () => {
+    renderPackTextCount();
+    clearErrorStatus("pack");
+    refreshButtons();
+  });
+  el("pack-text-name")?.addEventListener("input", refreshButtons);
 
   el("pack-add-files")?.addEventListener("click", async () => {
     addPaths(await invoke("pick_files_to_pack"));
@@ -1536,6 +1877,11 @@ function wireEvents() {
   el("pack-qr-stream-fast")?.addEventListener("change", (event) =>
     setStreamFast(Boolean(event.target?.checked)),
   );
+  // 타일 수도 도는 중에 바꿀 수 있다. 다음 화면부터 그 수만큼 세운다 — `tickQrStream` 이
+  // 매번 다시 읽고, 미리 만들어 둔 프레임은 몇 장이든 그대로 쓰인다 (번호만 다르면 된다).
+  for (const radio of all("pack-qr-tile")) {
+    radio.addEventListener("change", renderStreamTiles);
+  }
 
   el("unpack-pick")?.addEventListener("click", async () => {
     const picked = await invoke("pick_container");
@@ -1583,6 +1929,11 @@ async function main() {
 
   renderList();
   renderSource();
+  // 마크업의 기본값을 그대로 따른다. 어느 탭이 처음 열려 있는지는 화면이 정하고, 상태는
+  // 거기에 맞춰 선다.
+  setInputMode(state.inputMode);
+  setResultTab(state.resultTab);
+  renderPackTextCount();
   // 슬라이더 값과 옆의 숫자를 처음부터 맞춰 둔다. 마크업의 기본값을 고쳐도 따라온다.
   renderStreamSpeed();
   clearPackOutput();

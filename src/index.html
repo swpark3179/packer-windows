@@ -29,21 +29,85 @@
     <main>
       <!-- ------------------------------------------------------------ 묶기 -->
       <section class="panel" data-pk="panel" data-tab="pack" role="tabpanel" aria-label="묶기">
-        <div class="dropzone" data-pk="pack-dropzone">
-          <p class="dropzone-title">여기로 파일이나 폴더를 끌어다 놓으세요</p>
-          <p class="dropzone-sub">폴더를 놓으면 안에 있는 파일까지 모두 담습니다</p>
-          <div class="dropzone-actions">
-            <button type="button" class="btn btn-ghost" data-pk="pack-add-files">파일 선택</button>
-            <button type="button" class="btn btn-ghost" data-pk="pack-add-folders">폴더 선택</button>
+        <!--
+          무엇을 묶을지부터 고르게 한다. 두 갈래는 담는 것이 다를 뿐 뒤의 파이프라인은 같다 —
+          키 입력부터 아래는 두 모드가 그대로 공유한다.
+        -->
+        <nav class="subtabs" data-pk="pack-input-tabs" role="tablist" aria-label="묶을 대상 고르기">
+          <button
+            type="button"
+            class="subtab"
+            data-pk="pack-input-tab"
+            data-input="files"
+            role="tab"
+            aria-selected="true"
+          >
+            파일 선택
+          </button>
+          <button
+            type="button"
+            class="subtab"
+            data-pk="pack-input-tab"
+            data-input="text"
+            role="tab"
+            aria-selected="false"
+          >
+            텍스트 입력
+          </button>
+        </nav>
+
+        <div data-pk="pack-input-panel" data-input="files" role="tabpanel" aria-label="파일 선택">
+          <div class="dropzone" data-pk="pack-dropzone">
+            <p class="dropzone-title">여기로 파일이나 폴더를 끌어다 놓으세요</p>
+            <p class="dropzone-sub">폴더를 놓으면 안에 있는 파일까지 모두 담습니다</p>
+            <div class="dropzone-actions">
+              <button type="button" class="btn btn-ghost" data-pk="pack-add-files">파일 선택</button>
+              <button type="button" class="btn btn-ghost" data-pk="pack-add-folders">폴더 선택</button>
+            </div>
           </div>
+
+          <div class="list-head">
+            <span class="list-summary tnum" data-pk="pack-summary"></span>
+            <button type="button" class="btn btn-quiet" data-pk="pack-clear">모두 비우기</button>
+          </div>
+          <p class="empty" data-pk="pack-empty">아직 담긴 항목이 없습니다.</p>
+          <div class="list" data-pk="pack-list"></div>
         </div>
 
-        <div class="list-head">
-          <span class="list-summary tnum" data-pk="pack-summary"></span>
-          <button type="button" class="btn btn-quiet" data-pk="pack-clear">모두 비우기</button>
+        <!--
+          텍스트 입력 모드. 여기 친 글은 **임시 파일을 거치지 않고** 그대로 묶인다
+          (`archive::scan_text`). 평문을 디스크에 한 번 떨어뜨렸다 지우는 것은, 지운 자리를
+          덮어쓰지 못하므로 이 앱이 없애려는 노출을 스스로 만드는 일이다.
+        -->
+        <div data-pk="pack-input-panel" data-input="text" role="tabpanel" aria-label="텍스트 입력" hidden>
+          <div class="field">
+            <label class="field-label" for="pack-text-name-input">묶을 때 쓸 파일 이름</label>
+            <input
+              class="input"
+              id="pack-text-name-input"
+              data-pk="pack-text-name"
+              type="text"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="메모.txt"
+            />
+            <p class="hint">풀어내면 이 이름의 파일 하나가 나옵니다. 비워 두면 <code>메모.txt</code> 입니다.</p>
+          </div>
+
+          <div class="output">
+            <div class="output-head">
+              <span class="field-label">묶을 텍스트</span>
+              <span class="list-summary tnum" data-pk="pack-text-count"></span>
+            </div>
+            <textarea
+              class="textarea"
+              data-pk="pack-text"
+              spellcheck="false"
+              placeholder="여기에 붙여넣거나 바로 적으세요. 적은 글은 파일로 저장되지 않고 그대로 암호화됩니다."
+              aria-label="묶을 텍스트"
+            ></textarea>
+          </div>
         </div>
-        <p class="empty" data-pk="pack-empty">아직 담긴 항목이 없습니다.</p>
-        <div class="list" data-pk="pack-list"></div>
 
         <div class="field">
           <label class="field-label" for="pack-key-input">암호화 키</label>
@@ -71,23 +135,67 @@
 
         <p class="status" data-pk="pack-status" hidden></p>
 
-        <div class="output" data-pk="pack-output" hidden>
-          <div class="output-head">
-            <span class="field-label">묶은 결과 (텍스트)</span>
-            <button type="button" class="btn btn-ghost" data-pk="pack-output-copy">
-              전체 복사
-            </button>
-          </div>
-          <textarea
-            class="textarea"
-            data-pk="pack-output-text"
-            readonly
-            spellcheck="false"
-            aria-label="묶은 결과 텍스트"
-          ></textarea>
-          <p class="hint tnum" data-pk="pack-output-note"></p>
-        </div>
+        <!--
+          결과를 어떻게 옮길지 고르는 자리.
 
+          묶기 **전에** 저장 위치를 묻지 않는 이유가 여기 있다. 텍스트로 부칠지 QR 로 비출지는
+          결과가 얼마나 큰지를 알아야 정할 수 있고, 그 크기는 묶어 봐야 나온다. 그래서 결과는
+          먼저 임시 폴더에 앉고(`commands::PackedSlot`), 저장은 아래 텍스트 탭에서 사람이
+          고를 때 일어난다.
+        -->
+        <div class="result" data-pk="pack-result" hidden>
+          <nav class="subtabs" data-pk="pack-result-tabs" role="tablist" aria-label="결과 옮기는 방법">
+            <button
+              type="button"
+              class="subtab"
+              data-pk="pack-result-tab"
+              data-result="text"
+              role="tab"
+              aria-selected="true"
+            >
+              텍스트로 보기
+            </button>
+            <button
+              type="button"
+              class="subtab"
+              data-pk="pack-result-tab"
+              data-result="qr"
+              role="tab"
+              aria-selected="false"
+            >
+              QR 코드
+            </button>
+          </nav>
+
+          <div data-pk="pack-result-panel" data-result="text" role="tabpanel" aria-label="텍스트로 보기">
+            <div class="output" data-pk="pack-output" hidden>
+              <div class="output-head">
+                <span class="field-label">묶은 결과 (텍스트)</span>
+                <div class="output-actions">
+                  <button type="button" class="btn btn-ghost" data-pk="pack-output-copy">
+                    전체 복사
+                  </button>
+                  <button type="button" class="btn btn-primary" data-pk="pack-save">
+                    파일로 저장
+                  </button>
+                </div>
+              </div>
+              <textarea
+                class="textarea"
+                data-pk="pack-output-text"
+                readonly
+                spellcheck="false"
+                aria-label="묶은 결과 텍스트"
+              ></textarea>
+              <p class="hint tnum" data-pk="pack-output-note"></p>
+              <p class="hint tnum" data-pk="pack-save-note"></p>
+              <button type="button" class="btn btn-ghost" data-pk="pack-reveal" hidden>
+                탐색기에서 보기
+              </button>
+            </div>
+          </div>
+
+          <div data-pk="pack-result-panel" data-result="qr" role="tabpanel" aria-label="QR 코드" hidden>
         <div class="qr" data-pk="pack-qr" hidden>
           <div class="output-head">
             <span class="field-label">QR 코드 (휴대폰으로 스캔)</span>
@@ -133,6 +241,15 @@
               draggable="false"
               hidden
             />
+          </div>
+
+          <!--
+            스트림 타일 판. 조각 모드의 그림판(위)과 자리를 나눠 쓰지 않는다 — 한쪽은 한 장을
+            갈아 끼우고 다른 쪽은 여러 장을 동시에 세우므로, 같은 <img> 를 돌려 쓰면 배율 계산이
+            두 모드에서 서로를 덮어쓴다. 타일은 main.js 가 개수에 맞춰 만들어 넣는다.
+          -->
+          <div class="qr-frame qr-stream-frame" data-pk="pack-qr-stream-frame" hidden>
+            <div class="qr-tile-grid" data-pk="pack-qr-stream-grid"></div>
           </div>
 
           <!--
@@ -196,14 +313,39 @@
                 <input type="checkbox" data-pk="pack-qr-stream-fast" />
                 <span>빠르게 보내기</span>
               </label>
+
+              <!--
+                한 화면에 몇 장을 세울지. 카메라 프레임은 16:9 인데 QR 은 정사각형이라 한 장만
+                띄우면 좌우가 통째로 논다 — 두 장을 나란히 세우면 심볼 한 변이 11% 작아지는
+                대신 한 번에 두 프레임이 들어간다.
+
+                넘김 **횟수**는 그대로다. 그래서 속도를 올리는 것과 달리 롤링 셔터가 찢는 비율도,
+                초당 몇 번 바뀌는지(WCAG 2.3.1)도 늘지 않는다.
+              -->
+              <fieldset class="qr-tiles">
+                <legend class="sr-only">한 화면에 띄울 QR 수</legend>
+                <label class="qr-tile-choice">
+                  <input type="radio" name="pack-qr-tiles" data-pk="pack-qr-tile" value="1" />
+                  <span>1장</span>
+                </label>
+                <label class="qr-tile-choice">
+                  <input type="radio" name="pack-qr-tiles" data-pk="pack-qr-tile" value="2" checked />
+                  <span>2장</span>
+                </label>
+                <label class="qr-tile-choice">
+                  <input type="radio" name="pack-qr-tiles" data-pk="pack-qr-tile" value="4" />
+                  <span>4장</span>
+                </label>
+              </fieldset>
             </div>
+            <p class="qr-note qr-jump-note tnum" data-pk="pack-qr-tiles-note"></p>
             <p class="qr-note qr-jump-note tnum" data-pk="pack-qr-stream-fast-note"></p>
 
             <p class="qr-note tnum" data-pk="pack-qr-stream-note"></p>
           </div>
         </div>
-
-        <button type="button" class="btn btn-ghost" data-pk="pack-reveal" hidden>탐색기에서 보기</button>
+          </div>
+        </div>
       </section>
 
       <!-- ------------------------------------------------------------ 풀기 -->
