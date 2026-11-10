@@ -50,6 +50,17 @@ function base64Chunk(bytes) {
 }
 
 /**
+ * 바이트열 하나를 Base64 로. '풀어서 저장' 이 파일 조각을 브리지로 넘길 때 쓴다 — Capacitor 의
+ * `Filesystem` 은 이진 데이터를 Base64 문자열로만 받는다.
+ *
+ * 네이티브는 호출마다 받은 문자열을 따로 풀어 이어 붙이므로, 조각마다 끝에 `=` 채움이 붙어도
+ * 괜찮다.
+ */
+export function toBase64(bytes) {
+  return base64Chunk(bytes);
+}
+
+/**
  * 컨테이너 바이트를 armor 텍스트로 감싼다.
  *
  * 큰 입력에서 화면이 멈추지 않도록 조각으로 나눠 돌고, 조각마다 `onProgress(done, total)` 를

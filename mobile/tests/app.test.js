@@ -37,6 +37,12 @@ const unhex = (text) =>
 const STREAM_SOURCE = unhex(streamGolden.source);
 const STREAM_FRAMES = streamGolden.frames.map(unhex);
 
+// '풀어서 저장' 의 입력. 실제 묶기와 같은 길을 지난 컨테이너다 (`src-tauri/tests/unpack_format.rs`).
+const unpackGolden = JSON.parse(
+  fs.readFileSync(path.join(root, "tests", "fixtures", "unpack-container.json"), "utf8"),
+);
+const { memoryFilesystem } = await import("./memory-fs.js");
+
 // 타이밍을 여기에 다시 적지 않는다. `export.js` 가 바뀌면 테스트가 함께 움직여야 한다.
 const { BUSY_DELAY_MS, BUSY_HOLD_MS } = await import("../www/export.js");
 const BEGIN = "-----BEGIN PACKER CONTAINER-----";
@@ -82,6 +88,17 @@ async function boot(options = {}) {
   const shared = [];
   const listeners = {};
 
+  // '풀어서 저장' 은 폴더를 만들고 옮기고 지운다. 그 결과를 물어야 해서 상태를 들고 있는
+  // 메모리 파일 시스템을 쓴다. `slowWriteMs` 는 풀어내는 동안 막대가 뜨게 하려는 것이다.
+  const memory = options.memfs ? memoryFilesystem() : null;
+  if (memory && options.slowWriteMs) {
+    const write = memory.api.writeFile;
+    memory.api.writeFile = async (given) => {
+      await new Promise((r) => setTimeout(r, options.slowWriteMs));
+      return write(given);
+    };
+  }
+
   globalThis.Capacitor = {
     Plugins: {
       BarcodeScanner: {
@@ -99,7 +116,7 @@ async function boot(options = {}) {
           return { remove: async () => delete listeners[name] };
         },
       },
-      Filesystem: {
+      Filesystem: memory?.api ?? {
         writeFile: async (given) => {
           if ((options.failWrite ?? []).includes(given.directory)) {
             throw new Error(`denied: ${given.directory}`);
@@ -134,6 +151,7 @@ async function boot(options = {}) {
   return {
     dom,
     log,
+    memory,
     written,
     appended,
     shared,
@@ -166,7 +184,29 @@ async function boot(options = {}) {
       dom.window.document.querySelector(`[data-pk="${hook}"]`)?.click();
       await settle();
     },
+    /** 체크 상자를 사람이 누른 것처럼 바꾼다 (`change` 이벤트까지). */
+    check: async (hook, on) => {
+      const box = dom.window.document.querySelector(`[data-pk="${hook}"]`);
+      box.checked = on;
+      box.dispatchEvent(new dom.window.Event("change"));
+      await settle();
+    },
+    /** 조건이 설 때까지 기다린다. 풀기는 Argon2 와 여러 번의 쓰기를 지나 끝난다. */
+    until: async (predicate, ms = 5000) => {
+      const deadline = Date.now() + ms;
+      while (!predicate()) {
+        if (Date.now() > deadline) throw new Error("기다려도 끝나지 않았다");
+        await new Promise((r) => setTimeout(r, 10));
+      }
+    },
   };
+}
+
+/** 픽스처의 컨테이너를 조각으로 나눠 모두 읽힌 상태까지 간다. */
+async function collectGolden(app) {
+  const body = unpackGolden.armor.split("\n")[1];
+  for (const piece of makePieces(body, 3)) await app.scan(piece);
+  assert.equal(app.state(), "complete");
 }
 
 describe("앱 배선", { skip: JSDOM ? false : "jsdom 이 없습니다 — npm install 후 다시" }, () => {
@@ -608,5 +648,132 @@ describe("앱 배선", { skip: JSDOM ? false : "jsdom 이 없습니다 — npm i
   it("손전등을 못 쓰는 기기에서는 버튼을 감춘다", async () => {
     const app = await boot({ torch: false });
     assert.equal(app.el("scan-torch").hidden, true);
+  });
+  // ------------------------------------------------------------ 풀어서 저장
+
+  it("풀어서 저장은 고르는 기능이다 — 기본은 꺼짐이고 저장은 예전처럼 .txt 를 쓴다", async () => {
+    const app = await boot({ memfs: true });
+    await collectGolden(app);
+
+    assert.equal(app.el("unpack-option").hidden, false);
+    assert.equal(app.el("unpack-toggle").checked, false);
+    assert.equal(app.el("unpack-fields").hidden, true);
+    assert.equal(app.el("scan-save").textContent, "이 기기에 저장");
+
+    await app.click("scan-save");
+    const files = app.memory.list("DOCUMENTS");
+    assert.equal(files.length, 1);
+    assert.match(files[0], /^packer-\d{8}-\d{6}\.txt$/);
+  });
+
+  it("고르면 암호와 폴더 칸이 나오고 버튼이 하는 일을 말한다", async () => {
+    const app = await boot({ memfs: true });
+    await collectGolden(app);
+
+    await app.check("unpack-toggle", true);
+    assert.equal(app.el("unpack-fields").hidden, false);
+    assert.equal(app.el("scan-save").textContent, "풀어서 이 기기에 저장");
+    assert.equal(app.el("unpack-dir").value, "Packer");
+    assert.match(app.el("unpack-hint").textContent, /문서\(Documents\) → Packer 에 풉니다/);
+
+    await app.check("unpack-toggle", false);
+    assert.equal(app.el("unpack-fields").hidden, true);
+    assert.equal(app.el("scan-save").textContent, "이 기기에 저장");
+  });
+
+  it("암호 없이 누르면 아무것도 쓰지 않고 암호를 달라고 한다", async () => {
+    const app = await boot({ memfs: true });
+    await collectGolden(app);
+    await app.check("unpack-toggle", true);
+
+    await app.click("scan-save");
+    assert.equal(app.el("result-note").textContent, "암호화 키를 입력해 주세요.");
+    assert.deepEqual(app.memory.list("DOCUMENTS"), []);
+  });
+
+  it("암호를 넣으면 고른 폴더에 원래 파일로 풀어 두고, 무엇을 어디에 풀었는지 말한다", async () => {
+    const app = await boot({ memfs: true });
+    await collectGolden(app);
+    await app.check("unpack-toggle", true);
+
+    app.el("unpack-key").value = unpackGolden.password;
+    app.el("unpack-dir").value = "받은 파일/../2026";
+    await app.click("scan-save");
+    await app.until(() => /^풀/.test(app.el("result-note").textContent));
+
+    const note = app.el("result-note").textContent;
+    assert.match(note, /^풀었습니다 — 파일 7개 · 폴더 4개 · /, note);
+    assert.match(note, /file:\/\/\/DOCUMENTS\/받은 파일\/2026/);
+    // 폴더 이름을 고친 결과는 입력칸에 되돌려 적는다 — 파일 이름과 같은 규칙이다.
+    assert.equal(app.el("unpack-dir").value, "받은 파일/2026");
+
+    const files = app.memory.list("DOCUMENTS");
+    for (const entry of unpackGolden.entries) {
+      const want = `받은 파일/2026/${entry.path}${entry.kind === "dir" ? "/" : ""}`;
+      assert.ok(files.includes(want), `${want} 가 없다`);
+    }
+    const memo = app.memory.read("DOCUMENTS", "받은 파일/2026/메모.txt");
+    assert.equal(new TextDecoder().decode(memo), "두 번째 원본 — 낱개 파일\n");
+    // 임시 폴더도, 암호화된 .txt 도 남지 않는다.
+    assert.ok(!files.some((f) => f.includes(".packer-part-")), files.join("\n"));
+    assert.ok(!files.some((f) => f.endsWith(".txt") && f.startsWith("packer-")));
+    // 다 풀었으면 암호를 화면에 남겨 두지 않는다.
+    assert.equal(app.el("unpack-key").value, "");
+  });
+
+  it("암호가 틀리면 그렇게만 말하고 아무것도 남기지 않는다 — 고쳐 다시 누르게 암호는 둔다", async () => {
+    const app = await boot({ memfs: true });
+    await collectGolden(app);
+    await app.check("unpack-toggle", true);
+
+    app.el("unpack-key").value = "틀린 암호";
+    await app.click("scan-save");
+    await app.until(() => /^풀지/.test(app.el("result-note").textContent));
+
+    assert.equal(app.el("result-note").textContent, "풀지 못했습니다: 암호화 키가 올바르지 않습니다.");
+    assert.deepEqual(app.memory.list("DOCUMENTS"), ["Packer/"]);
+    assert.equal(app.el("unpack-key").value, "틀린 암호");
+    assert.equal(app.el("scan-save").disabled, false);
+  });
+
+  it("푸는 동안에는 버튼과 고르는 칸을 함께 잠그고, 막대가 단계를 말한다", async () => {
+    const app = await boot({ memfs: true, slowWriteMs: 60 });
+    await collectGolden(app);
+    await app.check("unpack-toggle", true);
+    app.el("unpack-key").value = unpackGolden.password;
+
+    app.press("scan-save");
+    assert.equal(app.el("scan-save").disabled, true);
+    assert.equal(app.el("scan-share").disabled, true);
+    assert.equal(app.el("unpack-toggle").disabled, true);
+
+    await app.until(() => !app.el("export-progress").hidden);
+    await app.until(() => /^풀어내는 중/.test(app.el("export-progress-label").textContent));
+    // 원래 파일의 크기를 사람이 읽는 단위로 적는다.
+    assert.match(app.el("export-progress-label").textContent, /^풀어내는 중 \d+% · .+ \/ 349 KB$/);
+
+    await app.until(() => /^풀었습니다/.test(app.el("result-note").textContent));
+    await app.until(() => app.el("export-progress").hidden);
+    assert.equal(app.el("scan-save").disabled, false);
+    assert.equal(app.el("unpack-toggle").disabled, false);
+  });
+
+  it("iOS 에서는 '파일' 앱에서 찾는 길을 알려 준다", async () => {
+    const app = await boot({ memfs: true, platform: "ios" });
+    await collectGolden(app);
+    await app.check("unpack-toggle", true);
+    assert.match(app.el("unpack-hint").textContent, /'파일' 앱의 내 iPhone → Packer Scanner → Packer/);
+  });
+
+  it("다시 모으기를 누르면 고른 것과 암호를 되돌린다", async () => {
+    const app = await boot({ memfs: true });
+    await collectGolden(app);
+    await app.check("unpack-toggle", true);
+    app.el("unpack-key").value = "적어 둔 암호";
+
+    await app.click("scan-reset");
+    assert.equal(app.el("unpack-toggle").checked, false);
+    assert.equal(app.el("unpack-key").value, "");
+    assert.equal(app.el("scan-save").textContent, "이 기기에 저장");
   });
 });

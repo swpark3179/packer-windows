@@ -177,6 +177,62 @@ code {
   outline-offset: 1px;
 }
 
+/* 결과 문구는 여러 줄이 될 수 있다 (저장 위치 · 건너뛴 항목 · 폴더 안내). 경로는 띄어쓰기가 없어
+ * 그대로 두면 화면 밖으로 밀려난다. */
+[data-pk="result-note"] {
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
+.note-warn {
+  color: var(--warn);
+}
+
+/* ------------------------------------------------------------------ 풀어서 저장 */
+
+.unpack {
+  margin: 18px 0 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  cursor: pointer;
+}
+
+.check input {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  margin: 1px 0 0;
+  accent-color: var(--accent);
+}
+
+.check-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.check-title {
+  font-weight: 600;
+}
+
+.check-sub {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+/* 판 안의 입력칸은 판보다 한 단 어둡게 — 같은 색이면 칸의 경계가 사라진다. */
+.unpack .text-input {
+  background: var(--bg);
+}
+
 /* ------------------------------------------------------------------ 진행 막대
  *
  * 데스크톱 `src/styles.css` 의 진행 막대를 옮겨 왔다. 스캔 오버레이가 아니라 **결과 화면에만**

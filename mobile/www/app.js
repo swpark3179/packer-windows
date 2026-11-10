@@ -3,8 +3,8 @@
 // 이 파일은 마크업의 클래스 이름을 하나도 모른다. 모든 DOM 참조는 `data-pk="..."` 훅으로만
 // 한다 (데스크톱 `src/main.js` 와 같은 규약). 없는 훅은 조용히 무시되므로 부분 이식도 안전하다.
 //
-// 판단은 전부 `collector.js` 에 있고 네이티브 호출은 전부 `bridge.js` 에 있다. 여기 있는 것은
-// 둘을 화면에 잇는 일뿐이다.
+// 판단은 전부 `collector.js` · `stream.js` · `unpack.js` 에 있고 네이티브 호출은 전부 `bridge.js` 에
+// 있다. 여기 있는 것은 그것들을 화면에 잇는 일뿐이다.
 
 import {
   addPiece,
@@ -31,6 +31,7 @@ import {
   buzz,
   cameraPermission,
   canShare,
+  canUnpack,
   hasScanner,
   isSupported,
   keepAwake,
@@ -45,16 +46,20 @@ import {
   startScan,
   stopScan,
   torchAvailable,
+  unpackToDevice,
 } from "./bridge.js";
 
 import {
   BUSY_DELAY_MS,
   BUSY_HOLD_MS,
+  DEFAULT_FOLDER,
   defaultFileName,
   safeFileName,
+  safeFolderPath,
 } from "./export.js";
 
 import { armorFromBytes } from "./armor.js";
+import { unpackContainer } from "./unpack.js";
 
 // ---------------------------------------------------------------- 안내 문구
 
@@ -89,6 +94,9 @@ const state = {
   mode: null,
   /// 다 모아 합친 텍스트 (아직이면 null).
   joined: null,
+  /// 스트림 모드가 복원한 컨테이너 바이트. '풀어서 저장' 은 Base64 를 다시 벗기지 않고 이걸 쓴다.
+  /// 조각 모드에서는 null 이고 `joined` 를 푼다.
+  container: null,
   scanning: false,
   /// 인식·오류 이벤트 구독. 멈출 때 뗀다.
   listeners: [],
@@ -670,12 +678,14 @@ async function finishStream() {
   await showResult(
     joined,
     `${bytes.length.toLocaleString("ko-KR")}바이트를 모두 복원했습니다.${warning}`,
+    bytes,
   );
 }
 
 /// 결과 화면으로 넘어간다. 두 모드가 함께 쓴다.
-async function showResult(joined, summary) {
+async function showResult(joined, summary, container = null) {
   state.joined = joined;
+  state.container = container;
   if (state.scanning) await endScan();
 
   setState("complete");
@@ -691,6 +701,12 @@ async function showResult(joined, summary) {
   enable("scan-share", true);
   // 공유를 못 쓰는 기기에서는 감춘다 — 뜻 없는 조작 도구는 잠그기보다 감춘다 (scan-torch 와 같다).
   show("scan-share", await canShare());
+
+  // '풀어서 저장' 은 고르는 기능이다. 기본은 꺼짐 — 켜지 않으면 화면도 동작도 예전과 같다.
+  show("unpack-option", canUnpack());
+  const folder = el("unpack-dir");
+  if (folder && folder.value === "") folder.value = DEFAULT_FOLDER;
+  syncUnpack();
 
   void buzz("done");
 }
@@ -713,6 +729,8 @@ const PHASE_TEXT = {
   save: "저장하는 중",
   share: "보낼 파일을 쓰는 중",
   armor: "텍스트로 옮겨 적는 중",
+  key: "암호를 확인하는 중",
+  unpack: "풀어내는 중",
 };
 
 /**
@@ -740,13 +758,7 @@ function renderExportProgress({ done, total, phase }) {
       delete fill.dataset.indeterminate;
     }
     bar?.setAttribute("aria-valuenow", String(percent));
-    // 저장·보내기는 글자를 세고, 옮겨 적기는 바이트를 센다. 단위를 틀리게 적으면 사용자가
-    // 파일 크기를 오해한다.
-    const unit = phase === "armor" ? "바이트" : "자";
-    setText(
-      "export-progress-label",
-      `${name} ${percent}% · ${NUMBER.format(done)} / ${NUMBER.format(total)}${unit}`,
-    );
+    setText("export-progress-label", `${name} ${percent}%${progressAmount(phase, done, total)}`);
   } else {
     if (fill) {
       fill.style.width = "100%";
@@ -757,6 +769,21 @@ function renderExportProgress({ done, total, phase }) {
   }
   if (label) label.hidden = false;
   show("export-progress", true);
+}
+
+/**
+ * 퍼센트 뒤에 붙는 양. 단계마다 세는 것이 달라서, 단위를 틀리게 적으면 사용자가 파일 크기를
+ * 오해한다.
+ *
+ * 저장·보내기는 글자를, 옮겨 적기는 바이트를 센다. 풀어내기는 **원래 파일의 크기**라 사람이 읽는
+ * 단위로 적는다. 암호 확인은 Argon2 의 메모리 블록을 세는데, 그 숫자는 사용자에게 아무 뜻이 없어
+ * 퍼센트만 둔다.
+ */
+function progressAmount(phase, done, total) {
+  if (phase === "key") return "";
+  if (phase === "unpack") return ` · ${formatBytes(done)} / ${formatBytes(total)}`;
+  const unit = phase === "armor" ? "바이트" : "자";
+  return ` · ${NUMBER.format(done)} / ${NUMBER.format(total)}${unit}`;
 }
 
 function resetExportProgress() {
@@ -791,6 +818,16 @@ function startBusy(phase) {
     busy.shownAt = Date.now();
     renderExportProgress(busy);
   }, BUSY_DELAY_MS);
+}
+
+/// 한 작업 안에서 단계를 바꾼다 (풀기: 암호 확인 → 풀어내기). 막대는 거두지 않고 이어 그린다 —
+/// 단계마다 사라졌다 다시 뜨면 끝난 것처럼 보인다.
+function setBusyPhase(phase) {
+  const { busy } = state;
+  busy.phase = phase;
+  busy.done = 0;
+  busy.total = 0;
+  if (busy.shownAt !== 0) renderExportProgress(busy);
 }
 
 /// 진행 상황을 기록한다. 아직 막대를 안 띄웠으면 숫자만 담아 둔다.
@@ -855,14 +892,14 @@ function setSaveHint() {
  * 합친 텍스트를 내보낸다.
  *
  * `"share"` 는 캐시에 쓴 뒤 시스템 시트로 넘긴다 — **저장 경로를 사용자가 정하는 길이 이것이다.**
- * `"save"` 는 이 기기의 문서 폴더에 바로 쓴다 (`bridge.js` 의 `SAVE_ORDER` 참고).
+ * `"save"` 는 이 기기의 문서 폴더에 바로 쓴다 (`bridge.js` 의 `SAVE_ORDER` 참고). '풀어서 저장' 을
+ * 골랐으면 `.txt` 대신 원래 파일을 고른 폴더에 풀어 둔다 (아래 `runUnpack`).
  */
 async function runExport(mode) {
   if (state.joined === null || state.exporting) return;
+  if (mode === "save" && unpackChosen()) return runUnpack();
 
-  state.exporting = true;
-  enable("scan-save", false);
-  enable("scan-share", false);
+  lockExport(true);
 
   const name = currentFileName();
   setText("result-note", "");
@@ -895,9 +932,120 @@ async function runExport(mode) {
     const what = mode === "share" ? "보내지" : "저장하지";
     setText("result-note", `${what} 못했습니다: ${reason(error)}`);
   } finally {
-    state.exporting = false;
-    enable("scan-save", true);
-    enable("scan-share", true);
+    lockExport(false);
+  }
+}
+
+/// 저장·보내기·풀기는 한 번에 하나만. 버튼과 고르는 칸을 함께 잠근다.
+function lockExport(locked) {
+  state.exporting = locked;
+  enable("scan-save", !locked);
+  enable("scan-share", !locked);
+  enable("unpack-toggle", !locked);
+}
+
+// ---------------------------------------------------------------- 풀어서 저장
+
+/// '풀어서 저장' 을 골랐는지. 칸이 감춰져 있으면(쓸 수 없는 기기) 고르지 않은 것이다.
+function unpackChosen() {
+  const option = el("unpack-option");
+  return Boolean(option && !option.hidden && el("unpack-toggle")?.checked);
+}
+
+/// 고르는 칸에 맞춰 화면을 바꾼다. 저장 버튼의 글자도 바꾼다 — 같은 버튼이 하는 일이 달라지는데
+/// 글자가 그대로면, 누르고 나서야 무엇이 일어났는지 안다.
+function syncUnpack() {
+  const on = unpackChosen();
+  show("unpack-fields", on);
+  setText("scan-save", on ? "풀어서 이 기기에 저장" : "이 기기에 저장");
+  setUnpackHint();
+}
+
+/// 입력칸의 폴더를 규칙에 맞게 고치고, **고친 결과를 입력칸에 되돌려 적는다** (파일 이름과 같다).
+function currentFolder() {
+  const input = el("unpack-dir");
+  const folder = safeFolderPath(input?.value ?? "");
+  if (input && input.value !== folder) input.value = folder;
+  return folder;
+}
+
+function setUnpackHint() {
+  const folder = safeFolderPath(el("unpack-dir")?.value ?? "");
+  const where =
+    platform() === "ios"
+      ? `'파일' 앱의 내 iPhone → Packer Scanner → ${folder}`
+      : `내 파일의 문서(Documents) → ${folder}`;
+  setText("unpack-hint", `${where} 에 풉니다. 같은 이름이 이미 있으면 번호를 붙이고 덮어쓰지 않습니다.`);
+}
+
+/// 풀어낸 폴더가 문서 폴더가 아닐 때. 저장(`WHERE_NOTE`)과 달리 '보내기' 로 옮기라고 하지 않는다 —
+/// 보내기가 넘기는 것은 풀어낸 파일이 아니라 암호화된 `.txt` 다.
+const UNPACK_WHERE_NOTE = {
+  EXTERNAL: "\n이 폴더는 앱을 지우면 함께 사라집니다. 필요한 파일은 다른 곳으로 옮겨 두세요.",
+  CACHE: "\n임시 폴더입니다 — 기기가 공간을 정리하면 사라집니다. 필요한 파일은 지금 옮겨 두세요.",
+};
+
+/// 결과 문구. 데스크톱 풀기 탭(`src/main.js` 의 `doUnpack`)과 같은 내용을 같은 순서로 말한다.
+function unpackNote(result, folder) {
+  const parts = [`파일 ${NUMBER.format(result.fileCount)}개`];
+  if (result.dirCount > 0) parts.push(`폴더 ${NUMBER.format(result.dirCount)}개`);
+  parts.push(formatBytes(result.totalBytes));
+
+  let note = `풀었습니다 — ${parts.join(" · ")}\n${readablePath(result.uri, folder)}`;
+  if (result.renamed.length > 0) {
+    note += `\n같은 이름이 있어 번호를 붙인 항목: ${result.renamed.join(", ")}`;
+  }
+  if (result.skipped.length > 0) {
+    note += `\n안전하지 않은 경로여서 건너뛴 항목 ${result.skipped.length}개: ${result.skipped.slice(0, 3).join(", ")}`;
+  }
+  if (result.hashMismatch.length > 0) {
+    note += `\n내용이 검증과 다른 파일 ${result.hashMismatch.length}개: ${result.hashMismatch.slice(0, 3).join(", ")}`;
+  }
+  return note + (UNPACK_WHERE_NOTE[result.directory] ?? "");
+}
+
+/**
+ * 암호를 받아 이 폰에서 풀고, 문서 폴더 아래 고른 폴더에 원래 파일로 둔다.
+ *
+ * 진행 막대는 두 단계로 이어진다 — 암호 확인(Argon2, 기본값이면 폰에서 몇 초)과 풀어내기.
+ * 데스크톱이 만든 키 유도 비용은 그대로라서 이 앱이 줄일 수 없고, 그래서 막대가 실제로 값을 한다.
+ */
+async function runUnpack() {
+  const keyInput = el("unpack-key");
+  const passphrase = keyInput?.value ?? "";
+  if (passphrase === "") {
+    setText("result-note", "암호화 키를 입력해 주세요.");
+    keyInput?.focus();
+    return;
+  }
+
+  lockExport(true);
+  const folder = currentFolder();
+  setUnpackHint();
+  setText("result-note", "");
+  startBusy("key");
+
+  try {
+    const result = await unpackToDevice(folder, (sink) =>
+      unpackContainer({
+        source: state.container ?? state.joined,
+        passphrase,
+        sink,
+        onPhase: setBusyPhase,
+        onProgress: tickBusy,
+      }),
+    );
+    await stopBusy();
+    setText("result-note", unpackNote(result, folder));
+    // 다 풀었으면 암호를 화면에 남겨 두지 않는다. 틀렸을 때는 고쳐 다시 누르게 남긴다.
+    if (keyInput) keyInput.value = "";
+    void buzz("done");
+  } catch (error) {
+    await stopBusy();
+    setText("result-note", `풀지 못했습니다: ${reason(error)}`);
+    void buzz("warn");
+  } finally {
+    lockExport(false);
   }
 }
 
@@ -907,9 +1055,16 @@ async function reset() {
   state.stream = createStream();
   state.mode = null;
   state.joined = null;
+  state.container = null;
   state.lastWarning = "";
   resetExportProgress();
   setText("result-note", "");
+  // 다음 묶음은 다른 암호일 것이다. 고른 것도 되돌린다 — 기본은 꺼짐이다.
+  const key = el("unpack-key");
+  if (key) key.value = "";
+  const toggle = el("unpack-toggle");
+  if (toggle) toggle.checked = false;
+  syncUnpack();
   render();
   await beginScan();
 }
@@ -940,6 +1095,8 @@ function wire() {
   on("scan-save", "click", () => void runExport("save"));
   on("scan-share", "click", () => void runExport("share"));
   on("scan-reset", "click", () => void reset());
+  on("unpack-toggle", "change", syncUnpack);
+  on("unpack-dir", "change", setUnpackHint);
   on("perm-settings", "click", () => void openSettings());
 
   // 앱이 가려지면 카메라를 놓는다 (OS 가 어차피 회수한다). 돌아오면 하던 일을 이어 간다.
