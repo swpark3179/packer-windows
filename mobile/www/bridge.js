@@ -9,7 +9,8 @@
 // 넘겨야 한다. 그 값들을 아래 한곳에 모아 두고 각각 출처를 적었다 — 흩어지면 틀렸을 때 찾기
 // 어렵고, 틀려도 조용히 기본값으로 동작해 버린다.
 
-import { chunkText, shouldChunk } from "./export.js";
+import { toBase64 } from "./armor.js";
+import { chunkText, shouldChunk, uniqueName } from "./export.js";
 
 /// `Resolution` — 네이티브는 **정수**로 받는다 (안드로이드 `call.getInt("resolution", 1)`).
 export const RESOLUTION = Object.freeze({
@@ -277,6 +278,133 @@ export async function saveText(fileName, text, onProgress = null) {
     }
   }
   throw last ?? new Error("저장할 수 있는 폴더가 없습니다.");
+}
+
+// ---------------------------------------------------------------- 풀어서 저장
+
+/// 풀어낸 파일을 모아 두는 임시 폴더의 이름 앞부분. 데스크톱 `commands.rs` 의 `staging_dir` 와 같다.
+const STAGING_PREFIX = ".packer-part-";
+
+/// 이 기기에서 '풀어서 저장' 을 쓸 수 있는지. 복호화에 WebCrypto 가, 쓰기에 Filesystem 이 필요하다.
+///
+/// WebCrypto 는 보안 출처에서만 있다. Capacitor 는 `https://localhost`(안드로이드)와
+/// `capacitor://localhost`(iOS)로 문서를 열어 늘 그렇지만, 없으면 뜻 없는 조작 도구가 되므로
+/// 감춘다.
+export function canUnpack() {
+  return filesystem() !== null && typeof globalThis.crypto?.subtle?.decrypt === "function";
+}
+
+function randomHex(bytes) {
+  const raw = new Uint8Array(bytes);
+  globalThis.crypto.getRandomValues(raw);
+  return Array.from(raw, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/// `readdir` 의 결과에서 이름만. Capacitor 4 이전은 문자열 배열이었다.
+async function namesIn(api, path, directory) {
+  try {
+    const result = await api.readdir({ path, directory });
+    return (result?.files ?? []).map((file) => (typeof file === "string" ? file : file.name));
+  } catch {
+    // 아직 없는 폴더. 겹칠 이름도 없다.
+    return [];
+  }
+}
+
+/**
+ * 폰의 문서 폴더 아래 `folder` 에 풀어낸다.
+ *
+ * `run(sink)` 이 실제로 푸는 일을 한다 (`unpack.js` 의 `unpackContainer`). 여기는 그 결과가
+ * **어디에 어떻게 놓이는지**만 맡는다. 데스크톱 `unpack_to_dir` 와 같은 순서다:
+ *
+ * 1. `folder` 안에 임시 폴더(`.packer-part-…`)를 하나 만든다. 문서 폴더에 못 만들면 저장과
+ *    같은 순서로 내려간다 (`SAVE_ORDER` — 안드로이드 10 이하가 그렇다).
+ * 2. 거기에 전부 푼다. 마지막 청크의 인증은 끝에 가서야 끝나므로, 그 전에 쓴 파일은 아직 믿을
+ *    수 없다.
+ * 3. 다 성공하면 최상위 항목을 `folder` 로 옮긴다. 이름이 겹치면 **번호를 붙인다** —
+ *    `rename` 은 대상 파일이 있으면 지우고 옮기기 때문에 그냥 옮기면 사용자의 파일이 사라진다.
+ * 4. 실패하든 성공하든 임시 폴더를 지운다. 반쯤 풀린 파일이 사용자의 폴더에 섞여 남지 않는다.
+ *
+ * @param {string} folder 문서 폴더 기준 상대 경로 (`export.js` 의 `safeFolderPath` 를 거친 것)
+ * @param {(sink: object) => Promise<object>} run
+ * @returns {Promise<object>} `run` 의 결과에 `uri` · `directory` · `renamed` 를 더한 것
+ */
+export async function unpackToDevice(folder, run) {
+  const api = filesystem();
+  if (!api) throw new Error("이 기기에서는 파일로 저장할 수 없습니다.");
+
+  const staging = `${folder}/${STAGING_PREFIX}${randomHex(8)}`;
+  let directory = null;
+  let last = null;
+  for (const candidate of SAVE_ORDER) {
+    try {
+      await api.mkdir({ path: staging, directory: candidate, recursive: true });
+      directory = candidate;
+      break;
+    } catch (error) {
+      last = error;
+    }
+  }
+  if (directory === null) throw last ?? new Error("저장할 수 있는 폴더가 없습니다.");
+
+  /// 이미 만든 폴더. 같은 폴더에 `mkdir` 을 두 번 보내면 플러그인이 "Directory exists" 로 거절한다.
+  const made = new Set();
+  const sink = {
+    async makeDir(rel) {
+      if (made.has(rel)) return;
+      const path = `${staging}/${rel}`;
+      try {
+        await api.mkdir({ path, directory, recursive: true });
+      } catch (error) {
+        // 파일을 쓰면서 부모로 이미 만들어졌을 수 있다. 정말 폴더면 된 것이다.
+        const info = await api.stat({ path, directory }).catch(() => null);
+        if (info?.type !== "directory") throw error;
+      }
+      made.add(rel);
+    },
+    async writeFile(rel, bytes, append) {
+      const path = `${staging}/${rel}`;
+      // `encoding` 을 주지 않으면 플러그인은 `data` 를 Base64 로 보고 바이트로 풀어 쓴다.
+      const data = toBase64(bytes);
+      if (append) await api.appendFile({ path, data, directory });
+      else await api.writeFile({ path, data, directory, recursive: true });
+    },
+  };
+
+  const cleanup = async () => {
+    try {
+      await api.rmdir({ path: staging, directory, recursive: true });
+    } catch {
+      // 이미 비었거나 지울 수 없다. 목적은 남기지 않는 것이므로 이 실패는 삼킨다.
+    }
+  };
+
+  try {
+    const report = await run(sink);
+
+    const taken = new Set(await namesIn(api, folder, directory));
+    const renamed = [];
+    for (const name of await namesIn(api, staging, directory)) {
+      const final = uniqueName(taken, name);
+      if (final !== name) renamed.push(`${name} → ${final}`);
+      await api.rename({
+        from: `${staging}/${name}`,
+        to: `${folder}/${final}`,
+        directory,
+        toDirectory: directory,
+      });
+    }
+
+    let uri = "";
+    try {
+      uri = (await api.getUri({ path: folder, directory }))?.uri ?? "";
+    } catch {
+      // 위치를 못 얻어도 풀기는 끝났다. 화면이 상대 경로로 대신 말한다.
+    }
+    return { ...report, uri, directory, renamed };
+  } finally {
+    await cleanup();
+  }
 }
 
 /// 공유 시트를 쓸 수 있는지. 웹으로 그냥 열면 false 다.

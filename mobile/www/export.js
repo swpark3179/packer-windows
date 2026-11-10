@@ -1,4 +1,4 @@
-// 합친 텍스트를 파일로 내보낼 때 필요한 순수 계산 — 파일 이름 정리와 나눠 쓰기.
+// 합친 텍스트를 파일로 내보낼 때 필요한 순수 계산 — 파일·폴더 이름 정리와 나눠 쓰기.
 //
 // `collector.js` 와 같은 규율이다: **의존성이 없다.** DOM 도, Capacitor 도, 시계도 모른다
 // (`stamp()` 는 `Date` 를 인자로 받는다). 그래서 기기 없이 `node --test` 로 전부 검증된다
@@ -88,6 +88,74 @@ export function safeFileName(input, now = new Date()) {
 
   // 사용자가 적은 확장자의 대소문자는 그대로 둔다.
   return stem + (hasExtension ? name.slice(-EXTENSION.length) : EXTENSION);
+}
+
+// ---------------------------------------------------------------- 풀어낼 폴더
+
+/// '풀어서 저장' 의 기본 폴더. 문서 폴더 바로 아래에 풀면 다른 앱의 파일과 뒤섞인다.
+export const DEFAULT_FOLDER = "Packer";
+
+/// 폴더 깊이 상한. 경로를 적는 칸이지 트리를 만드는 칸이 아니다.
+const MAX_FOLDER_DEPTH = 8;
+
+/**
+ * 사용자가 적은 '풀어낼 폴더' 를 문서 폴더 아래의 상대 경로로 고친다.
+ *
+ * 파일 이름과 같은 규칙으로 고치고(`safeFileName`), 고친 결과를 **입력칸에 되돌려 적는다**
+ * (`app.js`). 다른 점이 셋 있다:
+ *
+ * - `/` 와 `\` 는 구분자로 받는다. 사람이 `Packer/2026` 처럼 적는 것이 자연스럽다.
+ * - `.` · `..` 조각은 버린다. 문서 폴더 밖으로 나가는 길은 애초에 만들지 않는다.
+ * - 공백은 그대로 둔다. 밑줄로 바꾸는 이유(공유 시트의 MIME 판정)가 폴더에는 없다.
+ *
+ * 다 걷어내 비면 `DEFAULT_FOLDER` 로 돌아간다 — 문서 폴더 바로 아래에 풀어 놓으면 나중에 무엇이
+ * 풀린 것인지 가리기 어렵다.
+ */
+export function safeFolderPath(input) {
+  if (typeof input !== "string") return DEFAULT_FOLDER;
+
+  const parts = [];
+  for (const raw of input.split(/[/\\]+/)) {
+    let part = raw
+      .replace(CONTROL, "")
+      .replace(FORBIDDEN, "_")
+      .replace(/^[\s.]+/, "")
+      .replace(/[\s.]+$/, "")
+      .replace(/\s+/g, " ")
+      .replace(/_{2,}/g, "_");
+    if (part === "") continue;
+    if (RESERVED_STEMS.has(part.split(".")[0].toUpperCase())) part = `_${part}`;
+    if (part.length > MAX_NAME_LENGTH) part = part.slice(0, MAX_NAME_LENGTH).replace(/[\s.]+$/, "");
+    if (part !== "") parts.push(part);
+    if (parts.length === MAX_FOLDER_DEPTH) break;
+  }
+  return parts.length === 0 ? DEFAULT_FOLDER : parts.join("/");
+}
+
+/**
+ * 이미 있는 이름과 겹치지 않게 번호를 붙인다. `safepath.rs` 의 `unique_name` 을 옮겼다.
+ *
+ * 풀어낸 최상위 항목을 목적지로 옮길 때 쓴다 — 같은 이름이 있으면 **덮어쓰지 않는다.**
+ * Capacitor 의 `rename` 은 대상 파일이 있으면 지우고 옮기므로, 이 검사가 없으면 사용자의 파일이
+ * 소리 없이 사라진다.
+ *
+ * @param {Set<string>} taken 쓰인 이름. 고른 이름을 여기에 더한다.
+ */
+export function uniqueName(taken, desired) {
+  if (!taken.has(desired)) {
+    taken.add(desired);
+    return desired;
+  }
+  const dot = desired.lastIndexOf(".");
+  // 앞이 비어 있으면 `.gitignore` 같은 숨김 파일이므로 전체를 이름으로 본다.
+  const [stem, ext] = dot > 0 ? [desired.slice(0, dot), desired.slice(dot + 1)] : [desired, null];
+  for (let n = 2; ; n += 1) {
+    const candidate = ext === null ? `${stem} (${n})` : `${stem} (${n}).${ext}`;
+    if (!taken.has(candidate)) {
+      taken.add(candidate);
+      return candidate;
+    }
+  }
 }
 
 // ---------------------------------------------------------------- 나눠 쓰기

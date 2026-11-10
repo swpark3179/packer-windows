@@ -13,12 +13,15 @@ import {
   BUSY_HOLD_MS,
   CHUNK_CHARS,
   CHUNK_THRESHOLD,
+  DEFAULT_FOLDER,
   MAX_NAME_LENGTH,
   chunkText,
   defaultFileName,
   safeFileName,
+  safeFolderPath,
   shouldChunk,
   stamp,
+  uniqueName,
 } from "../www/export.js";
 
 /// 테스트가 시계에 흔들리지 않도록 고정한다.
@@ -78,6 +81,64 @@ describe("safeFileName", () => {
       const once = safeFileName(input, FIXED);
       assert.equal(safeFileName(once, FIXED), once, `${JSON.stringify(input)} → ${once}`);
     }
+  });
+});
+
+describe("safeFolderPath — 풀어낼 폴더", () => {
+  it("평범한 경로는 그대로 둔다 — 공백도 그대로", () => {
+    assert.equal(safeFolderPath("Packer"), "Packer");
+    assert.equal(safeFolderPath("Packer/2026 보고서"), "Packer/2026 보고서");
+  });
+
+  it("역슬래시도 구분자로 받고, 빈 조각은 버린다", () => {
+    assert.equal(safeFolderPath("a\\b//c/"), "a/b/c");
+    assert.equal(safeFolderPath("/앞/뒤/"), "앞/뒤");
+  });
+
+  it("문서 폴더 밖으로 나가는 길은 만들지 않는다", () => {
+    assert.equal(safeFolderPath("../../etc"), "etc");
+    assert.equal(safeFolderPath("a/./b/.."), "a/b");
+    assert.equal(safeFolderPath(".숨김"), "숨김");
+  });
+
+  it("윈도우에서 못 쓰는 글자와 장치 이름은 파일 이름과 같게 고친다", () => {
+    assert.equal(safeFolderPath('a:b*c?"d<e>f|g'), "a_b_c_d_e_f_g");
+    assert.equal(safeFolderPath("con/aux.d"), "_con/_aux.d");
+    assert.equal(safeFolderPath("끝에 점."), "끝에 점");
+  });
+
+  it("다 걷어내 비면 기본 폴더로 돌아간다", () => {
+    assert.equal(safeFolderPath(""), DEFAULT_FOLDER);
+    assert.equal(safeFolderPath(" / .. / . "), DEFAULT_FOLDER);
+    assert.equal(safeFolderPath(undefined), DEFAULT_FOLDER);
+  });
+
+  it("조각 길이와 깊이에 상한이 있다", () => {
+    const long = safeFolderPath("가".repeat(200));
+    assert.equal(long.length, MAX_NAME_LENGTH);
+    assert.equal(safeFolderPath("a/b/c/d/e/f/g/h/i/j").split("/").length, 8);
+  });
+
+  it("한 번 고친 결과를 다시 넣어도 그대로다 — 입력칸에 되돌려 적으므로", () => {
+    for (const input of ["a\\b", "../x", "con", " 공백 / 앞뒤 ", "a:b"]) {
+      const once = safeFolderPath(input);
+      assert.equal(safeFolderPath(once), once, input);
+    }
+  });
+});
+
+describe("uniqueName — safepath.rs 의 unique_name", () => {
+  it("겹치면 확장자 앞에 번호를 붙인다", () => {
+    const taken = new Set(["note.txt", "폴더"]);
+    assert.equal(uniqueName(taken, "new.txt"), "new.txt");
+    assert.equal(uniqueName(taken, "note.txt"), "note (2).txt");
+    assert.equal(uniqueName(taken, "note.txt"), "note (3).txt");
+    assert.equal(uniqueName(taken, "폴더"), "폴더 (2)");
+  });
+
+  it("숨김 파일은 확장자로 쪼개지 않는다", () => {
+    const taken = new Set([".gitignore"]);
+    assert.equal(uniqueName(taken, ".gitignore"), ".gitignore (2)");
   });
 });
 

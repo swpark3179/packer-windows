@@ -295,3 +295,110 @@ describe("onBarcodes — 한 프레임에 여러 심볼", () => {
     assert.equal(calls, 0);
   });
 });
+
+// ---------------------------------------------------------------- 풀어서 저장
+
+describe("unpackToDevice — 임시 폴더에 풀고 제자리로 옮긴다", () => {
+  /// 메모리 파일 시스템을 심는다. 호출을 기록만 하는 가짜로는 "옮긴 뒤 무엇이 남았는지" 를 물을
+  /// 수 없어서, 여기서는 상태를 들고 있는 가짜를 쓴다 (`memory-fs.js`).
+  async function installMemory(options = {}) {
+    const { memoryFilesystem } = await import("./memory-fs.js");
+    const fs = memoryFilesystem(options);
+    globalThis.Capacitor = { Plugins: { Filesystem: fs.api }, getPlatform: () => "android" };
+    return fs;
+  }
+
+  /// `unpack.js` 대신 싱크에 몇 가지를 써 보는 가짜 일꾼.
+  const writeSome = async (sink) => {
+    await sink.makeDir("프로젝트");
+    await sink.makeDir("프로젝트"); // 같은 폴더를 두 번 — 두 번째는 조용히 넘어가야 한다.
+    await sink.writeFile("프로젝트/a.bin", Uint8Array.from([0, 1, 2, 255]), false);
+    await sink.writeFile("프로젝트/a.bin", Uint8Array.from([7]), true);
+    await sink.writeFile("메모.txt", new TextEncoder().encode("안녕"), false);
+    await sink.writeFile("빈.txt", new Uint8Array(0), false);
+    return { fileCount: 3 };
+  };
+
+  it("문서 폴더 아래 고른 폴더에 풀고, 임시 폴더를 남기지 않는다", async () => {
+    const fs = await installMemory();
+    const result = await bridge.unpackToDevice("Packer/2026", writeSome);
+
+    assert.equal(result.fileCount, 3, "일꾼의 결과를 그대로 돌려준다");
+    assert.equal(result.directory, "DOCUMENTS");
+    assert.equal(result.uri, "file:///DOCUMENTS/Packer/2026");
+    assert.deepEqual(result.renamed, []);
+    assert.deepEqual(fs.list("DOCUMENTS"), [
+      "Packer/",
+      "Packer/2026/",
+      "Packer/2026/메모.txt",
+      "Packer/2026/빈.txt",
+      "Packer/2026/프로젝트/",
+      "Packer/2026/프로젝트/a.bin",
+    ]);
+    assert.deepEqual([...fs.read("DOCUMENTS", "Packer/2026/프로젝트/a.bin")], [0, 1, 2, 255, 7]);
+    assert.equal(new TextDecoder().decode(fs.read("DOCUMENTS", "Packer/2026/메모.txt")), "안녕");
+  });
+
+  it("바이트는 Base64 로, 인코딩 없이 넘긴다 — 플러그인이 그래야 바이너리로 쓴다", async () => {
+    const fs = await installMemory();
+    await bridge.unpackToDevice("Packer", writeSome);
+    const writes = fs.calls.filter(([name]) => name === "writeFile" || name === "appendFile");
+    assert.ok(writes.length > 0);
+    for (const [, given] of writes) assert.equal(given.encoding, undefined);
+    const first = writes.find(([, given]) => given.path.endsWith("a.bin"))[1];
+    assert.equal(first.data, "AAEC/w==");
+    assert.equal(first.recursive, true);
+  });
+
+  it("같은 이름이 이미 있으면 번호를 붙이고, 있던 파일은 건드리지 않는다", async () => {
+    // Capacitor 의 rename 은 대상 파일이 있으면 지우고 옮긴다. 이름을 먼저 피하지 않으면 사용자의
+    // 파일이 소리 없이 사라진다.
+    const fs = await installMemory();
+    fs.put("DOCUMENTS", "Packer/메모.txt", "원래 있던 메모");
+    const result = await bridge.unpackToDevice("Packer", writeSome);
+
+    assert.deepEqual(result.renamed, ["메모.txt → 메모 (2).txt"]);
+    assert.equal(new TextDecoder().decode(fs.read("DOCUMENTS", "Packer/메모.txt")), "원래 있던 메모");
+    assert.equal(new TextDecoder().decode(fs.read("DOCUMENTS", "Packer/메모 (2).txt")), "안녕");
+  });
+
+  it("중간에 실패하면 반쯤 풀린 파일을 남기지 않는다", async () => {
+    const fs = await installMemory();
+    fs.put("DOCUMENTS", "Packer/있던 것.txt", "그대로");
+    await assert.rejects(
+      bridge.unpackToDevice("Packer", async (sink) => {
+        await sink.writeFile("반쯤.bin", Uint8Array.from([1, 2, 3]), false);
+        throw new Error("파일이 손상되었거나 중간에 잘렸습니다.");
+      }),
+      /손상/,
+    );
+    assert.deepEqual(fs.list("DOCUMENTS"), ["Packer/", "Packer/있던 것.txt"]);
+  });
+
+  it("문서 폴더에 못 쓰면 저장과 같은 순서로 내려간다", async () => {
+    // 안드로이드 10 이하가 실제로 이 길로 온다 (`SAVE_ORDER`).
+    const fs = await installMemory({ deny: ["DOCUMENTS"] });
+    const result = await bridge.unpackToDevice("Packer", writeSome);
+    assert.equal(result.directory, "EXTERNAL");
+    assert.ok(fs.list("EXTERNAL").includes("Packer/메모.txt"));
+  });
+
+  it("어디에도 못 쓰면 마지막 이유를 그대로 올린다", async () => {
+    await installMemory({ deny: ["DOCUMENTS", "EXTERNAL", "CACHE"] });
+    let ran = false;
+    await assert.rejects(
+      bridge.unpackToDevice("Packer", async () => {
+        ran = true;
+      }),
+      /denied: CACHE/,
+    );
+    assert.equal(ran, false, "쓸 곳이 없으면 풀기를 시작하지도 않는다 — 키 유도만 몇 초다");
+  });
+
+  it("WebCrypto 와 Filesystem 이 둘 다 있어야 쓸 수 있다고 말한다", async () => {
+    await installMemory();
+    assert.equal(bridge.canUnpack(), true);
+    install({ noFilesystem: true });
+    assert.equal(bridge.canUnpack(), false);
+  });
+});

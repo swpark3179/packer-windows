@@ -89,7 +89,8 @@
           <p class="lead" data-pk="result-summary"></p>
           <p class="note">
             합쳐진 텍스트는 <strong>아직 암호화된 상태</strong>입니다. PC 의 Packer
-            <strong>풀기</strong> 탭에 붙여넣고 묶을 때 쓴 암호를 넣어야 파일이 돌아옵니다.
+            <strong>풀기</strong> 탭에 붙여넣고 묶을 때 쓴 암호를 넣어야 파일이 돌아옵니다. 이
+            폰에서 바로 풀려면 아래 <strong>풀어서 저장</strong> 을 고르세요.
           </p>
 
           <label class="field-label" for="pk-save-name">파일 이름</label>
@@ -105,6 +106,52 @@
             spellcheck="false"
           />
           <p class="note" data-pk="save-hint"></p>
+
+          <!--
+            '풀어서 저장' — 고르는 기능이다. 켜면 '이 기기에 저장' 이 .txt 대신 원래 파일을 문서
+            폴더 아래 고른 폴더에 풀어 둔다 (unpack.js). 쓸 수 없는 기기에서는 통째로 감춘다.
+          -->
+          <div class="unpack" data-pk="unpack-option" hidden>
+            <label class="check">
+              <input type="checkbox" data-pk="unpack-toggle" />
+              <span class="check-text">
+                <span class="check-title">풀어서 저장</span>
+                <span class="check-sub">암호를 넣으면 원래 파일로 되돌려 이 기기의 폴더에 둡니다</span>
+              </span>
+            </label>
+
+            <div data-pk="unpack-fields" hidden>
+              <label class="field-label" for="pk-unpack-key">암호화 키</label>
+              <input
+                class="text-input"
+                id="pk-unpack-key"
+                data-pk="unpack-key"
+                type="password"
+                autocomplete="off"
+                autocapitalize="off"
+                autocorrect="off"
+                spellcheck="false"
+                placeholder="묶을 때 사용한 키"
+              />
+
+              <label class="field-label" for="pk-unpack-dir">풀어낼 폴더</label>
+              <input
+                class="text-input"
+                id="pk-unpack-dir"
+                data-pk="unpack-dir"
+                type="text"
+                inputmode="text"
+                autocomplete="off"
+                autocapitalize="off"
+                autocorrect="off"
+                spellcheck="false"
+              />
+              <p class="note" data-pk="unpack-hint"></p>
+              <p class="note note-warn">
+                풀어낸 파일은 <strong>암호화되지 않은 채</strong> 이 기기에 남습니다.
+              </p>
+            </div>
+          </div>
 
           <p class="note" data-pk="result-note"></p>
 
